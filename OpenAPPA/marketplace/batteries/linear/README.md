@@ -1,0 +1,159 @@
+# Linear battery
+
+Rules for 65 Linear MCP tools and the `linear` audience source that
+reads who may see each issue, team, project, and document from Linear
+itself. The manifest registers the battery with the marketplace.
+
+## Targets
+
+`appa.toml` is the base policy; a deployment composes one target policy
+over it, whose rules run first.
+
+- **single-user** (`single-user.toml`) — one person's personal API key,
+  as this README describes: the twelve rules that name an issue, team,
+  or document by id, and the `linear` audience source.
+- **multi-user** (`multi-user.toml`) — an OAuth app's access token
+  issued with `actor=app`, with no person behind it. The same rules over
+  `audience-source-multi-user.py`, which serves every template but
+  `linear:viewer`, sends the token as a bearer token, and refuses a
+  personal API key. People stay the account emails Linear reports, so
+  map `internal` as below and `self` from another source.
+- **base alone** — no helper and no lookup: a read that names a resource
+  stays with the viewer (`self`), and a write into one needs trusted data
+  everyone may see.
+
+## Files
+
+**`appa.toml`**, **`single-user.toml`** — the rules. Trust follows who can write the text.
+Workspace members write issues, comments, documents, and projects, so
+reads and mutation responses keep the session's trust. Text an installed
+integration posts counts as trusted too, because a member installed it.
+Linear's public documentation (`search_documentation`) and images from
+arbitrary URLs (`extract_images`) enter `suspicious`. A tool that names an issue, team, or document by id is
+labelled with that resource's readers through a selector placeholder
+such as `@linear:issue/$issueId/readers`; a write into it needs trusted
+data those readers may see, the `linear-review` mark, and records
+`linear.changed` or `linear.sensitive`. A summary of a private team's
+issue can be commented back onto that issue and not onto a public
+team's. Tools that name no resource, or name one by a free-text query,
+keep the `internal` audience: map it in the root config to readers
+authorized for everything this connection can list. Image extraction can
+fetch external URLs, so its input must be public and reviewed.
+
+**`audience-source.py`** — the `linear` audience source, over the
+GraphQL API; its reads live in `linear_audience.py`, which both
+entrypoints import. It answers these selectors:
+
+- `linear:viewer` — the token's own reader. Feeds `self`.
+- `linear:full-members` — every active member of the workspace, guests
+  and app users excluded. Feeds `internal`.
+- `linear:team/<key>/members` — one team's members. Feeds `group`
+  entries.
+- `linear:team/<key>/readers` — who can see the team's issues, projects,
+  and cycles: every full member for a public team, its members for a
+  private team, its members and the parent team's readers for a
+  restricted sub-team.
+- `linear:issue/<id>/readers` — the team's readers plus the people the
+  issue is shared with individually.
+- `linear:project/<id>/readers` — the readers of every team the project
+  belongs to, plus the project's own members.
+- `linear:document/<id>/readers` — the readers of the issue, project, or
+  team the document belongs to; every full member for a document under
+  an initiative.
+
+A team is named by its UUID or key (`ENG`), an issue by its UUID or
+identifier (`ENG-123`), a project and a document by their UUID or slug.
+A name is never looked up: two things can share one, and a call that
+spells a name gets no answer and is refused, so the agent names the
+resource by id instead.
+
+A roster of more than 5,000 accounts — the workspace, a team, a
+project's members — is refused rather than paged: it cannot answer
+inside the runtime's consult budget. Map such an audience in the root
+config from a source that lists it in bulk.
+
+A member is the account's email as Linear reports it, else
+`linear:<id>`, which merges with no other provider's reader. The member
+lookup resolves a `linear:<id>` member the same way and answers `null`
+for an id Linear does not know.
+
+The battery binds the source itself, under `[externals.audience.linear]`
+in `single-user.toml`, and declares the seven templates above as its
+`selectors`. Audience mappings are root-only, so the root config maps
+the chain onto them:
+
+```toml
+[policy.audience]
+self = ["linear:viewer"]
+internal = ["linear:full-members"]
+
+[policy.audience.group.platform]
+within = "internal"
+from = ["linear:team/PLT/members"]
+```
+
+Every consult carries the declared templates, and the script refuses
+one whose declaration differs from what it serves (exit status 2), so a
+policy and a script of different versions never answer each other.
+
+The script reads its token from `APPA_PROVIDER_LINEAR_TOKEN`, which the
+binding's `token_env` forwards: a personal API key, or an OAuth access
+token that can read users, teams, issues, projects, and documents. A
+command inherits none of the runtime's `APPA_*` namespace — only the one
+`APPA_PROVIDER_*` variable its own binding names. Any Linear error or
+missing answer stops the operation without recording a decision; nothing
+is guessed.
+
+**`audience-source-multi-user.py`** — the same source for a
+multi-user deployment: no `viewer` template, an OAuth app token sent as
+a bearer token, a personal API key refused.
+
+**`test_audience_source.py`**, **`test_audience_source_multi_user.py`**
+— tests without network: member and person shaping, selector and member
+refusals, the token, and the envelope and declaration checks. Run with
+`python3 -m unittest discover -s marketplace/batteries/linear -p 'test_*.py'`.
+
+## Configure the deployment
+
+Install with `appa battery install linear --server <host-server-name>`, or include
+`appa.toml` from the root policy. Installation adds policy, not an MCP connection
+or Linear permissions. Map `self` and `internal` as above and pass the token.
+
+Root rules take precedence over battery rules. They must state the complete
+annotation, including write requirements and effects. Use `parameters` with
+`additionalProperties = false` when an override assumes a fixed argument shape.
+
+[The live replay](../../../examples/live-replays/linear/appa.toml) combines the
+Linear and GitHub batteries, maps the chain onto the Linear source, and keeps
+one root override for a resource with readers Linear does not model. That
+override and the review authority cannot widen an audience: reading a private
+team's issue does not authorize publishing it to a public GitHub repository.
+
+For read-only deployments, connect Linear's `/mcp/readonly` endpoint.
+
+## Maintenance
+
+Edit the TOML rules directly when tool behavior changes. Unknown tools receive no
+permission from this battery. Review each tool's destination, returned content,
+side effects and review requirements; tool descriptions and MCP annotations do
+not grant permission.
+
+```sh
+cargo test --locked -p appa --test integration -- linear_policy:: marketplace::
+python3 -m unittest discover -s marketplace/batteries/linear -p 'test_*.py'
+```
+
+## Sanitizers
+
+When the deployment binds a sanitizer below, the battery confines the results of `search_documentation` and `extract_images`, and of the issue, comment, document and project reads `list_issues`, `list_comments`, `list_documents`, `get_project` and `list_projects`. A read that narrows the session then offers, beside the plain narrowing, each sanitizer below that the deployment binds, and the agent chooses. A chosen sanitizer runs a model on the confined result with the sanitizer's `hint`. The model's output enters the session at the label the sanitizer's `permits` declare, and the raw result never reaches the agent.
+
+| Sanitizer | `permits` | Effect |
+|---|---|---|
+| `linear.strip-instructions` | `trust`: `suspicious` → `trusted` | Removes every instruction from the result and keeps the data. The read does not lower the session's trust, so it adds no trust gap to a later call that requires `trusted` data. |
+| `linear.redact-for-public` | `audience`: `internal` → `public` | Runs only on the issue, comment, document and project reads (tag `linear-records`). Removes personal data of customers and colleagues, customer and partner names, deal details, internal URLs and hostnames, credentials and unreleased plans, and keeps the problem, reproduction steps, error text, status and decisions. The read does not narrow the session's audience, so it adds no audience gap to a later call bound for `public` readers. |
+
+A sanitizer settles one dimension of a narrowing. When a read narrows both trust and audience, the other dimension stays a narrowing, which the agent accepts or settles with the other sanitizer. A sanitizer never clears a requirement, such as a review mark.
+
+The model for each sanitizer is configured in the deployment, not in the battery. A sanitizer runs only when the root config binds it under `[externals.sanitizers]`: for example `builtin = "llm"` with an `[externals.llm]` profile, `builtin = "claude-code"` where the `claude` CLI is installed, or a `url`. The default config of the Claude Code plugin binds every battery sanitizer to `claude-code`, so in `clappa` sessions it is active once the battery is installed. A sanitizer that the root does not bind is not offered, and the results that only it covers are not confined. The battery then decides as it would without sanitizers.
+
+APPA does not verify what the model removed: binding a sanitizer registers it as trusted. A root rule for a tool takes precedence over the battery's rule, and a root rule without the battery's tags offers no sanitizer. To change a sanitizer's hint, declare a `[[policy.sanitizer]]` with the same name in the root config. The root declaration replaces the battery's whole, so copy its `on`, `tags`, and `permits`.

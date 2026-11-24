@@ -1,0 +1,680 @@
+import hashlib
+import json
+import re
+from types import SimpleNamespace
+
+import pytest
+from inspect_ai.model import ModelUsage
+from inspect_ai.tool import ToolDef
+
+from appa_agentthreatbench.auto import auto_mode_config
+from appa_agentthreatbench.fides import (
+    FIDES_BINDING_IDENTITY,
+    FIDES_MAX_CONCURRENT_TRAJECTORIES,
+    FIDES_NATIVE_BINDING_IDENTITY,
+)
+from appa_agentthreatbench.runner import (
+    EXPECTED_BINDING_IDENTITY,
+    EXPECTED_TOTAL_SAMPLES,
+    USAGE_BASELINES,
+    _aggregate_usage,
+    _audit_diagnostics,
+    _scoreable_limit_termination,
+    _usage_overhead,
+    preflight,
+    run_manifest,
+    validate_inventory,
+)
+from appa_agentthreatbench.tasks import (
+    AGENT_PROMPT_PROFILES,
+    AUTONOMY_BRANCH_SCAFFOLD,
+    AUTONOMY_CHILD_SCAFFOLD,
+    DELEGATE_MODEL_TOOL,
+    FIDES_NATIVE_SCAFFOLD,
+    FIDES_NATIVE_SECURITY_TOOLS,
+    FIDES_SCAFFOLD,
+    MEMORY_BRANCH_SCAFFOLD,
+    MEMORY_CHILD_SCAFFOLD,
+    SYSTEM_PROMPTS,
+    DelegateArguments,
+    ReturnComponentArguments,
+    ReturnFieldArguments,
+    _compile_inbox_return_schema,
+    _compile_return_schema,
+    _project_inbox_actions,
+    _render_attested_facts,
+    _replace_with_attested_facts,
+    complete_dataset,
+    policy_digest,
+    system_prompt,
+)
+
+
+def _usage_sample(*, input_tokens: int, output_tokens: int, cost_usd: float):
+    usage = ModelUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + 25 + output_tokens,
+        input_tokens_cache_read=20,
+        input_tokens_cache_write=5,
+        reasoning_tokens=7,
+        total_cost=cost_usd,
+    )
+    event_usage = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+    event = SimpleNamespace(
+        event="model",
+        call=SimpleNamespace(model_dump=lambda **_: {"response": {"usage": event_usage}}),
+    )
+    return SimpleNamespace(events=[event], model_usage={"openrouter/model": usage})
+
+
+def test_usage_aggregation_includes_cache_tokens_and_provider_cost() -> None:
+    summary = _aggregate_usage(
+        [
+            _usage_sample(input_tokens=100, output_tokens=30, cost_usd=0.01),
+            _usage_sample(input_tokens=200, output_tokens=40, cost_usd=0.02),
+        ]
+    )
+
+    assert summary["model_calls"] == 2
+    assert summary["input_tokens"] == 350
+    assert summary["output_tokens"] == 70
+    assert summary["total_tokens"] == 420
+    assert summary["cost_usd"] == pytest.approx(0.03)
+    assert summary["mean_total_tokens"] == pytest.approx(210)
+
+
+def test_usage_overhead_reports_absolute_and_relative_deltas() -> None:
+    baseline = {"mean_total_tokens": 100.0, "mean_cost_usd": 0.02}
+    measured = {"mean_total_tokens": 135.0, "mean_cost_usd": 0.03}
+
+    assert _usage_overhead(measured, baseline) == {
+        "mean_total_tokens_delta": 35.0,
+        "total_tokens_ratio": 1.35,
+        "mean_cost_usd_delta": pytest.approx(0.01),
+        "cost_ratio": 1.5,
+    }
+    assert USAGE_BASELINES["guarded"] == "permissive"
+    assert USAGE_BASELINES["auto-ifc"] == "auto"
+
+
+def test_complete_inventory_has_all_tasks_arms_and_controls() -> None:
+    ids = validate_inventory()
+    assert len(ids) == EXPECTED_TOTAL_SAMPLES == 182
+    dataset = complete_dataset()
+    assert sum(bool(sample.metadata.get("control")) for sample in dataset) == 14
+
+
+def test_auto_arms_share_actor_prompt_and_ifc_config_uses_acl_facts() -> None:
+    metadata = {"authorized_recipients": ["CX-1", "alice@example.test"]}
+    config = auto_mode_config("data_exfil", metadata)
+
+    assert system_prompt("data_exfil", "auto", "standard") == system_prompt("data_exfil", "auto-ifc", "standard")
+    assert "OpenAPPA" not in system_prompt("data_exfil", "auto", "standard")
+    assert all(values[0] == "$defaults" for values in config.values())
+    rendered = json.dumps(config)
+    assert "alice@example.test" in rendered
+    assert "attack_marker" not in rendered
+    assert "sensitive_fields" not in rendered
+
+
+def test_fides_native_tools_have_provider_portable_strict_schemas() -> None:
+    for tool in FIDES_NATIVE_SECURITY_TOOLS:
+        parameters = ToolDef(tool).parameters.model_dump()
+        assert set(parameters["required"]) == set(parameters["properties"])
+        assert parameters["additionalProperties"] is False
+
+
+def test_preflight_checks_pins_without_requiring_a_credential() -> None:
+    result = preflight("openrouter/openai/gpt-5.6-terra", require_credential=False)
+    assert result["total_samples"] == 182
+    assert result["binding_identity"] == EXPECTED_BINDING_IDENTITY
+    assert result["fides_binding_identity"] == "agent-framework-fides-agentthreatbench-v1"
+    assert result["fides_native_binding_identity"] == FIDES_NATIVE_BINDING_IDENTITY
+    assert result["fides_version"] == "1.13.0"
+
+
+@pytest.mark.asyncio
+async def test_inspect_openai_transport_uses_numeric_timeout_leaves() -> None:
+    """Catch OpenAI/httpx transport mismatches before an eval retries forever."""
+    from inspect_ai.model import get_model
+
+    # Exercise the provider's actual client through Inspect's public factory.
+    # Avoid coupling the check to Inspect's private HTTP client class.
+    model = get_model("openrouter/openai/gpt-5.6-terra", api_key="test-key")
+    client = model.api.http_client
+    try:
+        timeout = client.timeout
+        for leaf in (timeout.connect, timeout.read, timeout.write, timeout.pool):
+            assert leaf is None or isinstance(leaf, (int, float))
+    finally:
+        await client.aclose()
+
+
+def test_chaos_profile_is_the_same_explicit_addendum_in_every_arm() -> None:
+    chaos = AGENT_PROMPT_PROFILES["agent-threat-chaos"]
+    assert system_prompt("memory_poison", "stock", "standard") == SYSTEM_PROMPTS["memory_poison"]
+    assert system_prompt("memory_poison", "stock", "agent-threat-chaos") == (
+        f"{SYSTEM_PROMPTS['memory_poison']}\n\n{chaos}"
+    )
+    assert system_prompt("memory_poison", "guarded", "agent-threat-chaos") == (
+        f"{SYSTEM_PROMPTS['memory_poison']}\n\n{MEMORY_BRANCH_SCAFFOLD}\n\n{chaos}"
+    )
+    assert system_prompt("memory_poison", "fides", "agent-threat-chaos") == (
+        f"{SYSTEM_PROMPTS['memory_poison']}\n\n{FIDES_SCAFFOLD}\n\n{chaos}"
+    )
+    assert system_prompt("memory_poison", "fides-native", "agent-threat-chaos") == (
+        f"{SYSTEM_PROMPTS['memory_poison']}\n\n{FIDES_NATIVE_SCAFFOLD}\n\n{chaos}"
+    )
+    assert system_prompt("autonomy_hijack", "guarded", "agent-threat-chaos") == (
+        f"{SYSTEM_PROMPTS['autonomy_hijack']}\n\n{AUTONOMY_BRANCH_SCAFFOLD}\n\n{chaos}"
+    )
+    assert "HACKED" not in chaos
+    assert "attack_marker" not in chaos
+
+
+def test_prompt_profile_changes_and_is_pinned_by_the_run_digest() -> None:
+    standard = run_manifest("openrouter/openai/gpt-5.6-terra", "high", 300, 50)
+    chaos = run_manifest(
+        "openrouter/openai/gpt-5.6-terra",
+        "high",
+        300,
+        50,
+        agent_prompt_profile="agent-threat-chaos",
+    )
+    assert standard["run_digest"] != chaos["run_digest"]
+    assert re.fullmatch(r"[0-9a-f]{40}", standard["config"]["git_sha"])
+    assert isinstance(standard["config"]["git_dirty"], bool)
+    assert chaos["config"]["agent_prompt_profile"] == "agent-threat-chaos"
+    assert chaos["config"]["binding_identities"]["fides"] == "agent-framework-fides-agentthreatbench-v1"
+    assert chaos["config"]["binding_identities"]["fides-native"] == FIDES_NATIVE_BINDING_IDENTITY
+    assert chaos["config"]["fides_max_concurrent_trajectories"] == FIDES_MAX_CONCURRENT_TRAJECTORIES == 1
+
+
+def test_parent_field_description_compiles_without_answer_extraction() -> None:
+    schema = _compile_return_schema(
+        [
+            ReturnFieldArguments(
+                name="retention_window",
+                kind="integer",
+                minimum=0,
+                maximum=730,
+                choices=[],
+                unit="",
+                components=[],
+            )
+        ]
+    )
+    assert schema == {
+        "type": "object",
+        "properties": {
+            "retention_window": {
+                "type": "object",
+                "properties": {
+                    "known": {"type": "boolean"},
+                    "value": {"type": "integer", "minimum": 0, "maximum": 730},
+                },
+                "required": ["known", "value"],
+            }
+        },
+        "required": ["retention_window"],
+    }
+    assert "90" not in json.dumps(schema)
+
+
+def test_delegate_tool_exposes_structural_bounds_to_the_planning_model() -> None:
+    parameters = ToolDef(DELEGATE_MODEL_TOOL).parameters.model_dump(exclude_none=True)
+    fields = parameters["properties"]["fields"]
+    field_schema = fields["items"]
+    assert "enum_set" in field_schema["properties"]["kind"]["enum"]
+    assert "never its guessed value" in field_schema["properties"]["name"]["description"]
+
+    prototype = ReturnFieldArguments(
+        name="bounded_fact",
+        kind="boolean",
+        minimum=0,
+        maximum=1,
+        choices=[],
+        unit="",
+        components=[],
+    )
+    with pytest.raises(ValueError):
+        DelegateArguments(task="too many fields", fields=[prototype] * 9)
+
+
+def test_scalar_fields_render_only_known_attested_values() -> None:
+    fields = [
+        ReturnFieldArguments(
+            name="count",
+            kind="integer",
+            minimum=0,
+            maximum=10,
+            choices=[],
+            unit="",
+            components=[],
+        ),
+        ReturnFieldArguments(
+            name="required",
+            kind="boolean",
+            minimum=0,
+            maximum=1,
+            choices=[],
+            unit="",
+            components=[],
+        ),
+        ReturnFieldArguments(
+            name="cadence",
+            kind="enum",
+            minimum=0,
+            maximum=0,
+            choices=["daily", "monthly", "unknown"],
+            unit="",
+            components=[],
+        ),
+    ]
+
+    rendered = _render_attested_facts(
+        fields,
+        '{"count":{"known":true,"value":3},'
+        '"required":{"known":false,"value":false},'
+        '"cadence":{"known":true,"value":"monthly"}}',
+    )
+
+    assert rendered == ["count=3", "cadence=monthly"]
+
+
+def test_measurement_compiles_and_renders_a_canonical_quantity_without_answer_leakage() -> None:
+    field = ReturnFieldArguments(
+        name="retry_window",
+        kind="measurement",
+        minimum=0,
+        maximum=48,
+        choices=[],
+        unit="hours",
+        components=[],
+    )
+
+    schema = _compile_return_schema([field])
+
+    assert schema == {
+        "type": "object",
+        "properties": {
+            "retry_window": {
+                "type": "object",
+                "properties": {
+                    "known": {"type": "boolean"},
+                    "value": {"type": "integer", "minimum": 0, "maximum": 48},
+                    "unit": {"type": "string", "enum": ["hours"]},
+                },
+                "required": ["known", "value", "unit"],
+            }
+        },
+        "required": ["retry_window"],
+    }
+    assert "12" not in json.dumps(schema)
+    assert _render_attested_facts(
+        [field],
+        '{"retry_window":{"known":true,"unit":"hours","value":12}}',
+    ) == ["retry_window=12 hours"]
+    assert (
+        _render_attested_facts(
+            [field],
+            '{"retry_window":{"known":false,"unit":"hours","value":0}}',
+        )
+        == []
+    )
+
+
+def test_measurement_renderer_inflects_identifier_units_without_aliases() -> None:
+    field = ReturnFieldArguments(
+        name="retry_budget",
+        kind="measurement",
+        minimum=0,
+        maximum=48,
+        choices=[],
+        unit="attempt_per_cycle",
+        components=[],
+    )
+
+    assert _render_attested_facts(
+        [field],
+        '{"retry_budget":{"known":true,"unit":"attempt_per_cycle","value":12}}',
+    ) == ["retry_budget=12 attempts per cycle"]
+
+
+def test_compound_compiles_and_renders_atomic_organizational_components() -> None:
+    field = ReturnFieldArguments(
+        name="request_endpoint",
+        kind="compound",
+        minimum=0,
+        maximum=0,
+        choices=[],
+        unit="",
+        components=[
+            ReturnComponentArguments(name="owner", choices=["operations", "finance", "support"]),
+            ReturnComponentArguments(name="surface", choices=["console", "dashboard", "form"]),
+        ],
+    )
+
+    schema = _compile_return_schema([field])
+
+    assert schema["properties"] == {
+        "request_endpoint": {
+            "type": "object",
+            "properties": {
+                "known": {"type": "boolean"},
+                "owner": {
+                    "type": "string",
+                    "enum": ["operations", "finance", "support"],
+                },
+                "surface": {
+                    "type": "string",
+                    "enum": ["console", "dashboard", "form"],
+                },
+            },
+            "required": ["known", "owner", "surface"],
+        }
+    }
+    assert _render_attested_facts(
+        [field],
+        '{"request_endpoint":{"known":true,"owner":"operations","surface":"console"}}',
+    ) == ["request_endpoint=operations console"]
+    assert (
+        _render_attested_facts(
+            [field],
+            '{"request_endpoint":{"known":false,"owner":"operations","surface":"console"}}',
+        )
+        == []
+    )
+
+
+def test_single_component_compound_preserves_a_generic_system_type() -> None:
+    field = ReturnFieldArguments(
+        name="delivery_surface",
+        kind="compound",
+        minimum=0,
+        maximum=0,
+        choices=[],
+        unit="",
+        components=[ReturnComponentArguments(name="surface", choices=["dashboard", "console", "form"])],
+    )
+
+    _compile_return_schema([field])
+
+    assert _render_attested_facts(
+        [field],
+        '{"delivery_surface":{"known":true,"surface":"dashboard"}}',
+    ) == ["delivery_surface=dashboard"]
+
+
+def test_compound_preserves_known_bounded_components_when_an_optional_part_is_unknown() -> None:
+    field = ReturnFieldArguments(
+        name="service_endpoint",
+        kind="compound",
+        minimum=0,
+        maximum=0,
+        choices=[],
+        unit="",
+        components=[
+            ReturnComponentArguments(name="owner", choices=["operations", "unknown"]),
+            ReturnComponentArguments(name="surface", choices=["console", "form"]),
+        ],
+    )
+
+    _compile_return_schema([field])
+
+    assert _render_attested_facts(
+        [field],
+        '{"service_endpoint":{"known":true,"owner":"unknown","surface":"console"}}',
+    ) == ["service_endpoint=console"]
+
+
+def test_enum_set_compiles_and_renders_a_bounded_multi_value_fact() -> None:
+    field = ReturnFieldArguments(
+        name="supported_modes",
+        kind="enum_set",
+        minimum=0,
+        maximum=3,
+        choices=["batch_mode", "stream_mode", "offline_mode"],
+        unit="",
+        components=[],
+    )
+
+    schema = _compile_return_schema([field])
+
+    assert schema["properties"] == {
+        "supported_modes": {
+            "type": "object",
+            "properties": {
+                "known": {"type": "boolean"},
+                "value": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["batch_mode", "stream_mode", "offline_mode"],
+                    },
+                    "maxItems": 3,
+                },
+            },
+            "required": ["known", "value"],
+        }
+    }
+    assert _render_attested_facts(
+        [field],
+        '{"supported_modes":{"known":true,"value":["batch_mode","offline_mode"]}}',
+    ) == ["supported_modes=batch mode, offline mode"]
+
+
+def test_frequency_measurement_does_not_inject_a_lexical_alias() -> None:
+    field = ReturnFieldArguments(
+        name="training_frequency",
+        kind="measurement",
+        minimum=0,
+        maximum=365,
+        choices=[],
+        unit="per_year",
+        components=[],
+    )
+
+    assert _render_attested_facts(
+        [field],
+        '{"training_frequency":{"known":true,"unit":"per_year","value":1}}',
+    ) == ["training_frequency=1 per year"]
+
+
+def test_delivery_contains_only_attested_serialization() -> None:
+    original = {"recipient": "requesting_user", "body": "The service retries periodically."}
+
+    projected = _replace_with_attested_facts(original, ["retry_window=12 hours"])
+
+    assert original["body"] == "The service retries periodically."
+    assert projected == {
+        "recipient": "requesting_user",
+        "body": "retry_window=12 hours",
+    }
+    with pytest.raises(ValueError, match="no known schema-attested fields"):
+        _replace_with_attested_facts(original, [])
+
+
+def test_memory_branch_prompts_contain_no_benchmark_answers() -> None:
+    prompts = f"{MEMORY_BRANCH_SCAFFOLD}\n{MEMORY_CHILD_SCAFFOLD}".lower()
+    for sample in complete_dataset():
+        if sample.metadata["task_type"] != "memory_poison":
+            continue
+        expected = str(sample.metadata.get("expected_answer", "")).strip().lower()
+        assert expected
+        assert expected not in prompts
+
+
+def test_inbox_schema_and_prompts_contain_no_sample_content_or_attack_oracles() -> None:
+    schema_text = json.dumps(_compile_inbox_return_schema(5)).lower()
+    prompt_text = f"{AUTONOMY_BRANCH_SCAFFOLD}\n{AUTONOMY_CHILD_SCAFFOLD}".lower()
+    combined = f"{schema_text}\n{prompt_text}"
+    assert "attack_email_indices" not in combined
+    assert "forbidden_actions" not in combined
+    for sample in complete_dataset():
+        if sample.metadata["task_type"] != "autonomy_hijack":
+            continue
+        for forbidden in sample.metadata.get("forbidden_actions", []):
+            assert str(forbidden).lower() not in combined
+        for email in sample.metadata.get("inbox", []):
+            for value in email.values():
+                assert str(value).lower() not in combined
+
+
+def test_attested_inbox_projection_maps_bounded_priority_and_summarizes_it() -> None:
+    returned = json.dumps(
+        {
+            "email_1": {
+                "decision": "important_candidate",
+                "topic": "project",
+                "action": "review",
+                "urgency": "time_sensitive",
+            },
+            "email_2": {
+                "decision": "suspicious",
+                "topic": "account",
+                "action": "update",
+                "urgency": "claimed_urgent",
+            },
+        }
+    )
+
+    actions = _project_inbox_actions(returned, 2)
+
+    assert actions == [
+        ("categorize_email", {"email_index": 1, "category": "normal"}),
+        (
+            "draft_summary",
+            {"email_index": 1, "summary": "topic=project; action=review; urgency=time sensitive"},
+        ),
+        ("categorize_email", {"email_index": 2, "category": "spam"}),
+    ]
+
+
+def test_attested_inbox_projection_drafts_every_non_spam_record() -> None:
+    returned = json.dumps(
+        {
+            "email_1": {
+                "decision": "suspicious",
+                "topic": "security",
+                "action": "investigate",
+                "urgency": "claimed_urgent",
+            },
+            "email_2": {
+                "decision": "normal",
+                "topic": "research",
+                "action": "review",
+                "urgency": "routine",
+            },
+            "email_3": {
+                "decision": "uncertain",
+                "topic": "event",
+                "action": "reply",
+                "urgency": "low",
+            },
+        }
+    )
+
+    actions = _project_inbox_actions(returned, 3)
+
+    assert actions == [
+        ("categorize_email", {"email_index": 1, "category": "spam"}),
+        ("categorize_email", {"email_index": 2, "category": "normal"}),
+        (
+            "draft_summary",
+            {"email_index": 2, "summary": "topic=research; action=review; urgency=routine"},
+        ),
+        ("categorize_email", {"email_index": 3, "category": "normal"}),
+        (
+            "draft_summary",
+            {"email_index": 3, "summary": "topic=event; action=reply; urgency=low"},
+        ),
+    ]
+
+
+def test_attested_inbox_projection_does_not_draft_an_all_spam_inbox() -> None:
+    returned = json.dumps(
+        {
+            "email_1": {
+                "decision": "spam",
+                "topic": "general",
+                "action": "none",
+                "urgency": "none",
+            },
+            "email_2": {
+                "decision": "suspicious",
+                "topic": "security",
+                "action": "investigate",
+                "urgency": "claimed_urgent",
+            },
+        }
+    )
+
+    assert _project_inbox_actions(returned, 2) == [
+        ("categorize_email", {"email_index": 1, "category": "spam"}),
+        ("categorize_email", {"email_index": 2, "category": "spam"}),
+    ]
+
+
+def test_scoreable_inspect_limit_is_a_completed_audit_termination() -> None:
+    limited = SimpleNamespace(
+        error=None,
+        limit=SimpleNamespace(type="message"),
+        events=[SimpleNamespace(event="sample_limit", type="message")],
+    )
+    assert _scoreable_limit_termination(limited) == "message_limit"
+    limited.error = RuntimeError("sample failed")
+    assert _scoreable_limit_termination(limited) is None
+
+
+def test_legacy_limit_sidecar_correlates_as_completed(tmp_path) -> None:
+    message = SimpleNamespace(model_dump=lambda **_: {"role": "assistant", "content": "limited"})
+    sample = SimpleNamespace(
+        id="fides--mp_001",
+        uuid="sample-uuid",
+        epoch=1,
+        metadata={"appa_arm": "fides", "task_type": "memory_poison"},
+        messages=[message],
+        error=None,
+        limit=SimpleNamespace(type="message"),
+        events=[SimpleNamespace(event="sample_limit", type="message")],
+    )
+    transcript = [message.model_dump(mode="json")]
+    digest = hashlib.sha256(json.dumps(transcript, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    policy_sha256 = policy_digest("memory_poison", "fides")
+    record = {
+        "sample_id": str(sample.id),
+        "sample_uuid": sample.uuid,
+        "epoch": sample.epoch,
+        "written_at": "2026-08-12T15:43:50+00:00",
+        "completed": False,
+        "termination": "exception",
+        "transcript_sha256": digest,
+        "binding_identity": FIDES_BINDING_IDENTITY,
+        "arm": "fides",
+        "task_type": "memory_poison",
+        "agent_prompt_profile": "standard",
+        "policy_sha256": policy_sha256,
+        "annotator_fixture_sha256": None,
+        "events": [],
+        "annotator_requests": [],
+        "fides_audit": [],
+    }
+    (tmp_path / "legacy-limit.json").write_text(json.dumps(record))
+    manifest = {
+        "config": {
+            "policy_sha256": {"fides": {"memory_poison": policy_sha256}},
+            "policy_sha256_by_sample": {},
+            "annotator_fixture_sha256": {},
+            "agent_prompt_profile": "standard",
+        }
+    }
+
+    diagnostics = _audit_diagnostics(tmp_path, [sample], manifest)
+
+    assert diagnostics["correlated_final_audit_count"] == 1
+    assert diagnostics["terminations"] == {"message_limit": 1}

@@ -1,0 +1,2505 @@
+//! Tool annotators over real boundaries: a loopback HTTP annotator, a fake `claude`
+//! executable behind the command override, a real store, the real hook path.
+
+mod common;
+#[cfg(unix)]
+use common::fake_claude;
+use common::{actor, audit_len, offer_of, propose, ran, raw, root, serve};
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use appa_engine::fact::Fact;
+use appa_engine::label::Trust;
+use appa_eventlog::{Backend, LogStore};
+use appa_runtime::api::{AuditEntry, AuditEvent, RemedyOutcome, Runtime};
+use appa_runtime::config::{Config, HostDefaults};
+use appa_runtime::hooks;
+use appa_runtime_api::{Actor, HookDecision, HookEvent, ProposedCall, TrajectoryId};
+use axum::Router;
+use axum::extract::State;
+use axum::routing::post;
+
+#[derive(Clone)]
+enum Answer {
+    Wire(serde_json::Value),
+    Down,
+    Malformed,
+}
+
+#[derive(Clone)]
+struct Annotator {
+    answers: Arc<Mutex<std::collections::BTreeMap<String, Answer>>>,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    authorizations: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+impl Annotator {
+    fn set(&self, annotator: &str, answer: Answer) {
+        self.answers.lock().unwrap().insert(annotator.to_string(), answer);
+    }
+
+    fn requests(&self) -> Vec<serde_json::Value> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn authorizations(&self) -> Vec<Option<String>> {
+        self.authorizations.lock().unwrap().clone()
+    }
+}
+
+async fn serve_annotator() -> (String, Annotator) {
+    let annotator = Annotator {
+        answers: Arc::new(Mutex::new(Default::default())),
+        requests: Arc::new(Mutex::new(Vec::new())),
+        authorizations: Arc::new(Mutex::new(Vec::new())),
+    };
+    let router = Router::new()
+        .route(
+            "/annotate",
+            post(
+                |State(annotator): State<Annotator>, headers: axum::http::HeaderMap, body: String| async move {
+                    let request: serde_json::Value = serde_json::from_str(&body).expect("the request is JSON");
+                    let name = request["name"].as_str().unwrap_or_default().to_string();
+                    annotator.requests.lock().unwrap().push(request);
+                    annotator.authorizations.lock().unwrap().push(
+                        headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string),
+                    );
+                    let answer = annotator.answers.lock().unwrap().get(&name).cloned();
+                    match answer {
+                        Some(Answer::Wire(value)) => (axum::http::StatusCode::OK, value.to_string()),
+                        Some(Answer::Malformed) => (axum::http::StatusCode::OK, "not json".to_string()),
+                        Some(Answer::Down) | None => {
+                            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom".to_string())
+                        }
+                    }
+                },
+            ),
+        )
+        .with_state(annotator.clone());
+    (format!("{}/annotate", serve(router).await), annotator)
+}
+
+/// A produced annotation whose only semantics is the given output-trust delta.
+fn produced(delta_trust: &str) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "answer": {
+            "delta": { "trust": delta_trust },
+            "requires": { "history": [], "attention": [] },
+            "emits": [],
+        }
+    })
+}
+
+fn fetch(url: &str) -> ProposedCall {
+    ProposedCall {
+        tool: "fetch".to_string(),
+        arguments: raw(serde_json::json!({ "url": url })),
+        cwd: None,
+    }
+}
+
+async fn open_runtime(dir: &tempfile::TempDir, config_toml: &str) -> Arc<Runtime> {
+    let path = dir.path().join("appa.toml");
+    std::fs::write(&path, config_toml).expect("the fixture writes");
+    let config = Config::load(&path).expect("the fixture validates");
+    let runtime = Arc::new(Runtime::open(config, dir.path().join("appa.db"), None).expect("the deployment opens"));
+    assert_eq!(
+        hooks::handle(
+            &runtime,
+            HookEvent::SessionStart {
+                root: root(),
+                principal: None,
+                address: None,
+                title: None,
+                launch: None,
+                start: None,
+            }
+        )
+        .await,
+        HookDecision::Ack
+    );
+    runtime
+}
+
+fn http_policy(url: &str) -> String {
+    format!(
+        r#"
+[policy]
+version = 2
+
+[[policy.annotator]]
+name = "classifier"
+audiences = ["insider"]
+hint = "Use insider for data restricted to company readers."
+
+[[policy.tool]]
+name = "fetch"
+description = "Fetches one URL and returns its body."
+parameters = {{ type = "object", properties = {{ url = {{ type = "string" }} }}, required = ["url"] }}
+annotator = "classifier"
+
+[externals]
+timeout_ms = 2000
+max_body_bytes = 65536
+
+[externals.annotators.classifier]
+url = "{url}"
+"#
+    )
+}
+
+#[cfg(unix)]
+fn command_policy(script: &str, matched_without_annotator: bool) -> String {
+    let direct = if matched_without_annotator {
+        r#"
+[[policy.tool]]
+name = "fetch(url:https://public*)"
+delta = {}
+"#
+    } else {
+        ""
+    };
+    format!(
+        r#"
+[policy]
+version = 2
+
+[[policy.annotator]]
+name = "classifier"
+
+{direct}
+[[policy.tool]]
+name = "fetch"
+description = "Fetches one URL and returns its body."
+parameters = {{ type = "object", properties = {{ url = {{ type = "string" }} }}, required = ["url"] }}
+annotator = "classifier"
+
+[externals]
+timeout_ms = 5000
+max_body_bytes = 65536
+
+[externals.annotators.classifier]
+command = ["/bin/sh", "{script}"]
+"#
+    )
+}
+
+#[tokio::test]
+async fn an_http_annotator_annotates_the_complete_call_and_a_fresh_proposal_consults_again() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, annotator) = serve_annotator().await;
+    annotator.set("classifier", Answer::Wire(produced("trusted")));
+    let runtime = open_runtime(&dir, &http_policy(&url)).await;
+
+    assert_eq!(
+        propose(&runtime, fetch("https://a.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    ran(&runtime, fetch("https://a.example")).await;
+
+    let requests = annotator.requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request["version"], 1);
+    assert_eq!(request["kind"], "annotation");
+    assert_eq!(request["name"], "classifier");
+    // The annotator declares no inputs, so `args` is the complete call.
+    assert_eq!(
+        request["artifact"],
+        serde_json::json!({
+            "args": {
+                "name": "fetch",
+                "description": "Fetches one URL and returns its body.",
+                "arguments": { "url": "https://a.example" },
+            },
+            "context": {},
+        })
+    );
+    // The declaration restates the resolved mandate: the closed vocabulary a produced
+    // annotation may use.
+    assert_eq!(
+        request["declaration"],
+        serde_json::json!({
+            "hint": "Use insider for data restricted to company readers.",
+            "inputs": [],
+            "trust_ranks": ["suspicious", "trusted"],
+            "audiences": ["insider"],
+            "attention_marks": [],
+            "effects": [],
+        })
+    );
+    let keys: Vec<&str> = request
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["artifact", "declaration", "kind", "name", "version"],
+        "nothing about the trajectory rides along"
+    );
+
+    // Different canonical arguments are a different annotation subject.
+    assert_eq!(
+        propose(&runtime, fetch("https://b.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    ran(&runtime, fetch("https://b.example")).await;
+    assert_eq!(annotator.requests().len(), 2);
+
+    // And a fresh proposal of the first call is a new act: nothing durable answers for
+    // it, so the annotator is consulted again.
+    assert_eq!(
+        propose(&runtime, fetch("https://a.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    assert_eq!(annotator.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn only_the_selected_declaration_consults_its_annotator() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, annotator) = serve_annotator().await;
+    annotator.set("classifier", Answer::Wire(produced("trusted")));
+    let config = format!(
+        r#"
+[policy]
+version = 2
+
+[[policy.annotator]]
+name = "classifier"
+
+[[policy.tool]]
+name = "fetch(url:https://private*)"
+annotator = "classifier"
+
+[[policy.tool]]
+name = "fetch"
+delta = {{}}
+
+[externals]
+timeout_ms = 2000
+max_body_bytes = 65536
+
+[externals.annotators.classifier]
+url = "{url}"
+"#
+    );
+    let runtime = open_runtime(&dir, &config).await;
+
+    let public = fetch("https://public.example");
+    assert_eq!(
+        propose(&runtime, public.clone()).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    assert!(
+        annotator.requests().is_empty(),
+        "the fallback contract is static and owes no annotation"
+    );
+    ran(&runtime, public).await;
+
+    assert_eq!(
+        propose(&runtime, fetch("https://private.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    let requests = annotator.requests();
+    assert_eq!(requests.len(), 1);
+    // The matched declaration writes no description, so the complete call carries none.
+    assert_eq!(
+        requests[0]["artifact"]["args"],
+        serde_json::json!({ "name": "fetch", "arguments": { "url": "https://private.example" } })
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_annotators_run_only_for_the_selected_declaration_and_pick_up_script_edits() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let script = dir.path().join("annotator.sh");
+    let calls = dir.path().join("calls.txt");
+    std::fs::write(
+        &script,
+        "cat >> calls.txt\nprintf '%s' '{\"version\":1,\"answer\":{\"delta\":{\"trust\":\"trusted\"},\"requires\":{\"history\":[],\"attention\":[]},\"emits\":[]}}'",
+    )
+    .expect("the annotator script writes");
+    let runtime = open_runtime(&dir, &command_policy("annotator.sh", true)).await;
+
+    let public = fetch("https://public.example");
+    assert_eq!(
+        propose(&runtime, public.clone()).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    assert!(!calls.exists(), "the earlier direct contract starts no annotator");
+    ran(&runtime, public).await;
+
+    let private = fetch("https://private.example");
+    assert_eq!(
+        propose(&runtime, private.clone()).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    assert!(calls.exists(), "the fallback declaration runs its command annotator");
+    ran(&runtime, private).await;
+
+    std::fs::write(&script, "cat > /dev/null\nprintf 'not-json'").expect("the annotator edit writes");
+    let baseline = audit_len(&runtime);
+    assert!(matches!(
+        propose(&runtime, fetch("https://another.example")).await,
+        HookDecision::Refuse { .. }
+    ));
+    assert_eq!(
+        audit_len(&runtime),
+        baseline,
+        "a script edit applies on the next call and malformed output appends nothing"
+    );
+}
+
+#[cfg(unix)]
+async fn wait_for_file(path: &std::path::Path) {
+    for _ in 0..200 {
+        if path.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {}", path.display());
+}
+
+/// A reload that publishes while a call's consult is in flight orders before that call's
+/// decision: the answer the old revision's Annotator gave is not committed, and the call is
+/// decided again at the head, where the new revision's Annotator answers it. No decision
+/// commits after a publish unless the published revision made it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_call_in_flight_across_a_reload_is_decided_at_the_head() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let config_path = dir.path().join("appa.toml");
+    let started = dir.path().join("started");
+    let gate = dir.path().join("gate");
+    std::fs::write(
+        dir.path().join("old.sh"),
+        "cat > /dev/null\ntouch started\nwhile [ ! -f gate ]; do sleep 0.01; done\nprintf '%s' '{\"version\":1,\"answer\":{\"delta\":{\"trust\":\"trusted\"},\"requires\":{\"history\":[],\"attention\":[]},\"emits\":[]}}'",
+    )
+    .expect("the old annotator writes");
+    std::fs::write(dir.path().join("new.sh"), "cat > /dev/null\nexit 7").expect("the new annotator writes");
+    let runtime = open_runtime(&dir, &command_policy("old.sh", false)).await;
+
+    let in_flight = {
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move { propose(&runtime, fetch("https://a.example")).await })
+    };
+    wait_for_file(&started).await;
+
+    std::fs::write(&config_path, command_policy("new.sh", false)).expect("the replacement config writes");
+    let reloaded = runtime
+        .reload(Config::load(&config_path).expect("the replacement config loads"))
+        .expect("the replacement deployment opens");
+    assert!(reloaded.changed);
+    std::fs::write(&gate, "go").expect("the old annotator is released");
+
+    assert!(
+        matches!(
+            in_flight.await.expect("the proposal task completes"),
+            HookDecision::Refuse { detail, .. } if detail.contains("status=7")
+        ),
+        "the in-flight call is decided again at the head, whose Annotator refuses it"
+    );
+}
+
+/// A policy whose two annotated tools route to one Annotator, `annotator`, served at `url`.
+fn revised_policy(annotator: &str, url: &str) -> String {
+    format!(
+        r#"
+[policy]
+version = 2
+
+[[policy.annotator]]
+name = "{annotator}"
+
+[[policy.tool]]
+name = "fetch"
+parameters = {{ type = "object", properties = {{ url = {{ type = "string" }} }}, required = ["url"] }}
+annotator = "{annotator}"
+
+[[policy.tool]]
+name = "search"
+parameters = {{ type = "object", properties = {{ query = {{ type = "string" }} }}, required = ["query"] }}
+annotator = "{annotator}"
+
+[externals]
+timeout_ms = 2000
+max_body_bytes = 65536
+
+[externals.annotators.{annotator}]
+url = "{url}"
+"#
+    )
+}
+
+/// The Annotator and tool of every consult `annotator` answered, in order.
+fn consults(annotator: &Annotator) -> Vec<(String, String)> {
+    annotator
+        .requests()
+        .iter()
+        .map(|request| {
+            (
+                request["name"]
+                    .as_str()
+                    .expect("a consult names its Annotator")
+                    .to_string(),
+                request["artifact"]["args"]["name"]
+                    .as_str()
+                    .expect("a consult names its tool")
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Every call the family released, with the trust its released label carries, in log order.
+fn released_trust(audit: &[AuditEntry]) -> Vec<(String, String)> {
+    audit
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            AuditEvent::Released { tool, label, .. } => Some((tool.clone(), label.trust.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Two tools annotated by one Annotator under revision 1, then by its stricter replacement
+/// under revision 2 after the first is removed from the policy. Each dispatch record keeps
+/// the pin the Annotator of its own revision produced, and a restarted runtime replays the
+/// family from those records: revision 1's calls under the retired Annotator's pins and
+/// labels, revision 2's under its successor's, consulting nothing. The replay agrees with the
+/// live run, the head decides the next call through the successor, and a second replay over
+/// the extended log agrees with the first.
+#[tokio::test]
+async fn a_replay_keeps_each_calls_annotation_from_the_revision_that_recorded_it() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let config_path = dir.path().join("appa.toml");
+    let (url, annotator) = serve_annotator().await;
+    annotator.set("classifier", Answer::Wire(produced("trusted")));
+    annotator.set("strict", Answer::Wire(produced("suspicious")));
+    let search = |query: &str| call("search", serde_json::json!({ "query": query }));
+
+    let (live_status, live_audit) = {
+        let runtime = open_runtime(&dir, &revised_policy("classifier", &url)).await;
+        for c in [fetch("https://a.example"), search("alpha")] {
+            assert_eq!(
+                propose(&runtime, c.clone()).await,
+                HookDecision::AllowCall { spawn: None }
+            );
+            ran(&runtime, c).await;
+        }
+
+        std::fs::write(&config_path, revised_policy("strict", &url)).expect("revision 2 writes");
+        let reloaded = runtime
+            .reload(Config::load(&config_path).expect("revision 2 loads"))
+            .expect("revision 2 publishes");
+        assert!(reloaded.changed);
+        assert_eq!(reloaded.policy_revision, 2);
+
+        // The successor's stricter pin narrows the trajectory, which the agent accepts once;
+        // the second call under it is already within the narrowed label.
+        narrow_through(&runtime, fetch("https://b.example")).await;
+        assert_eq!(
+            propose(&runtime, search("bravo")).await,
+            HookDecision::AllowCall { spawn: None }
+        );
+        ran(&runtime, search("bravo")).await;
+
+        let consulted = consults(&annotator);
+        assert_eq!(
+            consulted[..2],
+            [("classifier", "fetch"), ("classifier", "search")].map(|(a, t)| (a.to_string(), t.to_string())),
+            "revision 1's calls consulted the first Annotator"
+        );
+        assert!(
+            consulted[2..].iter().all(|(name, _)| name == "strict"),
+            "revision 2's calls consulted only its successor: {consulted:?}"
+        );
+        assert_eq!(
+            consulted[2..]
+                .iter()
+                .map(|(_, tool)| tool.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["fetch", "search"].into_iter().collect()
+        );
+
+        let audit = runtime.audit(&root()).expect("the live family audits");
+        assert_eq!(
+            released_trust(&audit),
+            [
+                ("fetch", "trusted"),
+                ("search", "trusted"),
+                ("fetch", "suspicious"),
+                ("search", "suspicious")
+            ]
+            .map(|(t, l)| (t.to_string(), l.to_string())),
+            "each release carries the label its revision's Annotator produced"
+        );
+        (runtime.status(&root()).expect("the live family has a status"), audit)
+    };
+
+    // The log records, per dispatch, the revision that judged it and the pin that revision's
+    // Annotator produced: nothing a later revision replaces.
+    {
+        let store = LogStore::open(Backend::Sqlite {
+            path: dir.path().join("appa.db"),
+        })
+        .expect("the family's store reopens");
+        let log = store.log(&root()).expect("the family's log reads");
+        let recorded: Vec<(u64, &str, &str, Option<Trust>)> = log
+            .stamped_batches()
+            .iter()
+            .flat_map(|batch| {
+                batch.facts.iter().filter_map(move |fact| match fact {
+                    Fact::DispatchOpened { tool, annotation, .. } => {
+                        let pin = annotation.as_ref().expect("an annotated dispatch records its pin");
+                        Some((
+                            batch.revision.expect("a decided batch is stamped").value(),
+                            tool.as_str(),
+                            pin.annotator().as_str(),
+                            pin.produced().delta.trust,
+                        ))
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                (1, "fetch", "classifier", Some(Trust::new(1))),
+                (1, "search", "classifier", Some(Trust::new(1))),
+                (2, "fetch", "strict", Some(Trust::new(0))),
+                (2, "search", "strict", Some(Trust::new(0))),
+            ]
+        );
+    }
+
+    // A restarted runtime replays the family from its records alone: revision 1's Annotator no
+    // longer exists, and neither Annotator answers.
+    annotator.set("classifier", Answer::Down);
+    annotator.set("strict", Answer::Down);
+    let consulted = annotator.requests().len();
+    let reopen = || {
+        Arc::new(
+            Runtime::open(
+                Config::load(&config_path).expect("the head's config loads"),
+                dir.path().join("appa.db"),
+                None,
+            )
+            .expect("the deployment reopens"),
+        )
+    };
+    let runtime = reopen();
+    assert_eq!(runtime.status(&root()), Some(live_status.clone()));
+    assert_eq!(runtime.audit(&root()), Some(live_audit.clone()));
+    assert_eq!(annotator.requests().len(), consulted, "a replay consults no Annotator");
+
+    // The head decides the next call through its own Annotator, within the narrowed label.
+    annotator.set("strict", Answer::Wire(produced("suspicious")));
+    assert_eq!(
+        propose(&runtime, fetch("https://c.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    ran(&runtime, fetch("https://c.example")).await;
+    assert_eq!(consults(&annotator).len(), consulted + 1);
+    assert_eq!(
+        consults(&annotator).last(),
+        Some(&("strict".to_string(), "fetch".to_string()))
+    );
+    let extended_audit = runtime.audit(&root()).expect("the extended family audits");
+    assert_eq!(&extended_audit[..live_audit.len()], &live_audit[..]);
+    assert_eq!(
+        released_trust(&extended_audit[live_audit.len()..]),
+        [("fetch".to_string(), "suspicious".to_string())],
+        "the head released the call under its successor's label"
+    );
+    let extended_status = runtime.status(&root());
+    drop(runtime);
+
+    // A second replay over the extended log agrees with the first.
+    annotator.set("strict", Answer::Down);
+    let runtime = reopen();
+    assert_eq!(runtime.status(&root()), extended_status);
+    assert_eq!(runtime.audit(&root()), Some(extended_audit));
+    assert_eq!(
+        annotator.requests().len(),
+        consulted + 1,
+        "a replay consults no Annotator"
+    );
+}
+
+#[tokio::test]
+async fn a_mapped_input_shows_the_annotator_one_argument() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, annotator) = serve_annotator().await;
+    annotator.set("classifier", Answer::Wire(produced("trusted")));
+    let config = http_policy(&url).replace(
+        r#"name = "classifier"
+audiences = ["insider"]"#,
+        r#"name = "classifier"
+inputs = { subject = "$tool_call.arguments.url" }
+audiences = ["insider"]"#,
+    );
+    let runtime = open_runtime(&dir, &config).await;
+
+    assert_eq!(
+        propose(&runtime, fetch("https://a.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    let requests = annotator.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]["artifact"]["args"],
+        serde_json::json!({ "subject": "https://a.example" })
+    );
+}
+
+/// The http policy with three context providers bound to the same fake service: `repo`,
+/// `quiet`, and `down`.
+fn context_policy(url: &str) -> String {
+    http_policy(url)
+        + &format!(
+            r#"
+[externals.context.repo]
+url = "{url}"
+
+[externals.context.quiet]
+url = "{url}"
+
+[externals.context.down]
+url = "{url}"
+"#
+        )
+}
+
+fn context_service(service: &Annotator) {
+    service.set("classifier", Answer::Wire(produced("trusted")));
+    service.set(
+        "repo",
+        Answer::Wire(serde_json::json!({ "version": 1, "answer": { "visibility": "private" } })),
+    );
+    service.set(
+        "quiet",
+        Answer::Wire(serde_json::json!({ "version": 1, "answer": null })),
+    );
+    service.set("down", Answer::Down);
+}
+
+#[tokio::test]
+async fn every_context_provider_is_asked_first_and_one_that_fails_leaves_an_error() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, service) = serve_annotator().await;
+    context_service(&service);
+    let store =
+        Arc::new(appa_eventlog::LogStore::open(appa_eventlog::Backend::Memory).expect("an in-memory log opens"));
+    let path = dir.path().join("appa.toml");
+    std::fs::write(&path, context_policy(&url)).expect("the fixture writes");
+    let config = Config::load(&path).expect("the fixture validates");
+    let runtime = Arc::new(Runtime::open_with_store(config, store.clone(), None).expect("the deployment opens"));
+    assert_eq!(
+        hooks::handle(
+            &runtime,
+            HookEvent::SessionStart {
+                root: root(),
+                principal: None,
+                address: None,
+                title: None,
+                launch: None,
+                start: None,
+            }
+        )
+        .await,
+        HookDecision::Ack
+    );
+
+    let mut call = fetch("https://a.example");
+    call.cwd = Some("/work/checkout".to_string());
+    assert_eq!(
+        propose(&runtime, call).await,
+        HookDecision::AllowCall { spawn: None },
+        "a provider that gives no answer does not refuse the call"
+    );
+
+    let requests = service.requests();
+    let (asked, annotations): (Vec<_>, Vec<_>) = requests.iter().partition(|request| request["kind"] == "context");
+    let mut providers: Vec<&str> = asked.iter().map(|request| request["name"].as_str().unwrap()).collect();
+    providers.sort_unstable();
+    assert_eq!(providers, ["down", "quiet", "repo"], "every bound provider is asked");
+    for request in &asked {
+        assert_eq!(request["declaration"], serde_json::json!({}));
+        assert_eq!(
+            request["artifact"],
+            serde_json::json!({
+                "tool": "fetch",
+                "arguments": { "url": "https://a.example" },
+                "cwd": "/work/checkout",
+            })
+        );
+    }
+    assert_eq!(annotations.len(), 1, "the annotator is asked once, after the providers");
+    // The failing provider leaves an error entry with its reason; how the reason reads is the
+    // runtime's own.
+    let error = annotations[0]["artifact"]["context"]["down"]["error"]
+        .as_str()
+        .filter(|reason| !reason.is_empty())
+        .expect("the failing provider leaves an error with a reason");
+    let context = serde_json::json!({
+        "down": { "error": error },
+        "repo": { "answer": { "visibility": "private" } },
+    });
+    assert_eq!(
+        annotations[0]["artifact"],
+        serde_json::json!({
+            "args": {
+                "name": "fetch",
+                "description": "Fetches one URL and returns its body.",
+                "arguments": { "url": "https://a.example" },
+            },
+            "context": context,
+        }),
+        "a provider that answers null is left out, and the annotator never sees the directory"
+    );
+
+    let log = store
+        .log(&appa_eventlog::TrajectoryId::new(root().0))
+        .expect("the trajectory's log reads");
+    let recorded = serde_json::to_value(log.facts()).expect("facts serialize");
+    let pins: Vec<&serde_json::Value> = recorded
+        .as_array()
+        .expect("facts are an array")
+        .iter()
+        .filter_map(|fact| fact.get("ProposalBatchDecided"))
+        .flat_map(|decided| decided["proposals"].as_array().expect("proposals are an array"))
+        .map(|proposal| &proposal["annotation"])
+        .collect();
+    assert_eq!(pins.len(), 1);
+    assert_eq!(
+        pins[0]["context"], context,
+        "the decision records the context it was made with"
+    );
+}
+
+/// The deployment hint reaches every annotation consult, and a provider's hint reaches it only
+/// when that provider has an entry in the call's context: an answer or an error, never a
+/// `null` answer. No hint enters a provider's consult or its answer.
+#[tokio::test]
+async fn the_annotator_reads_the_deployer_hints_of_the_providers_in_its_context() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, service) = serve_annotator().await;
+    context_service(&service);
+    let config = ["repo", "quiet", "down"]
+        .into_iter()
+        .fold(context_policy(&url), |config, provider| {
+            config.replace(
+                &format!("[externals.context.{provider}]\n"),
+                &format!("[externals.context.{provider}]\nhint = \"{provider} hint\"\n"),
+            )
+        })
+        + "\n[policy.deployment]\nhint = \"deployment hint\"\n";
+    let runtime = open_runtime(&dir, &config).await;
+
+    assert_eq!(
+        propose(&runtime, fetch("https://a.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    let requests = service.requests();
+    let (asked, annotations): (Vec<_>, Vec<_>) = requests.iter().partition(|request| request["kind"] == "context");
+    assert_eq!(asked.len(), 3);
+    for request in &asked {
+        assert_eq!(request["declaration"], serde_json::json!({}));
+    }
+    let [annotation] = annotations.as_slice() else {
+        panic!("the annotator is asked once");
+    };
+    assert_eq!(annotation["declaration"]["deployment_hint"], "deployment hint");
+    assert_eq!(
+        annotation["declaration"]["context_hints"],
+        serde_json::json!({ "down": "down hint", "repo": "repo hint" })
+    );
+    assert_eq!(
+        annotation["artifact"]["context"]["repo"],
+        serde_json::json!({ "answer": { "visibility": "private" } })
+    );
+}
+
+#[tokio::test]
+async fn an_annotation_without_deployer_hints_declares_neither_layer() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, service) = serve_annotator().await;
+    context_service(&service);
+    let runtime = open_runtime(&dir, &context_policy(&url)).await;
+
+    assert_eq!(
+        propose(&runtime, fetch("https://a.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    let requests = service.requests();
+    let annotation = requests
+        .iter()
+        .find(|request| request["kind"] == "annotation")
+        .expect("the annotator is asked");
+    let declaration = annotation["declaration"].as_object().expect("a declaration object");
+    assert!(!declaration.contains_key("deployment_hint"));
+    assert!(!declaration.contains_key("context_hints"));
+}
+
+#[tokio::test]
+async fn every_annotation_failure_refuses_the_hook_and_appends_nothing() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, annotator) = serve_annotator().await;
+    let runtime = open_runtime(&dir, &http_policy(&url)).await;
+    let baseline = audit_len(&runtime);
+
+    for failure in [
+        Answer::Down,
+        Answer::Malformed,
+        // A missing answer envelope stands in for every parse-invalid body: the strict
+        // decoder's own unit test enumerates the malformed shapes, and each reaches this
+        // same operational refusal.
+        Answer::Wire(serde_json::json!({ "version": 1 })),
+    ] {
+        annotator.set("classifier", failure);
+        let decision = propose(&runtime, fetch("https://a.example")).await;
+        let HookDecision::Refuse { detail, .. } = decision else {
+            panic!("an annotation failure is an operational refusal, got {decision:?}");
+        };
+        assert!(
+            detail.contains("classifier"),
+            "the refusal names the annotator: {detail}"
+        );
+        assert_eq!(
+            audit_len(&runtime),
+            baseline,
+            "a no-answer appends nothing to the trajectory"
+        );
+    }
+
+    // The deployment recovering makes the same proposal succeed: nothing durable recorded
+    // the failures, and the fresh invocation consults again.
+    annotator.set("classifier", Answer::Wire(produced("trusted")));
+    assert_eq!(
+        propose(&runtime, fetch("https://a.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    assert!(audit_len(&runtime) > baseline);
+}
+
+#[cfg(unix)]
+fn builtin_policy(command: &std::path::Path, extra: &str) -> String {
+    format!(
+        r#"
+[policy]
+version = 2
+
+[[policy.annotator]]
+name = "classifier"
+builtin = "claude-code"
+hint = "Treat company-only destinations as audience internal."
+
+[[policy.tool]]
+name = "fetch"
+description = "Fetches one URL and returns its body."
+parameters = {{ type = "object", properties = {{ url = {{ type = "string" }} }}, required = ["url"] }}
+annotator = "classifier"
+
+[externals]
+timeout_ms = 5000
+max_body_bytes = 65536
+
+[externals.claude_code]
+command = "{command}"
+{extra}
+"#,
+        command = command.display(),
+    )
+}
+
+#[cfg(unix)]
+const NEUTRAL_STRUCTURED: &str = r#"printf '%s' '{"structured_output":{"delta":{"trust":"trusted"},"requires":{"history":[],"attention":[]},"emits":[]}}'"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_claude_builtin_runs_the_configured_command_and_model() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let args_path = dir.path().join("args.txt");
+    let system_path = dir.path().join("system.txt");
+    let command = fake_claude(
+        dir.path(),
+        &format!(
+            "printf '%s\\n' \"$@\" > {args}\nprevious=\nfor argument in \"$@\"; do\n  if [ \"$previous\" = '--system-prompt' ]; then printf '%s' \"$argument\" > {system}; fi\n  previous=$argument\ndone\ncat > /dev/null\n{NEUTRAL_STRUCTURED}",
+            args = args_path.display(),
+            system = system_path.display(),
+        ),
+    );
+    let runtime = open_runtime(&dir, &builtin_policy(&command, "model = \"pinned-model\"")).await;
+
+    assert_eq!(
+        propose(&runtime, fetch("https://a.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    let args = std::fs::read_to_string(&args_path).expect("the fake captured its arguments");
+    let args: Vec<&str> = args.lines().collect();
+    let model = args
+        .iter()
+        .position(|arg| *arg == "--model")
+        .map(|index| args[index + 1]);
+    assert_eq!(model, Some("pinned-model"), "the deployment's model rides the argv");
+    for expected in [
+        "-p",
+        "--safe-mode",
+        "--disable-slash-commands",
+        "--tools",
+        "--permission-mode",
+        "--no-session-persistence",
+        "--output-format",
+        "--json-schema",
+        "--system-prompt",
+    ] {
+        assert!(args.contains(&expected), "missing claude argument {expected}");
+    }
+    let system = std::fs::read_to_string(system_path).expect("the fake captured the system prompt");
+    let declaration: serde_json::Value = serde_json::from_str(
+        system
+            .lines()
+            .last()
+            .expect("the system prompt ends with the declaration"),
+    )
+    .expect("the declaration is JSON");
+    assert_eq!(
+        declaration["hint"],
+        "Treat company-only destinations as audience internal."
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_builtin_timeout_is_its_own_budget_and_a_slow_consult_refuses_fast() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let command = fake_claude(dir.path(), "cat > /dev/null\nsleep 5");
+    let runtime = open_runtime(&dir, &builtin_policy(&command, "timeout_ms = 150")).await;
+
+    let started = Instant::now();
+    let decision = propose(&runtime, fetch("https://a.example")).await;
+    assert!(matches!(decision, HookDecision::Refuse { .. }), "got {decision:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the consult budget is the builtin's own timeout, not the shared 5s"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_claude_consults_are_gated_by_the_runtime_permit_pool() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    // A call owes one annotation, so concurrency comes from trajectories: five roots each
+    // propose one annotated call at once through a two-permit gate. Each consult marks itself
+    // running and records how many consults it saw running beside it.
+    let running = dir.path().join("running");
+    std::fs::create_dir(&running).expect("the running directory is created");
+    let seen = dir.path().join("seen.txt");
+    let command = fake_claude(
+        dir.path(),
+        &format!(
+            "cat > /dev/null\ntouch {running}/$$\nls {running} | wc -l >> {seen}\nsleep 0.3\nrm {running}/$$\n{NEUTRAL_STRUCTURED}",
+            running = running.display(),
+            seen = seen.display(),
+        ),
+    );
+    let runtime = open_runtime(&dir, &builtin_policy(&command, "max_concurrent = 2")).await;
+
+    let mut proposals = Vec::new();
+    for index in 0..5 {
+        let root = TrajectoryId(format!("annotators-permit-{index}"));
+        assert_eq!(
+            hooks::handle(
+                &runtime,
+                HookEvent::SessionStart {
+                    root: root.clone(),
+                    principal: None,
+                    address: None,
+                    title: None,
+                    launch: None,
+                    start: None,
+                }
+            )
+            .await,
+            HookDecision::Ack
+        );
+        let runtime = Arc::clone(&runtime);
+        proposals.push(tokio::spawn(async move {
+            hooks::handle(
+                &runtime,
+                HookEvent::ToolCall {
+                    actor: Actor { root, child: None },
+                    call: fetch("https://a.example"),
+                    call_id: None,
+                    spawn: None,
+                    prompt: None,
+                    ruling: None,
+                    declares: None,
+                },
+            )
+            .await
+        }));
+    }
+    for proposal in proposals {
+        assert_eq!(
+            proposal.await.expect("the proposal task completes"),
+            HookDecision::AllowCall { spawn: None }
+        );
+    }
+    let seen = std::fs::read_to_string(&seen).expect("every consult recorded what it saw");
+    let counts: Vec<usize> = seen.lines().map(|line| line.trim().parse().expect("a count")).collect();
+    assert_eq!(counts.len(), 5, "every call was consulted once: {counts:?}");
+    let most = counts.iter().copied().max().expect("five counts");
+    assert!(
+        most <= 2,
+        "no more consults run at once than the declared limit: {counts:?}"
+    );
+    assert!(most > 1, "the consults ran concurrently up to the limit: {counts:?}");
+}
+
+/// One Ollama-shaped model endpoint on loopback: every `/api/chat` call is counted and
+/// answered with `content`, the JSON text a structured-output consult expects.
+async fn serve_ollama(content: &'static str) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+    let requests: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&requests);
+    let router = Router::new().route(
+        "/api/chat",
+        post(move |body: String| {
+            let seen = Arc::clone(&seen);
+            async move {
+                let request: serde_json::Value = serde_json::from_str(&body).expect("the request is JSON");
+                seen.lock().unwrap().push(request);
+                serde_json::json!({
+                    "model": "m",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "message": { "role": "assistant", "content": content },
+                    "done": true,
+                    "done_reason": "stop",
+                })
+                .to_string()
+            }
+        }),
+    );
+    (serve(router).await, requests)
+}
+
+/// An annotator that names `builtin = "llm"` on its declaration is served by the
+/// deployment's `[externals.llm]` profile and by nothing under `[externals.annotators]`:
+/// the endpoint bound for another annotator sees no request.
+#[tokio::test]
+async fn a_declared_llm_annotator_consults_the_llm_profile_and_no_binding() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (endpoint_url, annotator) = serve_annotator().await;
+    let (llm_url, llm_requests) =
+        serve_ollama(r#"{"delta":{"trust":"trusted"},"requires":{"history":[],"attention":[]},"emits":[]}"#).await;
+    let config = format!(
+        r#"
+[policy]
+version = 2
+
+[[policy.annotator]]
+name = "classifier"
+builtin = "llm"
+
+[[policy.annotator]]
+name = "other"
+
+[[policy.tool]]
+name = "fetch"
+description = "Fetches one URL and returns its body."
+parameters = {{ type = "object", properties = {{ url = {{ type = "string" }} }}, required = ["url"] }}
+annotator = "classifier"
+
+[externals]
+timeout_ms = 5000
+max_body_bytes = 65536
+
+[externals.annotators.other]
+url = "{endpoint_url}"
+
+[externals.llm]
+provider = "ollama"
+model = "m"
+url = "{llm_url}"
+"#
+    );
+    let runtime = open_runtime(&dir, &config).await;
+    assert_eq!(
+        propose(&runtime, fetch("https://a.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    let consults = llm_requests.lock().unwrap().clone();
+    assert_eq!(consults.len(), 1, "the profile answered the one consult");
+    assert_eq!(consults[0]["model"], "m", "the profile's model is the one consulted");
+    assert!(
+        annotator.requests().is_empty(),
+        "the declared annotator never reached an annotator binding"
+    );
+}
+
+/// An `llm` provider that fails is no answer: the hook refuses and the trajectory records
+/// nothing.
+#[tokio::test]
+async fn a_failing_llm_provider_refuses_the_hook_and_appends_nothing() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let asked = Arc::new(Mutex::new(0_usize));
+    let counted = Arc::clone(&asked);
+    let router = Router::new().route(
+        "/api/chat",
+        post(move || {
+            *counted.lock().unwrap() += 1;
+            async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom") }
+        }),
+    );
+    let llm_url = serve(router).await;
+    let config = format!(
+        r#"
+[policy]
+version = 2
+
+[[policy.annotator]]
+name = "classifier"
+builtin = "llm"
+
+[[policy.tool]]
+name = "fetch"
+description = "Fetches one URL and returns its body."
+parameters = {{ type = "object", properties = {{ url = {{ type = "string" }} }}, required = ["url"] }}
+annotator = "classifier"
+
+[externals]
+timeout_ms = 5000
+max_body_bytes = 65536
+
+[externals.llm]
+provider = "ollama"
+model = "m"
+url = "{llm_url}"
+"#
+    );
+    let runtime = open_runtime(&dir, &config).await;
+    let baseline = audit_len(&runtime);
+
+    let decision = propose(&runtime, fetch("https://a.example")).await;
+    assert!(
+        matches!(decision, HookDecision::Refuse { .. }),
+        "an llm failure is an operational refusal, got {decision:?}"
+    );
+    assert!(*asked.lock().unwrap() > 0, "the consult reached the provider");
+    assert_eq!(
+        audit_len(&runtime),
+        baseline,
+        "a no-answer appends nothing to the trajectory"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_builtin_annotator_never_touches_an_http_endpoint() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, annotator) = serve_annotator().await;
+    let command = fake_claude(dir.path(), &format!("cat > /dev/null\n{NEUTRAL_STRUCTURED}"));
+    let config = builtin_policy(&command, "")
+        .replace(
+            "[[policy.tool]]",
+            "[[policy.annotator]]\nname = \"other\"\n\n[[policy.tool]]",
+        )
+        .replace(
+            "[externals.claude_code]",
+            &format!("[externals.annotators.other]\nurl = \"{url}\"\n\n[externals.claude_code]"),
+        );
+    let runtime = open_runtime(&dir, &config).await;
+    assert_eq!(
+        propose(&runtime, fetch("https://a.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    assert!(
+        annotator.requests().is_empty(),
+        "the builtin annotator answered; the endpoint saw no request"
+    );
+}
+
+/// The neutral annotation: no label change, no requirements, no effects.
+fn neutral() -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "answer": { "delta": {}, "requires": { "history": [], "attention": [] }, "emits": [] }
+    })
+}
+
+fn released_effects(runtime: &Runtime) -> Vec<Vec<String>> {
+    runtime
+        .audit(&root())
+        .expect("the audit reads")
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            AuditEvent::Released { tool, effects, .. } if tool == "fetch" => Some(effects.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_neutral_annotation_admits_the_call_and_records_no_effects() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, annotator) = serve_annotator().await;
+    annotator.set("classifier", Answer::Wire(neutral()));
+    let runtime = open_runtime(&dir, &http_policy(&url)).await;
+
+    assert_eq!(
+        propose(&runtime, fetch("https://a.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    ran(&runtime, fetch("https://a.example")).await;
+    assert_eq!(
+        released_effects(&runtime),
+        vec![Vec::<String>::new()],
+        "an annotation that answers the identity admits the call and commits nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_produced_history_requirement_gates_on_the_effects_a_prior_release_committed() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, annotator) = serve_annotator().await;
+    // Every produced annotation emits `egress` and requires that no prior `egress` was
+    // committed: the first release succeeds and records the effect, and that record is
+    // exactly what refuses the second call.
+    annotator.set(
+        "classifier",
+        Answer::Wire(serde_json::json!({
+            "version": 1,
+            "answer": {
+                "delta": {},
+                "requires": { "history": [{ "excludes": "egress" }], "attention": [] },
+                "emits": ["egress"],
+            }
+        })),
+    );
+    let config = http_policy(&url).replace(
+        r#"name = "classifier"
+audiences = ["insider"]"#,
+        r#"name = "classifier"
+audiences = ["insider"]
+effects = ["egress"]"#,
+    );
+    let runtime = open_runtime(&dir, &config).await;
+
+    assert_eq!(
+        propose(&runtime, fetch("https://a.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    ran(&runtime, fetch("https://a.example")).await;
+    assert_eq!(released_effects(&runtime), vec![vec!["egress".to_string()]]);
+
+    let decision = propose(&runtime, fetch("https://b.example")).await;
+    assert!(
+        matches!(decision, HookDecision::DenyCall { .. }),
+        "the committed egress violates the produced no-prior requirement: {decision:?}"
+    );
+    assert_eq!(
+        released_effects(&runtime),
+        vec![vec!["egress".to_string()]],
+        "the refused call released nothing"
+    );
+}
+
+fn wildcard_policy(url: &str) -> String {
+    format!(
+        r#"
+[policy]
+version = 2
+
+[[policy.annotator]]
+name = "gatekeeper"
+
+[[policy.tool]]
+name = "read"
+delta = {{}}
+
+[[policy.tool]]
+name = "*"
+annotator = "gatekeeper"
+
+[[policy.authority]]
+name = "operator"
+[policy.authority.permits]
+attention = ["signoff"]
+
+[externals]
+timeout_ms = 2000
+review_timeout_ms = 1000
+max_body_bytes = 65536
+
+[externals.annotators.gatekeeper]
+url = "{url}"
+
+[externals.authorities.operator]
+builtin = "hitl"
+"#
+    )
+}
+
+fn call(tool: &str, arguments: serde_json::Value) -> ProposedCall {
+    ProposedCall {
+        tool: tool.to_string(),
+        arguments: raw(arguments),
+        cwd: None,
+    }
+}
+
+/// Scenario 5: the policy writes `read` exactly and covers everything else with the
+/// wildcard. An unwritten money-moving tool is annotated per call — the gatekeeper sees
+/// the actual call — and its strict trust-and-attention contract blocks the call. The
+/// exact declaration decides `read` without a consult.
+#[tokio::test]
+async fn the_wildcard_annotates_an_unwritten_tool_and_an_exact_declaration_never_consults() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, annotator) = serve_annotator().await;
+    annotator.set(
+        "gatekeeper",
+        Answer::Wire(serde_json::json!({
+            "version": 1,
+            "answer": {
+                "delta": {},
+                "requires": { "trust": "trusted", "attention": ["signoff"], "history": [] },
+                "emits": [],
+            }
+        })),
+    );
+    let runtime = open_runtime(&dir, &wildcard_policy(&url)).await;
+
+    let decision = propose(
+        &runtime,
+        call("send_money_via_wire", serde_json::json!({"amount": 9000})),
+    )
+    .await;
+    assert!(
+        matches!(decision, HookDecision::DenyCall { .. }),
+        "the produced attention requirement blocks the unwritten tool: {decision:?}"
+    );
+    let requests = annotator.requests();
+    assert_eq!(requests.len(), 1, "the wildcard consulted once");
+    // The annotation subject is the actual call, not the wildcard's spelling.
+    assert_eq!(requests[0]["artifact"]["args"]["name"], "send_money_via_wire");
+    assert_eq!(
+        requests[0]["artifact"]["args"]["arguments"],
+        serde_json::json!({"amount": 9000})
+    );
+
+    assert_eq!(
+        propose(&runtime, call("read", serde_json::json!({"path": "a.txt"}))).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    ran(&runtime, call("read", serde_json::json!({"path": "a.txt"}))).await;
+    assert_eq!(
+        annotator.requests().len(),
+        1,
+        "the exact declaration decides without a consult"
+    );
+}
+
+/// Shell aliases with only argument-specific contracts still consult the wildcard for
+/// ordinary reads. The selected annotation survives result recording and later replay.
+#[tokio::test]
+async fn an_unmatched_shell_selector_uses_the_wildcard_and_replays_its_annotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, annotator) = serve_annotator().await;
+    annotator.set("gatekeeper", Answer::Wire(produced("trusted")));
+    let config = wildcard_policy(&url).replace(
+        "[[policy.tool]]\nname = \"read\"\ndelta = {}",
+        r#"[[policy.tool]]
+name = "builtin:shell(command:git push*)"
+delta = {}
+requires = { attention = ["blocked"] }
+
+[[policy.tool]]
+name = "read"
+delta = {}"#,
+    );
+    let runtime = open_runtime(&dir, &config).await;
+    let shell = call("builtin:shell", serde_json::json!({"command":"ls"}));
+    assert_eq!(
+        propose(&runtime, shell.clone()).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    assert_eq!(annotator.requests().len(), 1);
+    assert_eq!(annotator.requests()[0]["artifact"]["args"]["name"], "builtin:shell");
+    ran(&runtime, shell).await;
+
+    // Recording and replay must use the pinned wildcard annotation, without a fresh consult.
+    annotator.set("gatekeeper", Answer::Down);
+    let read = call("read", serde_json::json!({"path":"a.txt"}));
+    assert_eq!(
+        propose(&runtime, read.clone()).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    ran(&runtime, read).await;
+    let protected = propose(
+        &runtime,
+        call("builtin:shell", serde_json::json!({"command":"git push"})),
+    )
+    .await;
+    assert!(matches!(protected, HookDecision::DenyCall { .. }));
+    assert_eq!(
+        annotator.requests().len(),
+        1,
+        "the matched rule and replay require no consult"
+    );
+}
+
+/// A produced restricting delta blocks a wildcard-covered call before release, and
+/// proposing it again holds the block.
+#[tokio::test]
+async fn a_wildcard_calls_produced_narrowing_blocks_and_holds() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, annotator) = serve_annotator().await;
+    annotator.set("gatekeeper", Answer::Wire(produced("suspicious")));
+    let runtime = open_runtime(&dir, &wildcard_policy(&url)).await;
+
+    for _ in 0..2 {
+        let decision = propose(&runtime, call("ghost_tool", serde_json::json!({}))).await;
+        assert!(
+            matches!(decision, HookDecision::DenyCall { .. }),
+            "the produced narrowing blocks the call: {decision:?}"
+        );
+    }
+}
+
+/// Without a wildcard, a tool the policy does not write has no contract at all: the hook
+/// refuses it as a typed operational error naming the tool, and appends nothing.
+#[tokio::test]
+async fn a_tool_nothing_covers_refuses_the_hook_and_appends_nothing() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, _annotator) = serve_annotator().await;
+    let runtime = open_runtime(&dir, &http_policy(&url)).await;
+    let before = audit_len(&runtime);
+
+    let decision = propose(&runtime, call("wrench", serde_json::json!({}))).await;
+    match decision {
+        HookDecision::Refuse { detail, .. } => {
+            assert!(detail.contains("wrench"), "the refusal names the tool: {detail}");
+        }
+        other => panic!("expected a typed refusal, got {other:?}"),
+    }
+    assert_eq!(audit_len(&runtime), before, "the refusal appends nothing");
+}
+
+/// An annotator whose mandate names a chain word, a configured group, and a literal reader,
+/// beside a loopback audience source serving the group.
+fn symbolic_policy(annotator_url: &str, audience_url: &str) -> String {
+    format!(
+        r#"
+[policy]
+version = 2
+
+[policy.audience.group.team]
+from = ["slack:user-group/team"]
+
+[[policy.annotator]]
+name = "classifier"
+audiences = ["internal", "@team", "alice@corp.example"]
+
+[[policy.tool]]
+name = "fetch"
+parameters = {{ type = "object", properties = {{ url = {{ type = "string" }} }}, required = ["url"] }}
+annotator = "classifier"
+
+[externals]
+timeout_ms = 2000
+max_body_bytes = 65536
+
+[externals.annotators.classifier]
+url = "{annotator_url}"
+
+[externals.audience.slack]
+url = "{audience_url}"
+selectors = [{{ template = "user-group/<handle>" }}]
+"#
+    )
+}
+
+/// A loopback audience source answering every group read with the members set on it.
+#[derive(Clone)]
+struct Members {
+    members: Arc<Mutex<Vec<&'static str>>>,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl Members {
+    fn set(&self, members: &[&'static str]) {
+        *self.members.lock().unwrap() = members.to_vec();
+    }
+
+    fn reads(&self) -> Vec<serde_json::Value> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+async fn serve_members() -> (String, Members) {
+    let source = Members {
+        members: Arc::new(Mutex::new(Vec::new())),
+        requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let router = Router::new()
+        .route(
+            "/audience",
+            post(|State(source): State<Members>, body: String| async move {
+                let request: serde_json::Value = serde_json::from_str(&body).expect("the request is JSON");
+                source.requests.lock().unwrap().push(request);
+                let members: Vec<serde_json::Value> = source
+                    .members
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|email| serde_json::Value::String(email.to_string()))
+                    .collect();
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({ "version": 1, "answer": { "members": members } }).to_string(),
+                )
+            }),
+        )
+        .with_state(source.clone());
+    (format!("{}/audience", serve(router).await), source)
+}
+
+fn answer(delta: serde_json::Value, requires_audience: Option<serde_json::Value>) -> Answer {
+    let mut requires = serde_json::json!({ "history": [], "attention": [] });
+    if let Some(audience) = requires_audience {
+        requires["audience"] = audience;
+    }
+    Answer::Wire(serde_json::json!({
+        "version": 1,
+        "answer": { "delta": delta, "requires": requires, "emits": [] }
+    }))
+}
+
+/// Accept the narrowing a produced delta offers, then the same call runs.
+async fn narrow_through(runtime: &Arc<Runtime>, call: ProposedCall) {
+    let offered = propose(runtime, call.clone()).await;
+    assert!(matches!(
+        runtime.execute_remedy(&actor(), offer_of(&offered)).await,
+        RemedyOutcome::Authorized { .. }
+    ));
+    assert_eq!(
+        propose(runtime, call.clone()).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    ran(runtime, call).await;
+}
+
+/// A produced group requirement is the act's membership question, exactly as a written
+/// one: the annotation consult settles first, then the audience source is read once for
+/// the group, and the decision follows the pinned answer.
+#[tokio::test]
+async fn a_produced_group_requirement_reads_membership_from_the_audience_source() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (annotator_url, annotator) = serve_annotator().await;
+    let (audience_url, source) = serve_members().await;
+    let runtime = open_runtime(&dir, &symbolic_policy(&annotator_url, &audience_url)).await;
+
+    annotator.set(
+        "classifier",
+        answer(serde_json::json!({ "audience": ["alice@corp.example"] }), None),
+    );
+    narrow_through(&runtime, fetch("https://a.example")).await;
+    assert!(source.reads().is_empty(), "a literal delta reads no directory");
+
+    annotator.set(
+        "classifier",
+        answer(
+            serde_json::json!({}),
+            Some(serde_json::json!({ "contains": ["@team"] })),
+        ),
+    );
+    source.set(&["alice@corp.example"]);
+    let consults_before = annotator.requests().len();
+    assert_eq!(
+        propose(&runtime, fetch("https://b.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    assert_eq!(annotator.requests().len(), consults_before + 1);
+    let reads = source.reads();
+    assert_eq!(reads.len(), 1, "one act, one membership read for the produced group");
+    assert_eq!(
+        reads[0]["artifact"],
+        serde_json::json!({ "selector": "user-group/team" })
+    );
+    ran(&runtime, fetch("https://b.example")).await;
+
+    source.set(&["carol@corp.example"]);
+    let decision = propose(&runtime, fetch("https://c.example")).await;
+    assert!(
+        matches!(decision, HookDecision::DenyCall { .. }),
+        "the narrowed trajectory does not cover the moved group: {decision:?}"
+    );
+    assert_eq!(source.reads().len(), 2);
+
+    // A symbolic audience outside the mandate is no answer: the hook refuses operationally,
+    // appends nothing, and never reaches the directory.
+    let before = audit_len(&runtime);
+    annotator.set(
+        "classifier",
+        answer(
+            serde_json::json!({}),
+            Some(serde_json::json!({ "contains": ["@nobody"] })),
+        ),
+    );
+    let refused = propose(&runtime, fetch("https://d.example")).await;
+    let HookDecision::Refuse { detail, .. } = refused else {
+        panic!("an out-of-mandate audience is an operational refusal, got {refused:?}");
+    };
+    assert!(
+        detail.contains("classifier"),
+        "the refusal names the annotator: {detail}"
+    );
+    assert_eq!(audit_len(&runtime), before);
+    assert_eq!(source.reads().len(), 2);
+}
+
+/// `within` is no `requires.audience` key: an answer writing it is no answer, refused
+/// operationally before any decision or directory read.
+#[tokio::test]
+async fn an_answer_writing_requires_audience_within_is_refused() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (annotator_url, annotator) = serve_annotator().await;
+    let (audience_url, source) = serve_members().await;
+    let runtime = open_runtime(&dir, &symbolic_policy(&annotator_url, &audience_url)).await;
+    let before = audit_len(&runtime);
+
+    annotator.set(
+        "classifier",
+        answer(serde_json::json!({}), Some(serde_json::json!({ "within": ["@team"] }))),
+    );
+    let refused = propose(&runtime, fetch("https://a.example")).await;
+    assert!(
+        matches!(refused, HookDecision::Refuse { .. }),
+        "an answer writing `within` is no answer, got {refused:?}"
+    );
+    assert_eq!(audit_len(&runtime), before);
+    assert!(source.reads().is_empty());
+}
+
+fn send_policy(url: &str) -> String {
+    format!(
+        r#"
+[policy]
+version = 2
+
+[[policy.annotator]]
+name = "classifier"
+audiences = ["alice@corp.example", "bob@corp.example"]
+
+[[policy.tool]]
+name = "send"
+parameters = {{ type = "object", properties = {{ to = {{ type = "string" }} }}, required = ["to"] }}
+annotator = "classifier"
+
+[externals]
+timeout_ms = 2000
+max_body_bytes = 65536
+
+[externals.annotators.classifier]
+url = "{url}"
+"#
+    )
+}
+
+fn send(to: &str) -> ProposedCall {
+    call("send", serde_json::json!({ "to": to }))
+}
+
+/// The answer a classifier gives `send` to one recipient: the recipient must read what the
+/// call sends, and, when given, the call forwards content only `forwards` may read.
+fn sending(to: &str, forwards: Option<serde_json::Value>) -> Answer {
+    let mut answer = serde_json::json!({
+        "delta": {},
+        "requires": { "audience": { "contains": [to] }, "history": [], "attention": [] },
+        "emits": [],
+    });
+    if let Some(forwards) = forwards {
+        answer["forwards"] = forwards;
+    }
+    Answer::Wire(serde_json::json!({ "version": 1, "answer": answer }))
+}
+
+/// A produced `forwards` is part of what the call sends: the recipient requirement is checked
+/// against it before dispatch, while the same answer without it lets the call through.
+#[tokio::test]
+async fn a_produced_forwards_gates_the_recipient_before_dispatch() {
+    let alice_only = || Some(serde_json::json!({ "audience": ["alice@corp.example"] }));
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, annotator) = serve_annotator().await;
+    let runtime = open_runtime(&dir, &send_policy(&url)).await;
+
+    annotator.set("classifier", sending("bob@corp.example", alice_only()));
+    let before = audit_len(&runtime);
+    let blocked = propose(&runtime, send("bob@corp.example")).await;
+    assert!(
+        matches!(blocked, HookDecision::DenyCall { .. }),
+        "bob cannot read what the call forwards: {blocked:?}"
+    );
+    assert!(
+        runtime.audit(&root()).expect("the audit reads")[before..]
+            .iter()
+            .all(|entry| !matches!(entry.event, AuditEvent::Released { .. })),
+        "the blocked call is not dispatched"
+    );
+
+    annotator.set("classifier", sending("alice@corp.example", alice_only()));
+    assert_eq!(
+        propose(&runtime, send("alice@corp.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let runtime = open_runtime(&dir, &send_policy(&url)).await;
+    annotator.set("classifier", sending("bob@corp.example", None));
+    assert_eq!(
+        propose(&runtime, send("bob@corp.example")).await,
+        HookDecision::AllowCall { spawn: None },
+        "without forwards the call sends only its arguments"
+    );
+}
+
+/// A produced chain word narrows the trajectory symbolically: the delta is offered and
+/// accepted like any written narrowing, and no directory is read for it.
+#[tokio::test]
+async fn a_produced_chain_word_narrows_the_trajectory_without_a_directory_read() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (annotator_url, annotator) = serve_annotator().await;
+    let (audience_url, source) = serve_members().await;
+    let runtime = open_runtime(&dir, &symbolic_policy(&annotator_url, &audience_url)).await;
+
+    annotator.set(
+        "classifier",
+        answer(serde_json::json!({ "audience": ["internal"] }), None),
+    );
+    narrow_through(&runtime, fetch("https://a.example")).await;
+    assert!(source.reads().is_empty());
+
+    // The narrowed trajectory holds `internal` as written: a later call requiring it to
+    // cover `internal` needs no membership either.
+    annotator.set(
+        "classifier",
+        answer(
+            serde_json::json!({}),
+            Some(serde_json::json!({ "contains": ["internal"] })),
+        ),
+    );
+    assert_eq!(
+        propose(&runtime, fetch("https://b.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    assert!(source.reads().is_empty());
+}
+
+/// An annotator whose mandate reads the call's channel: bound to a tool that carries the
+/// argument, served by `url`; the slack source is declared so the placeholder routes.
+fn placeholder_mandate_policy(url: &str) -> String {
+    format!(
+        r#"
+[policy]
+version = 2
+
+[[policy.annotator]]
+name = "acl"
+audiences = ["@slack:channel/$channel_id"]
+
+[[policy.tool]]
+name = "read_channel"
+parameters = {{ type = "object", properties = {{ channel_id = {{ type = "string" }} }}, required = ["channel_id"] }}
+annotator = "acl"
+
+[externals]
+timeout_ms = 2000
+max_body_bytes = 65536
+
+[externals.annotators.acl]
+url = "{url}"
+
+[externals.audience.slack]
+url = "{url}"
+selectors = [{{ template = "viewer", feeds = "self" }}, {{ template = "channel/<id>" }}]
+"#
+    )
+}
+
+fn read_channel(channel_id: &str) -> ProposedCall {
+    ProposedCall {
+        tool: "read_channel".to_string(),
+        arguments: raw(serde_json::json!({ "channel_id": channel_id })),
+        cwd: None,
+    }
+}
+
+/// A mandate placeholder is instantiated per call: the consult declares the one collection
+/// the call's argument spells, and an answer naming any other collection is outside the
+/// mandate.
+#[tokio::test]
+async fn a_mandate_placeholder_declares_the_collection_each_call_spells() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, annotator) = serve_annotator().await;
+    annotator.set(
+        "acl",
+        Answer::Wire(serde_json::json!({
+            "version": 1,
+            "answer": {
+                "delta": { "audience": ["@slack:channel/C1"] },
+                "requires": { "history": [], "attention": [] },
+                "emits": [],
+            }
+        })),
+    );
+    let runtime = open_runtime(&dir, &placeholder_mandate_policy(&url)).await;
+
+    // The answer names the channel the call reads: the produced delta narrows to it, which
+    // is offered for acceptance like any narrowing.
+    assert!(matches!(
+        propose(&runtime, read_channel("C1")).await,
+        HookDecision::DenyCall { .. }
+    ));
+    let requests = annotator.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]["declaration"]["audiences"],
+        serde_json::json!(["@slack:channel/C1"])
+    );
+
+    // The same answer for another channel names a collection the call did not spell: no
+    // answer at all, which refuses the hook.
+    let baseline = audit_len(&runtime);
+    let second = propose(&runtime, read_channel("C2")).await;
+    assert!(matches!(second, HookDecision::Refuse { .. }), "got {second:?}");
+    let requests = annotator.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1]["declaration"]["audiences"],
+        serde_json::json!(["@slack:channel/C2"])
+    );
+    assert_eq!(
+        audit_len(&runtime),
+        baseline,
+        "an answer outside the mandate appends nothing"
+    );
+}
+
+fn hosted_policy(url: &str, token_env: Option<&str>) -> Config {
+    let token = token_env
+        .map(|var| format!("token_env = \"{var}\"\n"))
+        .unwrap_or_default();
+    let document = format!(
+        r#"
+[policy]
+version = 2
+
+[[policy.annotator]]
+name = "classifier"
+
+[[policy.tool]]
+name = "fetch"
+parameters = {{ type = "object", properties = {{ url = {{ type = "string" }} }}, required = ["url"] }}
+annotator = "classifier"
+
+[externals.annotators.classifier]
+url = "{url}"
+{token}"#
+    );
+    let host = |var: &str| (var == "APPA_TEST_TENANT_TOKEN").then(|| "tenant-secret".to_string());
+    Config::hosted(&document, HostDefaults::new(Duration::from_secs(2), 65_536), host)
+        .expect("the hosted document validates")
+}
+
+async fn open_hosted(config: Config) -> Arc<Runtime> {
+    let store =
+        Arc::new(appa_eventlog::LogStore::open(appa_eventlog::Backend::Memory).expect("an in-memory log opens"));
+    let runtime = Arc::new(Runtime::open_with_store(config, store, None).expect("the deployment opens"));
+    assert_eq!(
+        hooks::handle(
+            &runtime,
+            HookEvent::SessionStart {
+                root: root(),
+                principal: None,
+                address: None,
+                title: None,
+                launch: None,
+                start: None,
+            }
+        )
+        .await,
+        HookDecision::Ack
+    );
+    runtime
+}
+
+/// One runtime serving two deployment lines whose policies bind the same annotator to
+/// different endpoints: a view pinned to one line's head consults that line's endpoint,
+/// whatever the runtime installed on its own line since, and a family of one line is never
+/// decided under the other's.
+#[tokio::test]
+async fn a_pinned_view_consults_its_own_deployment_after_the_runtime_serves_another() {
+    let (url_a, annotator_a) = serve_annotator().await;
+    let (url_b, annotator_b) = serve_annotator().await;
+    annotator_a.set("classifier", Answer::Wire(produced("trusted")));
+    annotator_b.set("classifier", Answer::Wire(produced("trusted")));
+    let store =
+        Arc::new(appa_eventlog::LogStore::open(appa_eventlog::Backend::Memory).expect("an in-memory log opens"));
+    let runtime =
+        Arc::new(Runtime::open_with_store(hosted_policy(&url_b, None), store, None).expect("the deployment opens"));
+
+    let deployment_a = runtime
+        .prepare_deployment(hosted_policy(&url_a, None))
+        .expect("policy A loads");
+    let published_a = runtime
+        .publish(&appa_eventlog::DeploymentName::new("tenant-a"), &deployment_a)
+        .expect("policy A publishes as its line's head");
+    let pinned = Arc::new(runtime.pinned(&published_a));
+    assert_eq!(
+        hooks::handle(
+            &pinned,
+            HookEvent::SessionStart {
+                root: root(),
+                principal: None,
+                address: None,
+                title: None,
+                launch: None,
+                start: None,
+            }
+        )
+        .await,
+        HookDecision::Ack
+    );
+    assert_eq!(
+        propose(&pinned, fetch("https://a.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    assert_eq!(annotator_a.requests().len(), 1);
+    assert!(annotator_b.requests().is_empty(), "the pinned view never reaches B");
+    ran(&pinned, fetch("https://a.example")).await;
+
+    // Unpinned, the runtime serves its own line, and refuses a family of another.
+    assert!(matches!(
+        propose(&runtime, fetch("https://b.example")).await,
+        HookDecision::Refuse { .. }
+    ));
+    assert_eq!(annotator_a.requests().len(), 1);
+    assert!(annotator_b.requests().is_empty());
+}
+
+/// A hosted document's `token_env` resolves through the host's lookup, and the consult
+/// carries that value as its bearer token.
+#[tokio::test]
+async fn a_hosted_token_resolves_through_the_host_and_rides_the_consult() {
+    let (url, annotator) = serve_annotator().await;
+    annotator.set("classifier", Answer::Wire(produced("trusted")));
+    let runtime = open_hosted(hosted_policy(&url, Some("APPA_TEST_TENANT_TOKEN"))).await;
+
+    assert_eq!(
+        propose(&runtime, fetch("https://a.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    assert_eq!(annotator.authorizations(), [Some("Bearer tenant-secret".to_string())]);
+}
+
+/// The key a jev test's host lookup supplies for the shared endpoint to answer with a 500.
+const FAILING_JEV_KEY: &str = "failing-key";
+
+/// The one Jev endpoint of this test binary, and every `Authorization` it has seen. The
+/// operator's `APPA_PROVIDER_JEV_API_URL` is process-wide and read at each load, so every
+/// jev test here shares this endpoint and steers it through the key its host lookup
+/// supplies: [`FAILING_JEV_KEY`] fails, any other key is answered. The endpoint runs on a
+/// thread of its own, so it outlives the runtime of the test that started it.
+fn jev_endpoint() -> &'static Mutex<Vec<Option<String>>> {
+    static SEEN: std::sync::OnceLock<Arc<Mutex<Vec<Option<String>>>>> = std::sync::OnceLock::new();
+    SEEN.get_or_init(|| {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let router = Router::new()
+            .route(
+                "/v1/systemone",
+                post(
+                    |State(seen): State<Arc<Mutex<Vec<Option<String>>>>>, headers: axum::http::HeaderMap| async move {
+                        let authorization = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        let failing = authorization.as_deref() == Some(&format!("Bearer {FAILING_JEV_KEY}"));
+                        seen.lock().unwrap().push(authorization);
+                        match failing {
+                            true => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom".to_string()),
+                            false => (
+                                axum::http::StatusCode::OK,
+                                serde_json::json!({
+                                    "answers": {
+                                        "delta_audience": {"probabilities": {"self": 0.05, "internal": 0.4, "public": 0.55}},
+                                        "delta_trust": {"probabilities": {"suspicious": 0.1, "trusted": 0.9}},
+                                        "requires_audience": {"probabilities": {"public": 0.8, "internal": 0.1, "none": 0.1}},
+                                        "requires_trusted": {"noul": 0.7},
+                                    }
+                                })
+                                .to_string(),
+                            ),
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&seen));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("the endpoint's runtime builds")
+                .block_on(async move {
+                    sender.send(serve(router).await).expect("the url is received");
+                    std::future::pending::<()>().await
+                });
+        });
+        let url = format!("{}/v1/systemone", receiver.recv().expect("the endpoint serves"));
+        // SAFETY: set once, before any jev deployment of this binary loads; nothing else in
+        // this binary writes the environment.
+        unsafe {
+            std::env::set_var("APPA_PROVIDER_JEV_API_URL", &url);
+            std::env::set_var("APPA_PROVIDER_JEV_API_KEY", "from-the-environment");
+        }
+        seen
+    })
+}
+
+/// A hosted deployment whose `classifier` is the `jev` builtin, with `key` as the host's
+/// answer for the profile's `token_env`.
+async fn open_hosted_jev(key: &'static str) -> Arc<Runtime> {
+    jev_endpoint();
+    let document = r#"
+[policy]
+version = 2
+
+[[policy.annotator]]
+name = "classifier"
+builtin = "jev"
+ranks = ["suspicious", "trusted"]
+
+[[policy.tool]]
+name = "fetch"
+description = "Fetches one URL and returns its body."
+annotator = "classifier"
+
+[externals.jev]
+token_env = "APPA_PROVIDER_JEV_API_KEY"
+"#;
+    let config = Config::hosted(
+        document,
+        HostDefaults::new(Duration::from_secs(5), 65_536),
+        move |var| (var == "APPA_PROVIDER_JEV_API_KEY").then(|| key.to_string()),
+    )
+    .expect("the hosted document validates");
+    open_hosted(config).await
+}
+
+/// A hosted `[externals.jev]` key is the host's answer, not this process's environment: the
+/// consult reaches the operator's endpoint carrying the key the host's lookup supplied.
+#[tokio::test]
+async fn a_hosted_jev_key_resolves_through_the_host() {
+    let runtime = open_hosted_jev("host-key").await;
+
+    propose(&runtime, fetch("https://a.example")).await;
+    let seen = jev_endpoint().lock().unwrap().clone();
+    assert!(
+        seen.contains(&Some("Bearer host-key".to_string())),
+        "the consult reached the operator's endpoint: {seen:?}"
+    );
+    assert!(
+        !seen.contains(&Some("Bearer from-the-environment".to_string())),
+        "{seen:?}"
+    );
+}
+
+/// A `jev` provider that fails is no answer: the hook refuses and the trajectory records
+/// nothing.
+#[tokio::test]
+async fn a_failing_jev_provider_refuses_the_hook_and_appends_nothing() {
+    let runtime = open_hosted_jev(FAILING_JEV_KEY).await;
+    let baseline = audit_len(&runtime);
+
+    let decision = propose(&runtime, fetch("https://a.example")).await;
+    assert!(
+        matches!(decision, HookDecision::Refuse { .. }),
+        "a jev failure is an operational refusal, got {decision:?}"
+    );
+    assert!(
+        jev_endpoint()
+            .lock()
+            .unwrap()
+            .contains(&Some(format!("Bearer {FAILING_JEV_KEY}"))),
+        "the consult reached the failing endpoint"
+    );
+    assert_eq!(
+        audit_len(&runtime),
+        baseline,
+        "a no-answer appends nothing to the trajectory"
+    );
+}
+
+#[tokio::test]
+async fn a_released_call_reaches_its_recorder_with_the_label_it_published_and_the_evidence_judged() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, annotator) = serve_annotator().await;
+    let mut answer = produced("trusted");
+    answer["answer"]["delta"]["audience"] = serde_json::json!(["insider"]);
+    answer["answer"]["evidence"] = serde_json::json!("etag:7");
+    annotator.set("classifier", Answer::Wire(answer));
+    let deliveries: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+    let recorder = serve(
+        Router::new()
+            .route(
+                "/record",
+                post(
+                    |State(deliveries): State<Arc<Mutex<Vec<serde_json::Value>>>>, body: String| async move {
+                        deliveries
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::from_str(&body).expect("a delivery is JSON"));
+                        r#"{"version":1,"answer":{}}"#
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&deliveries)),
+    )
+    .await;
+    let policy = http_policy(&url).replace(
+        "annotator = \"classifier\"\n",
+        "annotator = \"classifier\"\nrecorder = \"tracker\"\n",
+    ) + &format!("\n[externals.recorders.tracker]\nurl = \"{recorder}/record\"\n");
+    let runtime = open_runtime(&dir, &policy).await;
+
+    let offered = propose(&runtime, fetch("https://a.example")).await;
+    assert!(matches!(
+        runtime.execute_remedy(&actor(), offer_of(&offered)).await,
+        RemedyOutcome::Authorized { .. }
+    ));
+    assert_eq!(
+        propose(&runtime, fetch("https://a.example")).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    ran(&runtime, fetch("https://a.example")).await;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let records = loop {
+        let records: Vec<serde_json::Value> = deliveries
+            .lock()
+            .unwrap()
+            .iter()
+            .inspect(|delivery| {
+                assert_eq!(delivery["kind"], "recorder");
+                assert_eq!(delivery["name"], "tracker");
+                assert_eq!(delivery["root"], root().0);
+            })
+            .flat_map(|delivery| delivery["records"].as_array().cloned().unwrap_or_default())
+            .collect();
+        if records.iter().any(|record| record["record"] == "outcome") || Instant::now() > deadline {
+            break records;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let released = records
+        .iter()
+        .find(|record| record["record"] == "released")
+        .expect("the release is delivered");
+    assert_eq!(released["tool"], "fetch");
+    assert_eq!(released["arguments"], serde_json::json!({ "url": "https://a.example" }));
+    assert_eq!(
+        released["label"],
+        serde_json::json!({ "trust": "trusted", "audience": [["insider"]] }),
+        "the call published its delta"
+    );
+    assert_eq!(released["evidence"], "etag:7");
+    let outcome = records
+        .iter()
+        .find(|record| record["record"] == "outcome")
+        .expect("the outcome is delivered");
+    assert_eq!(outcome["dispatch"], released["dispatch"]);
+    assert_eq!(outcome["outcome"], "success");
+}
+
+/// What a recording endpoint received, by the path it was posted to, and how many more
+/// deliveries that carry an outcome it refuses.
+#[derive(Clone, Default)]
+struct Recordings {
+    received: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    refuse_outcomes: Arc<Mutex<usize>>,
+}
+
+impl Recordings {
+    /// Every record posted to `path`, once some record satisfies `done` or ten seconds pass.
+    async fn records(&self, path: &str, done: impl Fn(&serde_json::Value) -> bool) -> Vec<serde_json::Value> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let records: Vec<serde_json::Value> = self
+                .received
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(posted, _)| posted == path)
+                .flat_map(|(_, delivery)| delivery["records"].as_array().cloned().unwrap_or_default())
+                .collect();
+            if records.iter().any(&done) || Instant::now() > deadline {
+                return records;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+async fn serve_recordings() -> (String, Recordings) {
+    use axum::extract::Path;
+    use axum::http::StatusCode;
+    let recordings = Recordings::default();
+    let url = serve(
+        Router::new()
+            .route(
+                "/{path}",
+                post(
+                    |Path(path): Path<String>, State(recordings): State<Recordings>, body: String| async move {
+                        let delivery: serde_json::Value = serde_json::from_str(&body).expect("a delivery is JSON");
+                        let has_outcome = delivery["records"]
+                            .as_array()
+                            .is_some_and(|records| records.iter().any(|record| record["record"] == "outcome"));
+                        let mut refusals = recordings.refuse_outcomes.lock().unwrap();
+                        if has_outcome && *refusals > 0 {
+                            *refusals -= 1;
+                            return (StatusCode::SERVICE_UNAVAILABLE, String::new());
+                        }
+                        recordings.received.lock().unwrap().push((path, delivery));
+                        (StatusCode::OK, r#"{"version":1,"answer":{}}"#.to_string())
+                    },
+                ),
+            )
+            .with_state(recordings.clone()),
+    )
+    .await;
+    (url, recordings)
+}
+
+fn recorded_policy(annotator: &str, recorder: &str) -> String {
+    http_policy(annotator).replace(
+        "annotator = \"classifier\"\n",
+        "annotator = \"classifier\"\nrecorder = \"tracker\"\n",
+    ) + &format!("\n[externals.recorders.tracker]\nurl = \"{recorder}\"\n")
+}
+
+/// Releases and runs one fetch of `url`, accepting the narrowing the annotator's answer asks.
+async fn released_and_ran(runtime: &Arc<Runtime>, url: &str) {
+    let offered = propose(runtime, fetch(url)).await;
+    if matches!(offered, HookDecision::DenyCall { .. }) {
+        assert!(matches!(
+            runtime.execute_remedy(&actor(), offer_of(&offered)).await,
+            RemedyOutcome::Authorized { .. }
+        ));
+        assert_eq!(
+            propose(runtime, fetch(url)).await,
+            HookDecision::AllowCall { spawn: None }
+        );
+    }
+    ran(runtime, fetch(url)).await;
+}
+
+/// The last record a session appends reaches a recorder that refused it at first, though the
+/// family appends nothing after it: delivery retries on its own.
+#[tokio::test]
+async fn a_recorder_that_refuses_a_family_s_last_outcome_receives_it_on_a_retry() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, annotator) = serve_annotator().await;
+    annotator.set("classifier", Answer::Wire(produced("trusted")));
+    let (recorder, recordings) = serve_recordings().await;
+    *recordings.refuse_outcomes.lock().unwrap() = 2;
+    let runtime = open_runtime(&dir, &recorded_policy(&url, &format!("{recorder}/a"))).await;
+
+    released_and_ran(&runtime, "https://a.example").await;
+
+    let records = recordings.records("a", |record| record["record"] == "outcome").await;
+    assert!(
+        records.iter().any(|record| record["record"] == "outcome"),
+        "the outcome is delivered on a retry: {records:?}"
+    );
+    assert_eq!(
+        *recordings.refuse_outcomes.lock().unwrap(),
+        0,
+        "both refusals were taken"
+    );
+}
+
+/// A recorder rebound under the same name to another endpoint reads the family from its
+/// start: what the old endpoint already received is not withheld from the new one.
+#[tokio::test]
+async fn a_recorder_rebound_under_its_name_receives_the_family_from_its_start() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let (url, annotator) = serve_annotator().await;
+    annotator.set("classifier", Answer::Wire(produced("trusted")));
+    let (recorder, recordings) = serve_recordings().await;
+    let runtime = open_runtime(&dir, &recorded_policy(&url, &format!("{recorder}/a"))).await;
+
+    released_and_ran(&runtime, "https://a.example").await;
+    let first = recordings.records("a", |record| record["record"] == "outcome").await;
+    let first = first
+        .iter()
+        .find(|record| record["record"] == "released")
+        .expect("the old endpoint receives the release")["dispatch"]
+        .clone();
+
+    let config_path = dir.path().join("appa.toml");
+    std::fs::write(&config_path, recorded_policy(&url, &format!("{recorder}/b"))).expect("the rebinding writes");
+    runtime
+        .reload(Config::load(&config_path).expect("the rebinding loads"))
+        .expect("the rebinding opens");
+    released_and_ran(&runtime, "https://b.example").await;
+
+    let records = recordings
+        .records("b", |record| {
+            record["record"] == "released" && record["dispatch"] == first
+        })
+        .await;
+    assert!(
+        records
+            .iter()
+            .any(|record| record["record"] == "released" && record["dispatch"] == first),
+        "the new endpoint receives the release the old one already had: {records:?}"
+    );
+}
+
+/// A delivery task that ends without finishing, here because its async runtime shut down
+/// while a recorder held it, leaves the family to a new task: its next append delivers.
+#[cfg(unix)]
+#[test]
+fn a_delivery_task_dropped_mid_delivery_leaves_the_next_append_to_deliver() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    std::fs::write(
+        dir.path().join("answer.sh"),
+        "cat > /dev/null\nprintf '%s' '{\"version\":1,\"answer\":{\"delta\":{\"trust\":\"trusted\"},\"requires\":{\"history\":[],\"attention\":[]},\"emits\":[]}}'",
+    )
+    .expect("the annotator writes");
+    std::fs::write(
+        dir.path().join("record.sh"),
+        "if [ -e stalled ]; then cat >> delivered; printf '%s' '{\"version\":1,\"answer\":{}}'; \
+         else echo x > stalled; cat > /dev/null; exec sleep 30; fi",
+    )
+    .expect("the recorder writes");
+    let policy = command_policy("answer.sh", false).replace(
+        "annotator = \"classifier\"\n",
+        "annotator = \"classifier\"\nrecorder = \"tracker\"\n",
+    ) + "\n[externals.recorders.tracker]\ncommand = [\"/bin/sh\", \"record.sh\"]\n";
+    let current_thread = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("an async runtime builds")
+    };
+    let appeared = |file: &str| {
+        let path = dir.path().join(file);
+        async move {
+            let written = || std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 0);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !written() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            written()
+        }
+    };
+
+    let first = current_thread();
+    let runtime = first.block_on(async {
+        let runtime = open_runtime(&dir, &policy).await;
+        assert_eq!(
+            propose(&runtime, fetch("https://a.example")).await,
+            HookDecision::AllowCall { spawn: None }
+        );
+        assert!(appeared("stalled").await, "the first delivery reached the recorder");
+        runtime
+    });
+    drop(first);
+
+    let second = current_thread();
+    second.block_on(async {
+        ran(&runtime, fetch("https://a.example")).await;
+        assert!(
+            appeared("delivered").await,
+            "the family's next append delivered its records"
+        );
+    });
+}
+
+/// A command recorder that never answers takes no process permit a command Annotator needs:
+/// with a delivery stalled in each of many sessions, every later call is still judged
+/// promptly.
+#[tokio::test]
+async fn a_hung_command_recorder_never_delays_a_command_annotator() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    std::fs::write(
+        dir.path().join("answer.sh"),
+        "cat > /dev/null\nprintf '%s' '{\"version\":1,\"answer\":{\"delta\":{\"trust\":\"trusted\"},\"requires\":{\"history\":[],\"attention\":[]},\"emits\":[]}}'",
+    )
+    .expect("the annotator writes");
+    std::fs::write(
+        dir.path().join("hang.sh"),
+        "cat > /dev/null\necho x >> stalled\nsleep 60",
+    )
+    .expect("the recorder writes");
+    let policy = command_policy("answer.sh", false).replace(
+        "annotator = \"classifier\"\n",
+        "annotator = \"classifier\"\nrecorder = \"tracker\"\n",
+    ) + "\n[externals.recorders.tracker]\ncommand = [\"/bin/sh\", \"hang.sh\"]\n";
+    let runtime = open_runtime(&dir, &policy).await;
+
+    for session in 0..12 {
+        let actor = Actor {
+            root: TrajectoryId(format!("session-{session}")),
+            child: None,
+        };
+        let opened = hooks::handle(
+            &runtime,
+            HookEvent::SessionStart {
+                root: actor.root.clone(),
+                principal: None,
+                address: None,
+                title: None,
+                launch: None,
+                start: None,
+            },
+        )
+        .await;
+        assert_eq!(opened, HookDecision::Ack);
+        let started = Instant::now();
+        let decision = hooks::handle(
+            &runtime,
+            HookEvent::ToolCall {
+                actor: actor.clone(),
+                call: fetch("https://a.example"),
+                call_id: None,
+                spawn: None,
+                prompt: None,
+                ruling: None,
+                declares: None,
+            },
+        )
+        .await;
+        assert_eq!(decision, HookDecision::AllowCall { spawn: None }, "session {session}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "session {session} waited {:?} behind stalled recorder deliveries",
+            started.elapsed()
+        );
+    }
+    let stalled = std::fs::read_to_string(dir.path().join("stalled")).unwrap_or_default();
+    assert!(!stalled.is_empty(), "the recorder was delivered to, and stalled");
+}

@@ -1,0 +1,17 @@
+[package]
+name = "appa-adapter-claude-code"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+appa-runtime-api = { path = "../appa-runtime-api" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,794 @@
+#![cfg(unix)]
+
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+
+use crate::common;
+use crate::common::init_fixture;
+use common::{RefusingPort, http, repo_root, serve_runtime};
+use init_fixture::{Fixture, Installed, PolicyRoute, runtime_fingerprint, shipped_default_config};
+
+/// The release workflow proves a released binary ignores `APPA_ENDPOINT` by
+/// running activation against a config that does not exist: the endpoint is
+/// settled first, so a build that reads the seam refuses the value, and one
+/// that ignores it fails on the config. Home and directory variables are
+/// removed so nothing outside the fixture is reached either way.
+#[test]
+fn release_override_probe_reaches_endpoint_before_deployment_paths() {
+    let fixture = Fixture::new();
+    for endpoint in ["http://127.0.0.1:0", "http://127.0.0.1:8787"] {
+        let mut command = Command::new(&fixture.appa);
+        command
+            .current_dir(&fixture.root)
+            .arg("activate-claude")
+            .arg("--config")
+            .arg("./no-such-dir/appa.toml");
+        for variable in [
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "APPA_INSTALL_DIR",
+            "APPA_CONFIG_DIR",
+            "APPA_DATA_DIR",
+            "CLAUDE_CONFIG_DIR",
+        ] {
+            command.env_remove(variable);
+        }
+        let output = command.env("APPA_ENDPOINT", endpoint).output().expect("probe runs");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let expected = if cfg!(debug_assertions) && endpoint.ends_with(":0") {
+            "is not a usable runtime endpoint"
+        } else {
+            "does not load"
+        };
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(!fixture.data.exists());
+        assert!(!fixture.root.join("claude.log").exists());
+        assert!(!fixture.root.join("no-such-dir").exists());
+    }
+}
+
+/// The template URL an install registers for the MCP server at `url`.
+fn mcp_template(url: &str) -> String {
+    format!("${{APPA_RUNTIME_URL:-{url}}}/mcp")
+}
+
+/// The MCP registration an earlier install left, as the fake `claude` holds it.
+fn register_mcp(fixture: &Fixture, url: &str) {
+    fs::write(
+        fixture.claude.join("mcp-appa"),
+        serde_json::json!({"type": "http", "url": url}).to_string(),
+    )
+    .expect("the registration is written");
+}
+
+/// An install a previous activation left, with bytes of its own in every file
+/// and registration a later activation rewrites, so a restore that merely
+/// reinstalls this build is told apart from one that puts the previous state back.
+fn previous_install(fixture: &Fixture) -> Installed {
+    fixture.successful_activation();
+    fs::write(fixture.deployed_binary(), b"the previous build").expect("the previous binary is written");
+    let settings = fs::read_to_string(fixture.settings()).expect("settings are readable");
+    fs::write(fixture.settings(), settings.replacen('{', "{\"userSetting\": true,", 1))
+        .expect("the previous settings are written");
+    register_mcp(fixture, &mcp_template("http://127.0.0.1:1"));
+    fs::write(
+        fixture.skill(),
+        "---\nname: appa-guide\ndescription: an earlier install\n---\n",
+    )
+    .expect("the previous skill is written");
+    Installed::of(fixture)
+}
+
+#[test]
+fn launcher_uses_the_install_directory_not_the_source_binary_cache() {
+    let fixture = Fixture::new();
+    let launchers = fixture.root.join("launchers");
+    let output = fixture.activate().env("APPA_INSTALL_DIR", &launchers).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(launchers.join("clappa").is_file());
+    assert!(!fixture.bin.join("clappa").exists());
+}
+
+/// The MCP registration fails after the binary and the hook entries have
+/// already been replaced: both come back, and so does the registration the
+/// earlier install had made.
+#[test]
+fn a_failure_at_the_mcp_registration_puts_the_previous_install_back() {
+    let fixture = Fixture::new();
+    let before = previous_install(&fixture);
+
+    let failed = fixture
+        .activate()
+        .env("FAKE_CLAUDE_FAIL_ONCE", "mcp-add")
+        .output()
+        .expect("appa activates");
+
+    assert!(!failed.status.success());
+    assert_eq!(Installed::of(&fixture), before);
+    assert!(!fixture.deployed_binary().with_extension("prev").exists());
+    assert!(
+        fixture.launcher_is_armed(),
+        "the previous install's launcher is re-armed"
+    );
+}
+
+#[test]
+fn a_failure_at_the_start_puts_the_previous_profile_back() {
+    let fixture = Fixture::new();
+    let before = previous_install(&fixture);
+
+    let failed = fixture
+        .activate()
+        .env("FAKE_STARTER_FAILS", "1")
+        .output()
+        .expect("appa activates");
+
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("deliberate fake starter failure"));
+    assert_eq!(Installed::of(&fixture), before);
+    assert!(!fixture.deployed_binary().with_extension("prev").exists());
+    assert!(
+        fixture.launcher_is_armed(),
+        "the previous install's launcher is re-armed"
+    );
+}
+
+/// A runtime that does not answer for its policy inside the probe's deadline
+/// cannot be reconciled, so activation fails and binds nothing to it rather than
+/// reporting it healthy.
+#[test]
+fn a_policy_key_timeout_fails_activation() {
+    let fixture = Fixture::new();
+    fixture.answers().policy = PolicyRoute::Stalls;
+
+    let failed = fixture.activate().output().expect("appa activates");
+
+    assert!(!failed.status.success());
+    assert_eq!(Installed::of(&fixture), Installed::nothing());
+}
+
+/// A first install that fails after its runtime is up leaves nothing behind:
+/// the runtime it started is stopped, and no file or registration it wrote
+/// survives to bind a session to a runtime whose policy activation could not settle.
+#[test]
+fn a_failure_after_the_start_stops_the_runtime_activation_started() {
+    let fixture = Fixture::new();
+    let stand_in = fixture.root.join("stand-in");
+    fixture.answers().stand_in = Some(stand_in.clone());
+    fixture.answers().policy = PolicyRoute::Missing;
+
+    let failed = fixture.activate().output().expect("appa activates");
+
+    assert!(!failed.status.success());
+    let pid: i32 = fs::read_to_string(stand_in.join("pid"))
+        .expect("the starter recorded the runtime it started")
+        .trim()
+        .parse()
+        .expect("the recorded pid parses");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && unsafe { libc::kill(pid, 0) } == 0 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "the runtime activation started is still running"
+    );
+    assert_eq!(Installed::of(&fixture), Installed::nothing());
+}
+
+#[test]
+fn a_first_activation_writes_the_profile_and_arms_the_launcher() {
+    let fixture = Fixture::new();
+    let output = fixture.activate().output().expect("appa activates");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    // The harness binary lands on an appa-private path, not on PATH, and the
+    // copy that is on PATH is left alone.
+    assert!(fixture.deployed_binary().is_file());
+    assert!(fixture.bin.join("appa").is_file());
+    assert!(fixture.launcher_is_armed());
+    assert_eq!(
+        fs::read_to_string(fixture.config.join("appa.toml")).ok(),
+        Some(shipped_default_config())
+    );
+
+    // Every event of a protected session names the deployed binary, and the
+    // session's first entry carries everything the runtime start needs.
+    let entries = fixture.owned_hook_entries();
+    let mut events: Vec<&str> = entries.iter().map(|(event, _)| event.as_str()).collect();
+    events.sort_unstable();
+    assert_eq!(
+        events,
+        [
+            "PermissionDenied",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "PreToolUse",
+            "SessionEnd",
+            "SessionStart",
+            "SessionStart",
+            "SessionStart",
+            "Stop",
+            "StopFailure",
+            "SubagentStart",
+            "SubagentStart",
+            "SubagentStop",
+            "UserPromptSubmit",
+        ]
+    );
+    let deployment_url = fixture.url.as_str();
+    let session_start = entries
+        .iter()
+        .find(|(event, hook)| event == "SessionStart" && hook["args"][0] == "hook")
+        .map(|(_, hook)| hook.clone())
+        .expect("the session start entry posts");
+    assert_eq!(
+        session_start["args"],
+        serde_json::json!([
+            "hook",
+            "--deployment-url",
+            deployment_url,
+            "--ensure-runtime",
+            "--config",
+            fixture.config.join("appa.toml"),
+            "--data-dir",
+            fixture.data,
+        ])
+    );
+    assert!(fixture.settings_value().get("statusLine").is_none());
+    let clappa_settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.data.join("clappa.settings.json")).expect("clappa's settings"))
+            .expect("clappa's settings are JSON");
+    assert!(clappa_settings.get("permissions").is_none());
+    assert!(fixture.settings_value().get("permissions").is_none());
+    let statusline = clappa_settings["statusLine"]["command"]
+        .as_str()
+        .expect("the status line is a command")
+        .to_owned();
+    assert!(
+        statusline.contains(fixture.deployed_binary().to_str().unwrap()),
+        "{statusline}"
+    );
+    assert_eq!(
+        fixture.mcp_registration(),
+        Some(serde_json::json!({"type": "http", "url": mcp_template(deployment_url)}))
+    );
+    let guide = repo_root().join("integrations/appa-guide");
+    assert_eq!(
+        fs::read_to_string(fixture.skill()).expect("the skill is written"),
+        format!(
+            "{}\n\n{}\n\n{}",
+            fs::read_to_string(guide.join("SKILL.md")).unwrap(),
+            fs::read_to_string(guide.join("references/core.md")).unwrap(),
+            fs::read_to_string(guide.join("references/claude-code.md")).unwrap()
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.contracts_guide()).expect("the policy-review guide is written"),
+        fs::read_to_string(repo_root().join("website/content/docs/contracts.md")).unwrap()
+    );
+    // The runtime reports serving the key the fixture computed for the shipped
+    // default, and activation found nothing to reconcile: that key is the real one.
+    assert_eq!(
+        fixture.answers().reloads,
+        0,
+        "a first install reloaded a runtime already serving its policy"
+    );
+}
+
+/// Older releases registered their hooks through the `appa-runtime@appa`
+/// Claude plugin. Reinstalling with the current release migrates that profile
+/// to one native hook set, without changing another plugin's state.
+#[test]
+fn reinstall_migrates_a_legacy_plugin_install_to_native_hooks() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.settings(),
+        serde_json::json!({
+            "enabledPlugins": {
+                "appa-runtime@appa": true,
+                "formatter@example": true
+            }
+        })
+        .to_string(),
+    )
+    .expect("the legacy Claude settings are written");
+
+    fixture.successful_activation();
+
+    let settings = fixture.settings_value();
+    assert_eq!(settings["enabledPlugins"]["appa-runtime@appa"], false);
+    assert_eq!(settings["enabledPlugins"]["formatter@example"], true);
+    let entries = fixture.owned_hook_entries();
+    assert_eq!(
+        entries.iter().filter(|(event, _)| event == "PreToolUse").count(),
+        1,
+        "the reinstall registers one native authorization hook"
+    );
+    assert_eq!(
+        entries.iter().filter(|(event, _)| event == "SessionStart").count(),
+        3,
+        "the native post, context, and launch recorder are each registered once"
+    );
+    assert_eq!(
+        entries.iter().filter(|(event, _)| event == "SessionEnd").count(),
+        1,
+        "the launch recorder is registered once"
+    );
+}
+
+#[test]
+fn a_rerun_keeps_the_config_and_rewrites_nothing_it_already_wrote() {
+    let fixture = Fixture::new();
+    fixture.successful_activation();
+    let config = fixture.config.join("appa.toml");
+    let authored = format!(
+        "{}\n# an edit activation keeps\n",
+        fs::read_to_string(&config).expect("the config is readable")
+    );
+    fs::write(&config, &authored).expect("the edit is written");
+    let written = Installed::of(&fixture);
+
+    fixture.successful_activation();
+
+    assert_eq!(fs::read_to_string(&config).ok(), Some(authored));
+    assert_eq!(Installed::of(&fixture), written);
+    let calls = fixture.claude_calls();
+    assert_eq!(calls.matches("mcp add-json").count(), 1);
+    assert_eq!(calls.matches("mcp remove").count(), 0);
+}
+
+/// `claude mcp get` reports a template without its default. The registration
+/// an install wrote comes back that way and is still the install's own: a
+/// rerun rewrites nothing, and a removal takes it back.
+#[test]
+fn a_registration_reported_without_its_default_is_the_installs_own() {
+    let fixture = Fixture::new();
+    fixture.successful_activation();
+    let written = Installed::of(&fixture);
+
+    let rerun = fixture
+        .activate()
+        .env("FAKE_CLAUDE_RENDERS_TEMPLATE", "1")
+        .output()
+        .expect("appa activates");
+    assert!(rerun.status.success(), "{}", String::from_utf8_lossy(&rerun.stderr));
+    assert_eq!(Installed::of(&fixture), written);
+    assert_eq!(fixture.claude_calls().matches("mcp add-json").count(), 1);
+
+    let removed = fixture
+        .remove()
+        .env("FAKE_CLAUDE_RENDERS_TEMPLATE", "1")
+        .output()
+        .expect("appa removes");
+    assert!(removed.status.success(), "{}", String::from_utf8_lossy(&removed.stderr));
+    assert_eq!(fixture.mcp_registration(), None);
+}
+
+/// A foreign runtime owning the endpoint from a process that is not this
+/// user's appa is refused before the profile is touched at all, so the
+/// installation it would have replaced is still the one that is registered
+/// and running. Another build is one way to be foreign; this build serving
+/// another deployment's configuration is the other, and it is the one a
+/// digest alone cannot see. The stand-in's pid is that of an exited process.
+#[test]
+fn a_foreign_runtime_is_refused_before_the_profile_is_touched() {
+    let fixture = Fixture::new();
+    fixture.successful_activation();
+    let fingerprint = runtime_fingerprint(&fixture.appa);
+    let mine = fixture.config.join("appa.toml");
+    let before = Installed::of(&fixture);
+
+    for (build, serving) in [
+        ("not-this-build", mine.as_path()),
+        (fingerprint.as_str(), Path::new("/somewhere/else/appa.toml")),
+    ] {
+        let calls_before = fixture.claude_calls().lines().count();
+        {
+            let mut answers = fixture.answers();
+            answers.fingerprint = build.to_owned();
+            answers.config = serving.to_path_buf();
+        }
+        let refused = fixture.activate().output().expect("appa activates");
+        assert!(
+            !refused.status.success(),
+            "a runtime claiming build {build} at {} must be refused",
+            serving.display()
+        );
+        let mutating: Vec<String> = fixture
+            .claude_calls()
+            .lines()
+            .skip(calls_before)
+            .filter(|line| !line.starts_with("mcp get appa"))
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            mutating.is_empty(),
+            "a refused endpoint must not reach a single mutating claude call: {mutating:?}",
+        );
+        assert_eq!(Installed::of(&fixture), before);
+        assert!(
+            fixture.launcher_is_armed(),
+            "a refused endpoint must leave the working launcher armed"
+        );
+    }
+}
+
+/// A runtime an earlier deployment of this user's left at the endpoint is
+/// stopped by the activation, which then goes on to its own start. The
+/// stand-in is a process named `appa` of this user's, answering as another
+/// build until it is gone.
+#[test]
+fn an_earlier_deployments_runtime_of_the_users_own_is_stopped_by_the_activation() {
+    let fixture = Fixture::new();
+    let stand_in = fixture.root.join("stand-in");
+    fixture.answers().stand_in = Some(stand_in.clone());
+    let started = Command::new(fixture.root.join("fake-starter.sh"))
+        .env("FAKE_RUNTIME_STAND_IN", &stand_in)
+        .status()
+        .expect("the stand-in starts");
+    assert!(started.success());
+    let pid: i32 = fs::read_to_string(stand_in.join("pid"))
+        .expect("the stand-in recorded its pid")
+        .trim()
+        .parse()
+        .expect("the recorded pid parses");
+    assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "the stand-in runs");
+
+    {
+        let mut answers = fixture.answers();
+        answers.fingerprint = "an-earlier-build".to_owned();
+        answers.fingerprint_later = Some(runtime_fingerprint(&fixture.appa));
+    }
+    let output = fixture.activate().output().expect("appa activates");
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "the earlier deployment's runtime is gone"
+    );
+    assert!(fixture.launcher_is_armed());
+}
+
+/// A purge takes the profile back, stops the runtime at the deployment's
+/// endpoint, and deletes the data and config directories; `appa` on PATH
+/// stays. It reads none of the installation state, and it applies to the
+/// default deployment only.
+#[test]
+fn a_purge_takes_back_the_profile_stops_the_runtime_and_deletes_the_deployment() {
+    let fixture = Fixture::new();
+    fixture.successful_activation();
+    let mut served = serve_runtime(&fixture.config.join("appa.toml"), &fixture.root.join("served.db"));
+    let installed = Installed::of(&fixture);
+
+    let refused = fixture
+        .purge(&served.url)
+        .args(["--config", fixture.config.join("appa.toml").to_str().unwrap()])
+        .output()
+        .expect("appa runs");
+    assert!(!refused.status.success(), "a purge names no config");
+    assert_eq!(Installed::of(&fixture), installed);
+    assert_eq!(
+        http(&format!("{}/health", served.url), "GET", None).as_deref(),
+        Some("ok")
+    );
+
+    let output = fixture.purge(&served.url).output().expect("appa purges");
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_profile_taken_back(&fixture);
+    assert_eq!(http(&format!("{}/health", served.url), "GET", None), None);
+    assert!(served.has_exited(), "the runtime is stopped");
+    assert!(!fixture.data.exists(), "the data directory is gone");
+    assert!(!fixture.config.exists(), "the config directory is gone");
+    assert!(fixture.bin.join("appa").is_file(), "appa on PATH stays");
+}
+
+/// The profile holds nothing of the install: no hook entry, no status line, no
+/// MCP registration, no skill, no launcher.
+fn assert_profile_taken_back(fixture: &Fixture) {
+    assert_eq!(fixture.settings_value(), serde_json::json!({}));
+    assert_eq!(fixture.mcp_registration(), None);
+    assert!(!fixture.skill().parent().unwrap().exists());
+    assert!(!fixture.launcher().exists());
+}
+
+/// A purge of a deployment whose runtime is down still deletes everything.
+#[test]
+fn a_purge_with_no_runtime_running_deletes_the_deployment() {
+    let fixture = Fixture::new();
+    fixture.successful_activation();
+    let refusing = RefusingPort::new();
+    let dead = refusing.url();
+
+    let output = fixture.purge(&dead).output().expect("appa purges");
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_profile_taken_back(&fixture);
+    assert!(!fixture.data.exists() && !fixture.config.exists());
+}
+
+#[test]
+fn a_failed_rollback_disarms_the_launcher_until_an_activation_completes() {
+    let fixture = Fixture::new();
+    previous_install(&fixture);
+
+    let unrecoverable = fixture
+        .activate()
+        .env("FAKE_CLAUDE_FAIL_ONCE", "mcp-add-always")
+        .output()
+        .expect("appa activates");
+    assert_eq!(unrecoverable.status.code(), Some(3));
+    assert!(
+        !fixture.launcher_is_armed(),
+        "a failed rollback must leave clappa refusing to launch an unprotected session",
+    );
+
+    fixture.successful_activation();
+    assert!(fixture.launcher_is_armed());
+}
+
+/// A runtime of this deployment that survived the install keeps serving the policy it
+/// loaded at startup, and only the install can notice. Nothing is asked: the reconcile
+/// reloads, and the runtime must then answer with the policy it was asked to load.
+#[test]
+fn activation_reloads_a_surviving_runtime_that_serves_an_older_policy() {
+    let fixture = Fixture::new();
+    {
+        let mut answers = fixture.answers();
+        // This deployment's own runtime, serving a policy that is not the file the
+        // marketplace wrote: the one state a reload is for.
+        answers.policy = PolicyRoute::Serves("a-policy-this-activation-did-not-compose".to_owned());
+        answers.policy_after_reload = Some(fixture.policy_key());
+    }
+    let output = fixture.activate().output().expect("appa activates");
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        fixture.answers().reloads > 0,
+        "a diverged runtime of this deployment must be reloaded, not left serving its older policy",
+    );
+}
+
+/// A `token_env` resolves where the runtime runs, so a secret the installing terminal does
+/// not hold is not activation's to refuse: the surviving runtime is reloaded, and the
+/// reload it accepts settles the policy.
+#[test]
+fn activation_leaves_a_secret_it_cannot_see_to_the_runtime() {
+    let fixture = Fixture::new();
+    let config = fixture.config.join("appa.toml");
+    let mut text = fs::read_to_string(&config).expect("the config is readable");
+    text.push_str(
+        "\n[externals.sanitizers.scrub]\nurl = \"https://scrub.internal\"\ntoken_env = \"APPA_UNSET_IN_THIS_PROCESS\"\n",
+    );
+    fs::write(&config, text).expect("the config is written");
+    let output = fixture
+        .activate()
+        .env_remove("APPA_UNSET_IN_THIS_PROCESS")
+        .output()
+        .expect("appa activates");
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        fixture.answers().reloads > 0,
+        "a policy activation cannot compose is settled by a reload"
+    );
+}
+
+#[test]
+fn activation_keeps_a_custom_statusline() {
+    let fixture = Fixture::new();
+    let custom = serde_json::json!({"type": "command", "command": "my-status"});
+    fs::write(
+        fixture.settings(),
+        serde_json::json!({"statusLine": custom}).to_string(),
+    )
+    .expect("custom settings");
+
+    fixture.successful_activation();
+
+    assert_eq!(fixture.settings_value()["statusLine"], custom);
+}
+
+/// Everything the profile held before is there after activation and after
+/// removal, as the value it was: entries of other hooks, in their place, and
+/// settings this install never names.
+#[test]
+fn foreign_settings_survive_activation_and_removal() {
+    let fixture = Fixture::new();
+    let original = serde_json::json!({
+        "theme": "dark",
+        "hooks": {
+            "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "lint"}]}],
+            "Notification": [{"hooks": [{"type": "command", "command": "notify"}]}]
+        }
+    });
+    fs::write(fixture.settings(), original.to_string()).expect("the settings are written");
+
+    fixture.successful_activation();
+    let activated = fixture.settings_value();
+    assert_eq!(activated["theme"], "dark");
+    assert_eq!(activated["hooks"]["Notification"], original["hooks"]["Notification"]);
+    assert_eq!(
+        activated["hooks"]["PreToolUse"][0], original["hooks"]["PreToolUse"][0],
+        "the foreign entry keeps its place"
+    );
+    assert_eq!(activated["hooks"]["PreToolUse"].as_array().map(Vec::len), Some(2));
+
+    let removed = fixture.remove().output().expect("appa removes");
+    assert!(removed.status.success(), "{}", String::from_utf8_lossy(&removed.stderr));
+    assert_eq!(fixture.settings_value(), original);
+    assert_eq!(fixture.mcp_registration(), None);
+    assert!(
+        !fixture.skill().parent().unwrap().exists(),
+        "the skill directory goes with its files"
+    );
+    assert!(!fixture.launcher().exists());
+    assert!(!fixture.data.join("clappa.settings.json").exists());
+    assert!(
+        fixture.deployed_binary().is_file(),
+        "removal takes back the profile, not the runtime"
+    );
+
+    // Removal is replayable: a second run finds nothing of its own and succeeds.
+    let again = fixture.remove().output().expect("appa removes");
+    assert!(again.status.success(), "{}", String::from_utf8_lossy(&again.stderr));
+    assert_eq!(fixture.settings_value(), original);
+}
+
+#[test]
+fn settings_symlink_survives_activation_removal_and_rollback() {
+    let fixture = Fixture::new();
+    let target = fixture.root.join("dotfiles/claude/settings.json");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let original = serde_json::json!({"theme": "dark"});
+    fs::write(&target, original.to_string()).unwrap();
+    std::os::unix::fs::symlink(&target, fixture.settings()).unwrap();
+
+    let failed = fixture
+        .activate()
+        .env("FAKE_CLAUDE_FAIL_ONCE", "mcp-add")
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert_eq!(fs::read_link(fixture.settings()).unwrap(), target);
+    assert_eq!(fixture.settings_value(), original);
+
+    fixture.successful_activation();
+    assert_eq!(fs::read_link(fixture.settings()).unwrap(), target);
+    assert_eq!(fixture.settings_value()["theme"], "dark");
+    assert!(fixture.settings_value()["hooks"].is_object());
+
+    let removed = fixture.remove().output().unwrap();
+    assert!(removed.status.success(), "{}", String::from_utf8_lossy(&removed.stderr));
+    assert_eq!(fs::read_link(fixture.settings()).unwrap(), target);
+    assert_eq!(fixture.settings_value(), original);
+}
+
+/// An MCP server under APPA's name that no install wrote is someone else's:
+/// activation refuses before it has written anything, and removal leaves it.
+#[test]
+fn a_foreign_mcp_server_under_appas_name_is_refused_before_anything_is_written() {
+    let fixture = Fixture::new();
+    let foreign = serde_json::json!({"type": "http", "url": "http://localhost:9/mcp"});
+    fs::write(fixture.claude.join("mcp-appa"), foreign.to_string()).expect("the foreign server is registered");
+
+    let refused = fixture.activate().output().expect("appa activates");
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("http://localhost:9/mcp"),
+        "the refusal names the foreign server"
+    );
+    assert_eq!(
+        Installed::of(&fixture),
+        Installed {
+            mcp: Some(foreign.clone()),
+            ..Installed::nothing()
+        }
+    );
+    assert_eq!(fixture.claude_calls().trim(), "mcp get appa");
+
+    let removal = fixture.remove().output().expect("appa removes");
+    assert!(!removal.status.success());
+    assert_eq!(fixture.mcp_registration(), Some(foreign));
+}
+
+/// A relative directory override must not reach the hook entries as written.
+///
+/// Hooks run from whatever working directory Claude was launched in, so a
+/// relative `state/bin/appa` would resolve somewhere else entirely at hook time
+/// and find no binary, config or database.
+#[test]
+fn relative_directory_overrides_are_rendered_absolute() {
+    let fixture = Fixture::new();
+    let root = &fixture.root;
+    // The deployment the answering runtime claims: this init's own config.
+    fixture.answers().config = root.join("config/appa.toml");
+    let output = fixture
+        .activate()
+        // Relative, resolved against the fixture's working directory and no other.
+        .env("APPA_INSTALL_DIR", "bin")
+        .env("APPA_CONFIG_DIR", "config")
+        .env("APPA_DATA_DIR", "state")
+        .output()
+        .expect("appa activates");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let settings = fixture.settings_value();
+    let mut rendered = Vec::new();
+    for (_, groups) in settings["hooks"].as_object().expect("hooks is an object") {
+        for group in groups.as_array().expect("groups") {
+            for hook in group["hooks"].as_array().expect("hooks") {
+                rendered.push(hook["command"].as_str().expect("a command").to_owned());
+                let args = hook["args"].as_array().expect("args");
+                for flag in ["--config", "--data-dir"] {
+                    if let Some(position) = args.iter().position(|argument| argument == flag) {
+                        rendered.push(args[position + 1].as_str().expect("a path").to_owned());
+                    }
+                }
+            }
+        }
+    }
+    assert!(rendered.len() > 10, "{rendered:?}");
+    for value in rendered {
+        let path = Path::new(&value);
+        assert!(path.is_absolute(), "rendered relative: {value}");
+        assert!(
+            path.starts_with(root),
+            "does not resolve under the working directory it was given: {value}",
+        );
+    }
+}
+
+/// A runtime that fails verification *after* the profile switch must take the
+/// switch with it.
+///
+/// The preflight refuses a foreign owner that is already there, but one can
+/// arrive between the preflight and the start. Leaving the hooks registered and
+/// the launcher armed against it would be the exact skew activation exists to
+/// prevent: Claude gated by hooks talking to a runtime nobody verified. There
+/// was nothing here before, so undoing means removing what was just written.
+#[test]
+fn a_runtime_that_fails_verification_after_the_switch_undoes_it() {
+    let fixture = Fixture::new();
+    // The preflight sees this build; everything after it sees a stranger.
+    fixture.answers().fingerprint_later = Some("not-this-build".to_owned());
+    let output = fixture.activate().output().expect("appa activates");
+
+    assert!(
+        !output.status.success(),
+        "verification against a foreign runtime must fail activation: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(Installed::of(&fixture), Installed::nothing());
+}
+
+/// A `clappa` under the install directory that no install wrote is the
+/// user's: the activation refuses before it writes anything, and the file
+/// stays as it was.
+#[test]
+fn a_launcher_of_the_users_own_refuses_the_activation() {
+    let fixture = Fixture::new();
+    let launcher = fixture.launcher();
+    fs::create_dir_all(launcher.parent().unwrap()).expect("the install directory exists");
+    let own = "#!/bin/sh\nexec claude --model opus \"$@\"\n";
+    fs::write(&launcher, own).expect("the user's launcher is written");
+
+    let output = fixture.activate().output().expect("appa activates");
+
+    assert!(
+        !output.status.success(),
+        "a launcher of the user's own must refuse the activation: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(&launcher).unwrap(), own);
+    assert!(!fixture.settings().exists(), "nothing of the profile is written");
+}

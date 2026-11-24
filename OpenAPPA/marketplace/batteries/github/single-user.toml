@@ -1,0 +1,194 @@
+# GitHub battery, single-user target: one person's token. The two
+# annotators ask GitHub whether the repository a read or write names is
+# public; a private one's content is read by
+# `@github:repo/<owner>/<repo>/collaborators`. The `github` context
+# provider tells the annotator who wrote an issue or pull request, and
+# the `github` audience source names people by their verified email.
+# A write's result is labelled only when it returns stored text: the
+# parent issue `sub_issue_write` returns gets the label a read of that
+# issue gets, and is `suspicious` without the provider's answer.
+# These rules run before the base policy's.
+
+[policy]
+version = 2
+
+# What a read of one repository returns.
+[[policy.annotator]]
+name = "github.repository-visibility"
+ranks = ["suspicious"]
+audiences = ["@github:repo/$owner/$repo/collaborators"]
+marks = []
+
+# What a write into one repository needs, and what its result returns.
+[[policy.annotator]]
+name = "github.repository-readers"
+ranks = ["suspicious", "trusted"]
+audiences = ["@github:repo/$owner/$repo/collaborators"]
+marks = []
+
+[externals.annotators."github.repository-visibility"]
+command = ["python3", "repository_visibility.py"]
+token_env = "APPA_PROVIDER_GITHUB_TOKEN"
+
+[externals.annotators."github.repository-readers"]
+command = ["python3", "repository_visibility.py"]
+token_env = "APPA_PROVIDER_GITHUB_TOKEN"
+
+[externals.context.github]
+command = ["python3", "context.py"]
+hint = "`context.github` is this deployment's finding about the GitHub repository, and the pull request, issue or listing, that the call reaches. The repository's `visibility` decides a write's destination: a push, pull request, issue, release or comment into a `private` or `internal` repository requires audience internal; into a `public` one, public. Authorship counts only in a repository the operator controls, one where `viewer_permission` is ADMIN, MAINTAIN or WRITE, or whose owner the deployment hint names as the organization's own: there, text written only by people whose `association` is OWNER, MEMBER or COLLABORATOR, or by a `bot`, is trusted. `association` is relative to that repository, and `bot` says only that the account is a GitHub App, so in any other repository neither establishes anything about the operator, and text there is suspicious, whoever wrote it. `truncated: true` means authors may be missing, so it does not establish that only those people wrote it. An error entry means the provider could not follow the call: it establishes nothing about the repository."
+token_env = "APPA_PROVIDER_GITHUB_TOKEN"
+
+[externals.audience.github]
+command = ["python3", "audience-source.py"]
+token_env = "APPA_PROVIDER_GITHUB_TOKEN"
+selectors = [
+  { template = "viewer", feeds = "self" },
+  { template = "org/<org>/members", feeds = "internal" },
+  { template = "org/<org>/team/<team>" },
+  { template = "repo/<owner>/<repo>/collaborators" },
+]
+
+# --- reads of one repository: its visibility decides who may see the content ---
+
+[[policy.tool]]
+name = "mcp/github/get_file_contents"
+annotator = "github.repository-visibility"
+tags = ["github"]
+
+[[policy.tool]]
+name = "mcp/github/list_branches"
+annotator = "github.repository-visibility"
+tags = ["github"]
+
+[[policy.tool]]
+name = "mcp/github/list_commits"
+annotator = "github.repository-visibility"
+tags = ["github"]
+
+[[policy.tool]]
+name = "mcp/github/get_commit"
+annotator = "github.repository-visibility"
+tags = ["github"]
+
+[[policy.tool]]
+name = "mcp/github/list_tags"
+annotator = "github.repository-visibility"
+tags = ["github"]
+
+[[policy.tool]]
+name = "mcp/github/get_tag"
+annotator = "github.repository-visibility"
+tags = ["github"]
+
+[[policy.tool]]
+name = "mcp/github/list_releases"
+annotator = "github.repository-visibility"
+tags = ["github"]
+
+[[policy.tool]]
+name = "mcp/github/get_latest_release"
+annotator = "github.repository-visibility"
+tags = ["github"]
+
+[[policy.tool]]
+name = "mcp/github/get_release_by_tag"
+annotator = "github.repository-visibility"
+tags = ["github"]
+
+[[policy.tool]]
+name = "mcp/github/list_repository_collaborators"
+annotator = "github.repository-visibility"
+tags = ["github"]
+
+[[policy.tool]]
+name = "mcp/github/list_issues"
+annotator = "github.repository-visibility"
+tags = ["github"]
+
+[[policy.tool]]
+name = "mcp/github/issue_read"
+annotator = "github.repository-visibility"
+tags = ["github"]
+
+[[policy.tool]]
+name = "mcp/github/get_label"
+annotator = "github.repository-visibility"
+tags = ["github"]
+
+[[policy.tool]]
+name = "mcp/github/list_pull_requests"
+annotator = "github.repository-visibility"
+tags = ["github"]
+
+[[policy.tool]]
+name = "mcp/github/pull_request_read"
+annotator = "github.repository-visibility"
+tags = ["github"]
+
+# --- writes into one repository: its visibility decides who must be allowed to see the data ---
+
+[[policy.tool]]
+name = "mcp/github/fork_repository"
+annotator = "github.repository-readers"
+
+[[policy.tool]]
+name = "mcp/github/create_branch"
+annotator = "github.repository-readers"
+
+[[policy.tool]]
+name = "mcp/github/create_or_update_file"
+annotator = "github.repository-readers"
+
+[[policy.tool]]
+name = "mcp/github/push_files"
+annotator = "github.repository-readers"
+
+[[policy.tool]]
+name = "mcp/github/delete_file"
+annotator = "github.repository-readers"
+
+[[policy.tool]]
+name = "mcp/github/issue_write"
+annotator = "github.repository-readers"
+
+[[policy.tool]]
+name = "mcp/github/sub_issue_write"
+annotator = "github.repository-readers"
+tags = ["github"]
+
+[[policy.tool]]
+name = "mcp/github/add_issue_comment"
+annotator = "github.repository-readers"
+
+[[policy.tool]]
+name = "mcp/github/create_pull_request"
+annotator = "github.repository-readers"
+
+[[policy.tool]]
+name = "mcp/github/update_pull_request"
+annotator = "github.repository-readers"
+
+[[policy.tool]]
+name = "mcp/github/update_pull_request_branch"
+annotator = "github.repository-readers"
+
+[[policy.tool]]
+name = "mcp/github/merge_pull_request"
+annotator = "github.repository-readers"
+
+[[policy.tool]]
+name = "mcp/github/pull_request_review_write"
+annotator = "github.repository-readers"
+
+[[policy.tool]]
+name = "mcp/github/add_comment_to_pending_review"
+annotator = "github.repository-readers"
+
+[[policy.tool]]
+name = "mcp/github/add_reply_to_pull_request_comment"
+annotator = "github.repository-readers"
+
+[[policy.tool]]
+name = "mcp/github/request_copilot_review"
+annotator = "github.repository-readers"

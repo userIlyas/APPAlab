@@ -1,0 +1,135 @@
+{
+  "observed_on": "2026-11-24 UTC",
+  "model": "N/A: deterministic native engine, no LLM calls",
+  "system_prompt_hash": "N/A",
+  "temperature": "N/A",
+  "seed": "N/A (UUID call IDs random; no asserted policy dependency)",
+  "test_environment": {
+    "python": "3.14.10",
+    "pytest": "9.2.0",
+    "native_package": "appa-agent-python 0.46.1",
+    "binding_identity": "appa-agent-python-v9",
+    "native_so_sha256": "324b973dd580b831bd8e3e135cb32a69bc751512c8122f32f807e99eb44a058b"
+  },
+  "native_gate": {
+    "command": "APPA_TAINT_MODE=enforce python -m pytest tests/test_appa_taint.py -q -p no:cacheprovider",
+    "repetitions": 3,
+    "passed_per_repetition": [
+      14,
+      14,
+      14
+    ],
+    "skipped_per_repetition": [
+      0,
+      0,
+      0
+    ],
+    "test_functions": [
+      "test_enforce_fails_closed_when_engine_unavailable",
+      "test_enforce_fails_closed_without_conversation_id",
+      "test_enforce_fails_closed_when_policy_missing",
+      "test_observe_passes_through_when_engine_unavailable",
+      "test_off_mode_passes_through",
+      "test_status_reports_engine_and_policy",
+      "test_has_untrusted_memory_detects_provenance",
+      "test_clean_conversation_allows_reads_and_money",
+      "test_plain_memory_recall_does_not_narrow",
+      "test_untrusted_memory_recall_narrows_and_blocks_money",
+      "test_untrusted_search_blocks_money_in_the_same_conversation",
+      "test_taint_is_cross_turn_and_per_conversation",
+      "test_undeclared_tool_is_refused",
+      "test_travel_plan_is_also_untrusted_ingress"
+    ],
+    "warning": "pytest-asyncio not installed in existing native-only venv; unknown asyncio_mode config, selected tests synchronous"
+  },
+  "glue": {
+    "command": "PYTHONPATH=agentic-banking-lab python integration/validation.py",
+    "repetitions": 3,
+    "checks_passed_per_repetition": [
+      4,
+      4,
+      4
+    ]
+  },
+  "tool_sinks": "in-memory fake_executor / fake_result only; no banking service or HTTP MCP calls",
+  "static": {
+    "counts": {
+      "python_compiled": 75,
+      "banking_json_parsed": 2,
+      "toml_parsed": 6,
+      "source_hashes_checked": 1452
+    },
+    "compose": {
+      "docker-compose.yml": {
+        "services": [
+          "abs-api",
+          "abs-mcp",
+          "abs-mcp-vulnerable",
+          "banking-agent",
+          "clickhouse",
+          "duckduckgo-mcp",
+          "flights-mcp",
+          "keycloak",
+          "keycloak-configurator",
+          "langfuse-memory",
+          "langfuse-travel",
+          "langfuse-web",
+          "langfuse-worker",
+          "memory-api",
+          "memory-orchestrator",
+          "memory-service",
+          "mongo",
+          "postgres",
+          "redis",
+          "seaweedfs",
+          "travel-agent",
+          "travel-api",
+          "travel-duckduckgo-mcp",
+          "ui"
+        ],
+        "service_count": 24,
+        "build_contexts_and_bind_sources": "PASS"
+      },
+      "docker-compose.appa.yml": {
+        "services": [
+          "banking-agent-appa"
+        ],
+        "service_count": 1,
+        "build_contexts_and_bind_sources": "PASS"
+      }
+    },
+    "limitations": [
+      "No wheel rebuild or deployment performed",
+      "Search names mismatch: news_search/text_search vs policy news/text"
+    ]
+  },
+  "offline_cargo": {
+    "command": "cargo check --manifest-path /src/appa-agent-python/Cargo.toml --locked --offline",
+    "image": "rust:1.96-bookworm",
+    "network": "none",
+    "exit_code": 101,
+    "reason": "no matching package named reqwest found in clean Cargo cache/index",
+    "full_rebuild": "UNVERIFIED"
+  },
+  "live_e2e": "NOT RUN; no chat, token or transfer endpoints invoked",
+  "source_drift": "1452 snapshot hashes verified",
+  "cleanup": "Test Session temporary stores removed; scanner canary file removed; offline Cargo container --rm; no existing container/volume/.env changes.",
+  "artifact_sha256": {
+    "agentic-banking-lab/services/common/appa_taint.py": "78fa4c4fac2c23b386208ea0e387bb096e5d1ac02042c7cea2d423452935903c",
+    "agentic-banking-lab/configs/appa.toml": "ea6d0eead80c13ff8cb9f1281430c8c0e7a93f37957ba2a740b8fc5f21cb0c10",
+    "agentic-banking-lab/tests/test_appa_taint.py": "b4cd81d000b178c65957aafe58f99ba0824f694cbe59799ad1923961aee275de",
+    "integration/validation.py": "ed23d677d08c0b9eb033df3e9611a037d90b66ea580bc6441927c46f2a0f1abb"
+  },
+  "git_diff_check": {
+    "exit_code": 2,
+    "notices": 24,
+    "scope": "Only preserved source bytes, all match snapshot SHA-256",
+    "files": [
+      "OpenAPPA/bench/corp/README.md",
+      "agentic-banking-lab/Dockerfile",
+      "agentic-banking-lab/infra/nginx/default.conf",
+      "agentic-banking-lab/infra/postgres/init-databases.sql"
+    ],
+    "action": "Not reformatted; preserve first snapshot faithfully"
+  }
+}

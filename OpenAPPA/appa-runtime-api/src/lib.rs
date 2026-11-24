@@ -1,0 +1,914 @@
+//! appa-runtime-api — the vocabulary the runtime and its harness
+//! adapters share, and the canonical hook wire ([`wire`]) that carries
+//! it between a host's adapter and the runtime.
+
+pub mod inventory;
+mod launch;
+mod peer;
+mod wire;
+
+pub use launch::{LaunchStart, LaunchToken, LaunchTokenError, StartKind};
+pub use peer::{PeerAddress, PeerDigest, PeerFrame, PeerValueError, SessionTitle};
+
+pub use wire::{
+    Accepted, Adapter, DecisionName, EventName, IdentifiedTool, IdentifyToolFn, NamesChildrenFn, OutcomeStatus,
+    PROTOCOL, PrincipalSource, SpellFn, UnsanitizedReturn, WireDecision, WireEvent, WireOffer, WireOutcome, WireReturn,
+    WireReview,
+};
+
+/// The hosts this runtime serves over the wire, plus the one that is
+/// no host of the wire at all. The one place harness names appear as a
+/// closed set: each served variant fixes a trajectory prefix and the
+/// channel a review reaches a person through
+/// ([`AdapterName::review_channel`]); how a host identifies a tool from
+/// its raw spelling and how its policy resolves names is the [`Adapter`] it
+/// supplies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdapterName {
+    ClaudeCode,
+    Kagent,
+    Amp,
+    #[serde(rename = "opencode")]
+    OpenCode,
+    /// A host that embeds the runtime in its own process. There is no
+    /// served process and no wire: the host builds every event itself,
+    /// identifies each call through the [`Adapter`] it opened the runtime
+    /// with, and reviews through its own surface. Never the answer to
+    /// [`AdapterName::parse`], since nothing on the wire names it.
+    Embedded,
+}
+
+impl AdapterName {
+    /// The adapters a served runtime can be started with.
+    pub const ALL: [AdapterName; 4] = [
+        AdapterName::ClaudeCode,
+        AdapterName::Kagent,
+        AdapterName::Amp,
+        AdapterName::OpenCode,
+    ];
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|host| host.as_str() == text)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AdapterName::ClaudeCode => "claude-code",
+            AdapterName::Kagent => "kagent",
+            AdapterName::Amp => "amp",
+            AdapterName::OpenCode => "opencode",
+            AdapterName::Embedded => "embedded",
+        }
+    }
+
+    /// The prefix every trajectory id of this adapter carries. An embedding host names
+    /// its trajectories itself and never asks for one.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            AdapterName::ClaudeCode => "cc",
+            AdapterName::Kagent => "kagent",
+            AdapterName::Amp => "amp",
+            AdapterName::OpenCode => "opencode",
+            AdapterName::Embedded => "embedded",
+        }
+    }
+
+    pub fn root(self, host_id: &str) -> TrajectoryId {
+        TrajectoryId(format!("{}:{host_id}", self.prefix()))
+    }
+
+    /// The channel a [`Review`] reaches a person through under this
+    /// host, and with it the right to assert a [`Ruling`]. An embedding
+    /// host has its own surface to show a review on.
+    pub fn review_channel(self) -> ReviewChannel {
+        match self {
+            AdapterName::ClaudeCode | AdapterName::Amp | AdapterName::OpenCode => ReviewChannel::Runtime,
+            AdapterName::Kagent | AdapterName::Embedded => ReviewChannel::Host,
+        }
+    }
+}
+
+/// Where the person who rules on a remedy sits, per host.
+///
+/// `Host` is a harness that reviews through its own channel: it shows
+/// the [`Review`] text and returns the answer as a [`Ruling`] on the
+/// control call. `Runtime` is a harness with no such channel, where the
+/// runtime's own elicitation is the only route to a person — so a
+/// ruling on that host's wire asserts an answer no person gave, and the
+/// envelope carrying it is refused rather than spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewChannel {
+    Host,
+    Runtime,
+}
+
+impl std::fmt::Display for AdapterName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AdapterName {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        AdapterName::ALL
+            .into_iter()
+            .find(|name| name.as_str() == text)
+            .ok_or_else(|| format!("{text} is not an adapter; one of: claude-code, kagent, amp, opencode"))
+    }
+}
+
+/// A tool's canonical identity: `<family>/<namespace>/<tool>` for the
+/// `mcp`, `host`, and `agent` families, and `appa/execute_remedy_plan`
+/// as the whole `appa` family. Policies the runtime loads name tools this
+/// way; an adapter maps its host's raw spelling onto it bijectively over
+/// the host's raw domain. The runtime keys every fact on this identity;
+/// the raw spelling stays with the host for dispatch and diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CanonicalTool(String);
+
+/// The runtime's own control tool, the one member of the `appa` family.
+pub const CONTROL_TOOL: &str = "appa/execute_remedy_plan";
+
+/// The control tool as a model sees it. Function-calling APIs reject `/` in a tool
+/// name, so a harness advertises this alias and translates it back with
+/// [`canonical_tool_name`]; `CONTROL_TOOL` is the runtime side of that translation.
+pub const ADVERTISED_CONTROL_TOOL: &str = "execute_remedy_plan";
+
+/// Translates a name the model called into the name the runtime knows: the advertised
+/// alias becomes [`CONTROL_TOOL`], and a host tool passes through unchanged.
+pub fn canonical_tool_name(advertised: &str) -> &str {
+    match advertised {
+        ADVERTISED_CONTROL_TOOL => CONTROL_TOOL,
+        host_tool => host_tool,
+    }
+}
+
+/// Whether a name a host would register belongs to the control tool under either
+/// spelling: the advertised alias the model calls, or the canonical id the runtime
+/// routes. A host tool under either one is indistinguishable from the control tool at
+/// check time — the alias is translated into the canonical id, and the canonical id
+/// passes through — so every call to it reaches remedy handling instead of the host's
+/// tool, and a harness refuses the name rather than rerouting it.
+pub fn is_reserved_tool_name(name: &str) -> bool {
+    canonical_tool_name(name) == CONTROL_TOOL
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalToolError {
+    Family { name: String },
+    Shape { name: String },
+    Segment { name: String, segment: String },
+    Namespace { name: String },
+    Control { name: String },
+}
+
+impl std::fmt::Display for CanonicalToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Family { name } => write!(f, "{name}: a canonical tool starts with mcp/, host/, agent/, or appa/"),
+            Self::Shape { name } => write!(f, "{name}: a canonical tool is <family>/<namespace>/<tool>"),
+            Self::Segment { name, segment } => {
+                write!(f, "{name}: segment {segment:?} is not [A-Za-z0-9_.-]+")
+            }
+            Self::Namespace { name } => write!(f, "{name}: a namespace segment cannot contain __"),
+            Self::Control { name } => write!(f, "{name}: the appa family has one member, {CONTROL_TOOL}"),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalToolError {}
+
+fn is_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+impl CanonicalTool {
+    pub fn parse(name: &str) -> Result<Self, CanonicalToolError> {
+        let refuse_shape = || CanonicalToolError::Shape { name: name.to_string() };
+        let (family, rest) = name
+            .split_once('/')
+            .ok_or_else(|| CanonicalToolError::Family { name: name.to_string() })?;
+        match family {
+            "appa" => {
+                if name == CONTROL_TOOL {
+                    Ok(Self(name.to_string()))
+                } else {
+                    Err(CanonicalToolError::Control { name: name.to_string() })
+                }
+            }
+            "mcp" | "host" | "agent" => {
+                let (namespace, tool) = rest.split_once('/').ok_or_else(refuse_shape)?;
+                for segment in [namespace, tool] {
+                    if !is_segment(segment) {
+                        return Err(CanonicalToolError::Segment {
+                            name: name.to_string(),
+                            segment: segment.to_string(),
+                        });
+                    }
+                }
+                if namespace.contains("__") {
+                    return Err(CanonicalToolError::Namespace { name: name.to_string() });
+                }
+                Ok(Self(name.to_string()))
+            }
+            _ => Err(CanonicalToolError::Family { name: name.to_string() }),
+        }
+    }
+
+    /// Build one from its parts, refusing what [`CanonicalTool::parse`] refuses.
+    pub fn of(family: &str, namespace: &str, tool: &str) -> Result<Self, CanonicalToolError> {
+        Self::parse(&format!("{family}/{namespace}/{tool}"))
+    }
+
+    pub fn control() -> Self {
+        Self(CONTROL_TOOL.to_string())
+    }
+
+    pub fn is_control(&self) -> bool {
+        self.0 == CONTROL_TOOL
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for CanonicalTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+
+    #[test]
+    fn the_grammar_is_per_family() {
+        for name in [
+            "mcp/github/create_issue",
+            "host/claude-code/Bash",
+            "agent/kagent/log-analyst",
+            "mcp/a.b-c_d/T.o-o_l",
+            CONTROL_TOOL,
+        ] {
+            assert_eq!(
+                CanonicalTool::parse(name).map(|tool| tool.into_string()),
+                Ok(name.to_string())
+            );
+        }
+        assert!(CanonicalTool::parse(CONTROL_TOOL).expect("control").is_control());
+        assert!(
+            !CanonicalTool::parse("mcp/appa/execute_remedy_plan")
+                .expect("mcp")
+                .is_control()
+        );
+        for name in [
+            "",
+            "Bash",
+            "mcp__github__x",
+            "mcp/github",
+            "mcp/github/",
+            "mcp//x",
+            "mcp/github/x/y",
+            "mcp/a__b/x",
+            "mcp/a b/x",
+            "mcp/a(b)/x",
+            "host/claude-code/Bash(command:ls)",
+            "appa/other",
+            "appa/execute_remedy_plan/x",
+            "tool/x/y",
+            "*",
+        ] {
+            assert!(CanonicalTool::parse(name).is_err(), "{name:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn serde_and_names_round_trip() {
+        let tool: CanonicalTool = serde_json::from_str(r#""mcp/github/x""#).expect("parses");
+        assert_eq!(serde_json::to_string(&tool).expect("serializes"), r#""mcp/github/x""#);
+        assert!(serde_json::from_str::<CanonicalTool>(r#""github""#).is_err());
+        for name in AdapterName::ALL {
+            assert_eq!(name.as_str().parse::<AdapterName>(), Ok(name));
+            assert_eq!(
+                serde_json::to_string(&name).expect("serializes"),
+                format!("{:?}", name.as_str())
+            );
+        }
+        assert!("ClaudeCode".parse::<AdapterName>().is_err());
+        assert_eq!(AdapterName::ClaudeCode.root("s1").0, "cc:s1");
+    }
+}
+
+impl serde::Serialize for CanonicalTool {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CanonicalTool {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        CanonicalTool::parse(&name).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Identity of one trajectory (root or child). The adapter constructs it
+/// from the harness's own ids with a harness prefix; there is no
+/// translation table.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+pub struct TrajectoryId(pub String);
+
+impl TrajectoryId {
+    pub fn new(id: impl Into<String>) -> Self {
+        TrajectoryId(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+mod trajectory_id_tests {
+    use super::TrajectoryId;
+
+    #[test]
+    fn serializes_as_a_bare_string() {
+        let id = TrajectoryId::new("cc:s1");
+        let json = serde_json::to_string(&id).expect("serializes");
+        assert_eq!(json, "\"cc:s1\"");
+        assert_eq!(serde_json::from_str::<TrajectoryId>(&json).expect("deserializes"), id);
+    }
+}
+
+/// A model-directed tool call at the harness's execution boundary. The
+/// arguments are the JSON spelling the harness would execute. The engine
+/// canonicalizes them; the runtime and adapter do not parse or rewrite them.
+/// `tool` is the host's raw spelling on the client side of the wire and
+/// the canonical identity ([`CanonicalTool`]) once the runtime has read
+/// the event; a host that embeds the runtime and calls it directly names
+/// tools the way its own policy does.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProposedCall {
+    pub tool: String,
+    pub arguments: Box<serde_json::value::RawValue>,
+    /// The working directory the harness would execute the call in, when the harness
+    /// reports one. Not part of the call's identity: the programs bound to an annotator's
+    /// inputs read it, the engine and the annotator never do.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+/// Equality is over the bytes as spelled, because that is the only
+/// equality this type can answer: deciding that two spellings are the
+/// same call needs the registered contract and the engine's
+/// canonicalization, neither of which this crate has. Parsing here to
+/// compare would reintroduce exactly what `arguments` exists to
+/// prevent — `serde_json` would make `{"a":1,"a":2}` equal to the
+/// admissible `{"a":2}`, though the engine refuses the first.
+/// Callers that need same-call identity compare the
+/// engine's canonical bytes; the runtime does
+/// (`api::session::classify_report`).
+impl PartialEq for ProposedCall {
+    fn eq(&self, other: &Self) -> bool {
+        self.tool == other.tool && self.arguments.get() == other.arguments.get()
+    }
+}
+
+/// What a dispatched tool produced, in the runtime's typing. The
+/// adapter owns the mapping from its harness's wire to this type.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolOutcome {
+    Success { body: OutcomeBody },
+    Failure { message: String },
+    Indeterminate,
+}
+
+/// The tool output body, where available. `TooLarge` records a success
+/// whose body was over a byte cap, with the cap when the side that applied
+/// it knows it (the cap is the runtime's to apply, so an adapter carries the
+/// body it saw). `Unavailable` records a success the harness reported
+/// without a body.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutcomeBody {
+    Available(String),
+    TooLarge { limit_bytes: Option<usize> },
+    Unavailable,
+}
+
+/// Which trajectory an event belongs to: the root, and the child when
+/// the harness attributes the event to one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Actor {
+    pub root: TrajectoryId,
+    pub child: Option<TrajectoryId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SpawnBinding(pub String);
+
+/// How a starting child names the spawn that prepared its fork.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SpawnRef {
+    Binding(SpawnBinding),
+    InFlight,
+    /// The fan-out spawn released under this host prompt.
+    FanOut(PromptKey),
+}
+
+/// How many children one spawn call starts under its single return
+/// declaration: one bound to the spawn's fork, or any number, each on a
+/// member fork of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpawnKind {
+    Single,
+    FanOut,
+}
+
+/// The host's opaque identity for one user prompt. A fan-out spawn's
+/// children name no spawn call, only the prompt it was released under,
+/// so this is what binds them to it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PromptKey(pub String);
+
+/// A person's ruling the harness obtained itself for the offer a
+/// control call quotes. A harness whose review channel is its own —
+/// where the runtime's elicitation reaches no person — shows the
+/// [`Review`] text and returns the answer here; the runtime spends it
+/// as the human authority's answer for that one execution, exactly as
+/// an elicitation's Accept or Decline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ruling {
+    Approve,
+    Deny,
+}
+
+/// An offer whose plan consults a human authority, with the review as
+/// the person reads it — the consult artifact alone: the authority and
+/// its hint, the exact tool, the canonical arguments, and what the
+/// ruling covers. Nothing the model said is in it, and the person's
+/// answer never passes back through the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Review {
+    pub offer: String,
+    pub text: String,
+    /// The authority this review asks. `None` when unknown: a decision stored before this
+    /// field, or a `text` that joins the reviews of several authorities.
+    pub authority: Option<String>,
+    /// The policy author's hint for that authority.
+    pub hint: Option<String>,
+    /// What approving accepts, one item per coverage bullet in `text`. `None` when unknown,
+    /// under the same two conditions as `authority`: show `text` instead. `Some(vec![])`
+    /// means approving accepts nothing else.
+    pub scope: Option<Vec<ReviewScopeItem>>,
+}
+
+/// One thing approving a review accepts. Identifiers are exact and unescaped; `text` is the
+/// bullet the review prints for this item, safe to display as it stands.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewScopeItem {
+    Attention {
+        mark: String,
+        text: String,
+    },
+    Requirement {
+        requirement: ReviewRequirement,
+        text: String,
+    },
+    Narrowing {
+        narrowing: ReviewNarrowing,
+        text: String,
+    },
+}
+
+impl ReviewScopeItem {
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Attention { text, .. } | Self::Requirement { text, .. } | Self::Narrowing { text, .. } => text,
+        }
+    }
+}
+
+/// A gap other than attention that the ruling would cover.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReviewRequirement {
+    Trust { required: String },
+    PublicAudience,
+    Audience { readers: Vec<String> },
+    Effect { excludes: String },
+}
+
+/// What approving also does to the rest of the conversation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReviewNarrowing {
+    Blocked {
+        tools: Vec<String>,
+    },
+    SignOff {
+        tools: Vec<String>,
+    },
+    RecipientChecked {
+        tools: Vec<String>,
+    },
+    PerCall,
+    /// The narrowing is known but its impact on each tool is not.
+    Unjudged,
+}
+
+/// What a stop (a turn end or a child's end) does with a call still open
+/// at it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenCalls {
+    /// The harness reports no outcome after its stop, as a hook harness
+    /// does: each call still open closes as unreported.
+    Abandon,
+    /// The harness reports every outcome under its call id on the actor's
+    /// next step, as an inference proxy does. `answered` names the calls
+    /// whose results the stopping step carried. An open call with a call id
+    /// outside `answered` is still running, so the stop is held; any other
+    /// open call closes as unreported.
+    Hold {
+        answered: std::collections::BTreeSet<String>,
+    },
+}
+
+/// One hook event in the runtime's vocabulary. The adapter maps each
+/// of its harness's hooks onto exactly one variant — or onto no event
+/// at all for hooks the deployment does not gate.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HookEvent {
+    SessionStart {
+        root: TrajectoryId,
+        /// The reader this session acts for, as the host authenticated it: an address. It
+        /// answers the `self` audience for the whole family. `None` leaves `self` to the
+        /// policy's configured sources.
+        principal: Option<String>,
+        /// Where this session receives peer messages, when its launcher bound one.
+        address: Option<PeerAddress>,
+        /// The title the host shows for this session.
+        title: Option<SessionTitle>,
+        /// Why the host started this session id, where it says.
+        start: Option<StartKind>,
+        /// The protected launch this start belongs to, when a launcher started the host.
+        launch: Option<LaunchStart>,
+    },
+    Prompt {
+        actor: Actor,
+        text: String,
+        /// The host call this prompt reports finished: a background
+        /// spawn's completion notice arrives as a prompt naming its call.
+        settles: Option<String>,
+        /// Set when the prompt arrived as another session's message.
+        peer: Option<PeerFrame>,
+        /// The title the host shows for this session.
+        title: Option<SessionTitle>,
+    },
+    /// The actor finished a turn. Under [`OpenCalls::Abandon`] a dispatch
+    /// still open names a call the harness never ran, except an identified
+    /// spawn whose subagent is still running: a background subagent works
+    /// past its parent's turn.
+    TurnEnd { actor: Actor, open_calls: OpenCalls },
+    /// A child finished without output. Close a no-return child permanently;
+    /// retain a child with a crossing return contract for subsequent turns.
+    ChildTurnEnd {
+        root: TrajectoryId,
+        child: TrajectoryId,
+        open_calls: OpenCalls,
+    },
+    ToolCall {
+        actor: Actor,
+        call: ProposedCall,
+        /// The host's opaque identity for this call occurrence. A host
+        /// that supplies one can have several ordinary calls open at once.
+        call_id: Option<String>,
+        spawn: Option<SpawnKind>,
+        /// The host prompt this call serves. On a child's call it is set
+        /// only for a fan-out spawn's child, and names that spawn's prompt.
+        prompt: Option<PromptKey>,
+        /// A ruling the harness already obtained for the offer this
+        /// control call quotes; `None` on every ordinary call.
+        ruling: Option<Ruling>,
+        /// The return this single spawn declares for its subagent. A blocked spawn applies it
+        /// through its block's declaration plan and is proposed again in the same hook. Any
+        /// other call that carries one is refused.
+        declares: Option<DeclaredReturn>,
+    },
+    /// Continue an already released spawn after native approval, without a new proposal.
+    SpawnResume {
+        actor: Actor,
+        call: ProposedCall,
+        child: TrajectoryId,
+    },
+    ToolResult {
+        actor: Actor,
+        call: ProposedCall,
+        call_id: Option<String>,
+        outcome: ToolOutcome,
+    },
+    ChildStart {
+        root: TrajectoryId,
+        child: TrajectoryId,
+        spawn: SpawnRef,
+    },
+    ChildEnd {
+        /// The root whose log this child's records land in. No
+        /// parent: which branch this child was forked from is the log's own
+        /// record, and a caller's claim about it would be a second answer.
+        root: TrajectoryId,
+        child: TrajectoryId,
+        value: Option<String>,
+        open_calls: OpenCalls,
+    },
+    /// A child's return that does not end it: the value crosses exactly as
+    /// a stop's would, and the child keeps running.
+    ChildReturn {
+        root: TrajectoryId,
+        child: TrajectoryId,
+        value: String,
+    },
+    SpawnResult {
+        actor: Actor,
+        call: ProposedCall,
+        call_id: Option<String>,
+        outcome: ToolOutcome,
+        child: Option<TrajectoryId>,
+        value: Option<String>,
+    },
+}
+
+/// Which operational fault a [`HookDecision::Refuse`] names: a closed
+/// class a host can route on without reading `detail`. The serde name is
+/// its one spelling, on the wire and in telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalClass {
+    Storage,
+    UntrustedLog,
+    PolicyUnavailable,
+    /// The deployment published a later revision while this event was being decided.
+    /// Nothing was committed; the same event decides at the head when the host retries it.
+    PolicyMoved,
+    /// The trajectory family was opened before live policy revisions, and no policy of this
+    /// runtime decides it. A retry is refused again: the host opens a new family.
+    LegacyFamily,
+    InventoryRefused,
+    EngineInvariant,
+    Contended,
+    ResolutionDiverged,
+    AnnotationRefused,
+    UndeclaredTool,
+    UndeclaredSpawn,
+    PeerMessage,
+    Principal,
+    OutstandingCall,
+    CallIdReused,
+    TrajectoryEnded,
+    Trajectory,
+    Dispatch,
+    Remedy,
+    /// No prepared fork opens this child: the spawn never took.
+    SpawnNotTaken,
+    Spawn,
+}
+
+/// The runtime's answer to one hook event. The adapter renders each
+/// variant into its harness's wire; it interprets nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HookDecision {
+    Ack,
+    AllowCall {
+        spawn: Option<SpawnBinding>,
+    },
+    PassControl,
+    /// The call is blocked; `feedback` tells the model why — a requirement
+    /// the trajectory's label does not meet, or the narrowing the call would
+    /// cause.
+    DenyCall {
+        feedback: String,
+        /// The remedies the block offers, in the order the feedback lists
+        /// them, for a harness that routes one itself rather than through
+        /// the model's control call.
+        offers: Vec<OfferedRemedy>,
+        /// The offers whose plans consult a human authority, for a
+        /// harness that reviews through its own channel.
+        review: Vec<Review>,
+    },
+    Block {
+        reason: String,
+    },
+    /// The runtime's own words in place of the result: a notice that
+    /// nothing was admitted, or the narrowing this result would cause
+    /// and the control call that accepts it. Nothing here was admitted
+    /// from a value, so a harness that spells the runtime's tool names
+    /// into names its model dispatches spells this text.
+    ReplaceOutput {
+        output: String,
+    },
+    /// The value the engine admitted in place of the raw result: a
+    /// confined result the check let through, or a sanitizer's
+    /// derivation. It reaches the model as it crossed — a harness
+    /// delivers these bytes and rewrites nothing in them, exactly as it
+    /// delivers a [`HookDecision::ChildReturn`].
+    DeliverValue {
+        value: String,
+    },
+    /// What crosses to the parent is `value`, not the child's message as
+    /// it spelled it: a shaped return crosses in canonical form, and a
+    /// sanitized one as the sanitizer's derivation. A harness that
+    /// delivers the child's own words has the child return `value`
+    /// verbatim — the next stop that carries it crosses and answers
+    /// `Ack`; a harness that speaks for the child returns `value` on its
+    /// behalf the same way. A return that crosses as spoken answers
+    /// `Ack`, so this variant never merely reports a crossing.
+    ChildReturn {
+        value: String,
+    },
+    /// The child's return is deferred: nothing it said crosses until its parent accepts it,
+    /// and the child's errand is over. The harness ends the child's run and hands the parent
+    /// none of the child's words.
+    DeferReturn,
+    /// The event is acknowledged, and `text` goes to the actor it names
+    /// as context the harness hands that actor: at a child's start, the
+    /// return contract the child works under; with a prompt or a tool's
+    /// result, the peer messages held for it.
+    Context {
+        text: String,
+    },
+    /// The runtime judged nothing for this event because of an
+    /// operational fault it classes in `class` and names in `detail`: an
+    /// annotator or store that did not answer, a policy that would not
+    /// load. A host routes on `class`, never on `detail`. Fail the one
+    /// event closed — the call does not run, the result is not admitted
+    /// — and hand the model `detail` as the runtime's words, never as
+    /// policy feedback: nothing was decided and no remedy is offered.
+    /// The trajectory stays open; a harness ends it only when a
+    /// lifecycle event is refused.
+    Refuse {
+        class: RefusalClass,
+        detail: String,
+    },
+    /// The stop is not taken: the calls `running` names are still running
+    /// under [`OpenCalls::Hold`]. Nothing was recorded and nothing crossed.
+    /// The harness delivers the step's response as it is; the actor's
+    /// next stop after those calls report is judged as usual.
+    Held {
+        running: Vec<String>,
+    },
+}
+
+/// One remedy a block offers: the id `execute_remedy_plan` takes and,
+/// where the plan declares a child's return, how that return crosses.
+/// `None` for a plan that declares no return.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferedRemedy {
+    pub id: String,
+    pub returns: Option<OfferedReturn>,
+    /// Input sanitizer that rewrites call arguments before re-proposing the tool.
+    pub input_sanitizer: Option<OfferedInputSanitizer>,
+}
+
+/// Typed metadata for an input-sanitizer remedy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferedInputSanitizer {
+    pub name: String,
+    pub target: String,
+    pub description: Option<String>,
+}
+
+/// How a return-declaring plan crosses the child's return: as the child
+/// spoke it, through the registered sanitizer named (`attest-schema`
+/// attests a schema the declaration supplies), or not at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OfferedReturn {
+    AsSpoken,
+    Sanitized { sanitizer: String },
+    Void,
+}
+
+/// A label as the policy dialect spells a `delta`: a trust rank name and an audience list. An
+/// omitted dimension keeps the declaring trajectory's current value.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LabelSpelling {
+    pub trust: Option<String>,
+    pub audience: Option<Vec<String>>,
+}
+
+/// The arguments a subagent's return is declared with, as its caller spelled them: the lowest
+/// label the parent accepts from the return, and the schema an attested return matches.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredArguments {
+    pub label: Option<LabelSpelling>,
+    pub return_schema: Option<serde_json::Value>,
+}
+
+/// The return a single spawn's proposal declares for its subagent: the arguments its block's
+/// declaration plan takes, or a deferred return. Only a host that itself delivers a
+/// subagent's answer to its parent declares the deferral, and only here, on the spawn's own
+/// call: no control call and no declaration made ahead spells it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "DeclaredReturnRecord", into = "DeclaredReturnRecord")]
+pub enum DeclaredReturn {
+    Arguments(DeclaredArguments),
+    Deferred,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeclaredReturnRecord {
+    label: Option<LabelSpelling>,
+    return_schema: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    deferred: bool,
+}
+
+impl TryFrom<DeclaredReturnRecord> for DeclaredReturn {
+    type Error = &'static str;
+
+    fn try_from(record: DeclaredReturnRecord) -> Result<DeclaredReturn, &'static str> {
+        match record {
+            DeclaredReturnRecord {
+                label: None,
+                return_schema: None,
+                deferred: true,
+            } => Ok(DeclaredReturn::Deferred),
+            DeclaredReturnRecord { deferred: true, .. } => {
+                Err("a deferred return takes no `label` and no `return_schema`")
+            }
+            DeclaredReturnRecord {
+                label,
+                return_schema,
+                deferred: false,
+            } => Ok(DeclaredReturn::Arguments(DeclaredArguments { label, return_schema })),
+        }
+    }
+}
+
+impl From<DeclaredReturn> for DeclaredReturnRecord {
+    fn from(declared: DeclaredReturn) -> DeclaredReturnRecord {
+        match declared {
+            DeclaredReturn::Arguments(DeclaredArguments { label, return_schema }) => DeclaredReturnRecord {
+                label,
+                return_schema,
+                deferred: false,
+            },
+            DeclaredReturn::Deferred => DeclaredReturnRecord {
+                label: None,
+                return_schema: None,
+                deferred: true,
+            },
+        }
+    }
+}
+
+/// A refusal at the parse stage, before any event exists. `Unreadable`
+/// is not-even-JSON; `Malformed` parsed but misses a field its hook
+/// requires. Both block the action: hooks fail closed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParseRefusal {
+    Unreadable { detail: String },
+    Malformed { detail: String },
+}
+
+/// A host's shape translation, run on the client side of the wire (the
+/// `appa hook` client for Claude Code): parse the host's own hook bytes
+/// into at most one typed event, whose tool spelling is still the raw
+/// one; render one decision, for the event it answers, into the host's
+/// hook JSON. Plain `fn` pointers — no trait, no captured state —
+/// because an adapter that could hold state or reach the runtime would
+/// breach the boundary this crate declares. Nothing here is trusted by
+/// the runtime: the runtime identifies the tool itself
+/// ([`Adapter::identify_tool`]).
+#[derive(Clone, Copy)]
+pub struct Codec {
+    pub parse: fn(&[u8]) -> Result<Option<HookEvent>, ParseRefusal>,
+    /// Renders a decision for the event the host bytes reported; the bytes carry what the
+    /// host's own permission pipeline does after the hook.
+    pub render: fn(&[u8], &HookEvent, &HookDecision) -> serde_json::Value,
+    /// The answer that withholds a result, read from host bytes
+    /// [`Codec::parse`] refused. `Some` where those bytes report a
+    /// result the harness has already produced, carrying the host's own
+    /// answer that takes it out of the model's attention for the given
+    /// reason; `None` for every other hook, where nothing has run and
+    /// the client's exit code stops the action. Recognizing the hook is
+    /// the host's own shape question, so it is answered here rather than
+    /// by the client reading the host's JSON itself.
+    pub withholding: fn(&[u8], &str) -> Option<serde_json::Value>,
+}

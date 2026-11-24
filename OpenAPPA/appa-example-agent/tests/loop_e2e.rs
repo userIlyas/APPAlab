@@ -1,0 +1,1272 @@
+mod harness;
+
+use std::sync::Arc;
+
+use appa_example_agent::wire::WireMessage;
+use appa_example_agent::{
+    Agent, ArgumentKey, Limits, OpenAiCompatible, OpenAiConfig, Outcome, SpawnTool, ToolCatalogue, ToolName, ToolShim,
+    TranscriptHead,
+};
+use appa_runtime::api::TrajectoryId;
+use harness::{Decisions, Provider, ToolHost, runtime, tool};
+
+const NEUTRAL: &str = r#"
+version = 2
+
+[[policy.tool]]
+name = "read_hr"
+
+[[policy.tool]]
+name = "send_email"
+"#;
+
+async fn agent(runtime: appa_runtime::api::Runtime, provider: &Provider, host: &ToolHost, tools: &[&str]) -> Agent {
+    let endpoint = provider.clone().serve().await;
+    let shim = format!("{}/tools", host.clone().serve().await);
+    Agent::new(
+        Arc::new(runtime),
+        OpenAiCompatible::with_http_client(
+            OpenAiConfig::new(endpoint, "fixture/model", "test-key"),
+            appa_example_agent::HttpClient::loopback(),
+        ),
+        ToolShim::new(shim),
+        ToolCatalogue::new(tools.iter().map(|name| tool(name)).collect())
+            .expect("the fixture tools leave the control name to the runtime"),
+    )
+    .with_head(TranscriptHead::new(vec![WireMessage::system("You are a fixture.")]))
+    .with_limits(Limits {
+        max_inference_rounds: 8,
+        ..Limits::default()
+    })
+}
+
+fn root() -> TrajectoryId {
+    TrajectoryId("agent-test".to_string())
+}
+
+#[tokio::test]
+async fn a_released_call_runs_and_its_output_reaches_the_model() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let provider = Provider::default();
+    provider
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .says("Alice is a Staff Engineer.");
+    let host = ToolHost::default();
+    host.answers("read_hr", "Alice Chen, Staff Engineer");
+
+    let agent = agent(runtime(&dir, NEUTRAL, ""), &provider, &host, &["read_hr"]).await;
+    let outcome = agent.run(root(), "Who is Alice?", Default::default()).await;
+
+    assert_eq!(outcome, Outcome::Answer("Alice is a Staff Engineer.".to_string()));
+    assert_eq!(
+        provider.tool_result(1, "call_0"),
+        "Alice Chen, Staff Engineer",
+        "the released call's output crosses as produced",
+    );
+    assert_eq!(
+        host.calls(),
+        vec![serde_json::json!({"tool": "read_hr", "arguments": {"who": "alice"}})],
+        "the host ran exactly the call the model proposed",
+    );
+}
+
+#[tokio::test]
+async fn the_agent_owns_the_transcript_it_shows_the_model() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let provider = Provider::default();
+    provider.says("done");
+    let host = ToolHost::default();
+
+    let agent = agent(runtime(&dir, NEUTRAL, ""), &provider, &host, &["read_hr"]).await;
+    agent.run(root(), "Who is Alice?", Default::default()).await;
+
+    let transcript = provider.transcript(0);
+    assert_eq!(transcript.len(), 2);
+    assert_eq!(transcript[0]["role"], "system");
+    assert_eq!(
+        transcript[1],
+        serde_json::json!({"role": "user", "content": "Who is Alice?"})
+    );
+
+    let requests = provider.requests();
+    let advertised: Vec<&str> = requests[0]["tools"]
+        .as_array()
+        .expect("the agent advertises its catalogue")
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(
+        advertised,
+        vec!["read_hr", "execute_remedy_plan"],
+        "the control tool is advertised beside the host's own",
+    );
+}
+
+#[tokio::test]
+async fn a_denied_call_never_runs_and_its_feedback_reaches_the_model() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let policy = r#"
+version = 2
+
+[[policy.tool]]
+name = "read_hr"
+delta = { audience = ["staff"] }
+
+[[policy.tool]]
+name = "send_email"
+requires = { audience = { contains = ["public"] } }
+delta = {}
+"#;
+    let provider = Provider::default();
+    provider
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .calls("send_email", serde_json::json!({"to": "all"}))
+        .says("I could not send it.");
+    let host = ToolHost::default();
+    host.answers("read_hr", "Alice Chen, Staff Engineer")
+        .answers("send_email", "sent");
+
+    let agent = agent(runtime(&dir, policy, ""), &provider, &host, &["read_hr", "send_email"]).await;
+    let outcome = agent
+        .run(root(), "Email Alice's record to everyone.", Default::default())
+        .await;
+
+    assert_eq!(outcome, Outcome::Answer("I could not send it.".to_string()));
+    assert_eq!(
+        host.calls(),
+        vec![serde_json::json!({"tool": "send_email", "arguments": {"to": "all"}})],
+        "the read was denied, so it never reached the host — and, never having run, it left the \
+         audience the mail needs intact",
+    );
+    assert!(
+        !provider.tool_result(1, "call_0").is_empty(),
+        "the denial's feedback is what the model gets for the call that did not run",
+    );
+}
+
+#[tokio::test]
+async fn a_denied_call_is_recorded_for_the_host_in_the_engines_own_words() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let policy = r#"
+version = 2
+
+[[policy.tool]]
+name = "read_hr"
+delta = { audience = ["staff"] }
+
+[[policy.tool]]
+name = "send_email"
+requires = { audience = { contains = ["public"] } }
+delta = {}
+"#;
+    let provider = Provider::default();
+    provider
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .calls("send_email", serde_json::json!({"to": "all"}))
+        .says("I could not send it.");
+    let host = ToolHost::default();
+    host.answers("read_hr", "Alice Chen, Staff Engineer")
+        .answers("send_email", "sent");
+
+    let agent = agent(runtime(&dir, policy, ""), &provider, &host, &["read_hr", "send_email"]).await;
+    let decisions = Decisions::recording();
+    agent
+        .run(root(), "Email Alice's record to everyone.", Default::default())
+        .await;
+
+    let recorded = decisions.recorded();
+    let feedback = provider.tool_result(1, "call_0").replace('\n', "\\n");
+    assert!(
+        recorded.iter().any(|line| line.contains(&feedback)),
+        "the block the model was told about is in the host's record too. Recorded: {recorded:?}",
+    );
+    assert!(
+        recorded.iter().any(|line| line.contains("send_email")),
+        "and so is the call that did run, so a host sees the whole conversation. Recorded: {recorded:?}",
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_key_proposal_is_refused_before_the_host_sees_it() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let provider = Provider::default();
+    provider
+        .calls_raw("read_hr", r#"{"who":"alice","who":"mallory"}"#)
+        .says("I could not read it.");
+    let host = ToolHost::default();
+    host.answers("read_hr", "Alice Chen, Staff Engineer");
+
+    let agent = agent(runtime(&dir, NEUTRAL, ""), &provider, &host, &["read_hr"]).await;
+    let outcome = agent.run(root(), "Who is Alice?", Default::default()).await;
+
+    assert_eq!(outcome, Outcome::Answer("I could not read it.".to_string()));
+    assert_eq!(
+        host.calls(),
+        Vec::<serde_json::Value>::new(),
+        "a call the engine would not read must never run. Ran: {:?}",
+        host.calls(),
+    );
+    assert!(
+        !provider.tool_result(1, "call_0").is_empty(),
+        "and the model is told why, so it can propose something readable",
+    );
+}
+
+#[tokio::test]
+async fn a_narrowing_read_is_blocked_before_it_runs_and_the_options_reach_the_model() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let policy = r#"
+version = 2
+
+[[policy.tool]]
+name = "read_hr"
+delta = { audience = ["hr"] }
+
+[policy.boundary]
+audience = ["public"]
+"#;
+    let host = ToolHost::default();
+    host.answers("read_hr", "Alice Chen, SSN 4821-9930");
+
+    let provider = Provider::default();
+    provider
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .says("I could not read it without narrowing this session.");
+
+    let agent = agent(runtime(&dir, policy, ""), &provider, &host, &["read_hr"]).await;
+    agent.run(root(), "Who is Alice?", Default::default()).await;
+
+    assert!(
+        host.calls().is_empty(),
+        "a blocked call must never reach the host. Ran: {:?}",
+        host.calls(),
+    );
+    let feedback = provider.tool_result(1, "call_0");
+    assert!(
+        harness::offer_id(&feedback).is_some(),
+        "the block must surface an offer id the model can pursue. Got: {feedback}",
+    );
+}
+
+#[tokio::test]
+async fn an_uncarried_output_crosses_as_the_engine_s_account_of_it() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let host = ToolHost::default();
+    host.answers("read_hr", &format!("SSN 4821-9930{}", "x".repeat(70_000)));
+
+    let provider = Provider::default();
+    provider
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .says("The record was too large to read.");
+
+    let agent = agent(runtime(&dir, NEUTRAL, ""), &provider, &host, &["read_hr"]).await;
+    agent.run(root(), "Who is Alice?", Default::default()).await;
+
+    let shown = provider.tool_result(1, "call_0");
+    assert!(
+        !shown.contains("4821-9930"),
+        "an uncarried body must not reach the model. Got {} bytes",
+        shown.len(),
+    );
+    assert_eq!(
+        shown,
+        "[appa] the tool ran, but its output is not shown: it is over the 65536-byte limit"
+    );
+    assert_eq!(host.calls().len(), 1, "the call ran; only its body did not cross");
+}
+
+const FORKING: &str = r#"
+version = 2
+
+[[policy.tool]]
+name = "delegate"
+parameters = { type = "object", properties = { task = { type = "string" } } }
+
+# A neutral delta establishes the output's label. Without one the value
+# is unknown, and the child's return blocks on missing facts rather than
+# on anything this test is about.
+[[policy.tool]]
+name = "read_hr"
+delta = {}
+
+[policy.deployment]
+context_control = true
+"#;
+
+fn delegating(agent: Agent) -> Agent {
+    agent.with_spawn_tool(
+        SpawnTool::new(ToolName::new("delegate"), ArgumentKey::new("task"))
+            .expect("the spawn tool leaves the control name to the runtime"),
+    )
+}
+
+#[tokio::test]
+async fn a_child_runs_its_own_trajectory_and_its_final_message_crosses_back() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let provider = Provider::default();
+    provider
+        .calls("delegate", serde_json::json!({"task": "Look up Alice."}))
+        .declares_the_return()
+        .calls("delegate", serde_json::json!({"task": "Look up Alice."}))
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .says("Alice Chen is a Staff Engineer.")
+        .says("The lookup says: Alice Chen is a Staff Engineer.");
+    let host = ToolHost::default();
+    host.answers("read_hr", "Alice Chen, Staff Engineer");
+
+    let agent = delegating(agent(runtime(&dir, FORKING, ""), &provider, &host, &["delegate", "read_hr"]).await);
+    let outcome = agent.run(root(), "Find out about Alice.", Default::default()).await;
+
+    assert_eq!(
+        outcome,
+        Outcome::Answer("The lookup says: Alice Chen is a Staff Engineer.".to_string()),
+    );
+    assert_eq!(
+        host.calls().len(),
+        1,
+        "the spawn call opens a child; it is not dispatched to the host",
+    );
+    let child_opening = provider.transcript(3);
+    assert_eq!(
+        child_opening.last().expect("the child gets its errand"),
+        &serde_json::json!({"role": "user", "content": "Look up Alice."}),
+    );
+    assert_eq!(
+        provider.tool_result(5, "call_2"),
+        "Alice Chen is a Staff Engineer.",
+        "the parent's spawn call is answered with what crossed the return channel",
+    );
+}
+
+#[tokio::test]
+async fn a_return_declared_ahead_releases_the_spawn_at_once() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let provider = Provider::default();
+    provider
+        .calls("execute_remedy_plan", serde_json::json!({"label": {}}))
+        .calls("delegate", serde_json::json!({"task": "Look up Alice."}))
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .says("Alice Chen is a Staff Engineer.")
+        .says("The lookup says: Alice Chen is a Staff Engineer.");
+    let host = ToolHost::default();
+    host.answers("read_hr", "Alice Chen, Staff Engineer");
+
+    let agent = delegating(agent(runtime(&dir, FORKING, ""), &provider, &host, &["delegate", "read_hr"]).await);
+    let outcome = agent.run(root(), "Find out about Alice.", Default::default()).await;
+
+    assert_eq!(
+        outcome,
+        Outcome::Answer("The lookup says: Alice Chen is a Staff Engineer.".to_string()),
+    );
+    let declared = provider.tool_result(1, "call_0");
+    assert!(
+        declared.starts_with("[appa] Declared."),
+        "the control call that quotes no offer declares: {declared}"
+    );
+    assert_eq!(
+        provider.tool_result(4, "call_1"),
+        "Alice Chen is a Staff Engineer.",
+        "the spawn meets no block and its child's return crosses",
+    );
+}
+
+#[tokio::test]
+async fn a_child_that_says_nothing_returns_no_value() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let provider = Provider::default();
+    provider
+        .calls("delegate", serde_json::json!({"task": "Do it yourself."}))
+        .declares_the_return()
+        .calls("delegate", serde_json::json!({"task": "Do it yourself."}))
+        .says_nothing()
+        .says("The child handled it.");
+    let host = ToolHost::default();
+
+    let agent =
+        delegating(agent(runtime(&dir, FORKING, ""), &provider, &host, &["delegate"]).await).with_limits(Limits {
+            max_inference_rounds: 8,
+            max_forks: 1,
+            ..Limits::default()
+        });
+    let outcome = agent.run(root(), "Delegate the work.", Default::default()).await;
+
+    assert_eq!(outcome, Outcome::Answer("The child handled it.".to_string()));
+    assert_eq!(
+        provider.tool_result(4, "call_2"),
+        "[appa] the child trajectory ended and returned no value; no child result was admitted. This does not attest that its task or side effects succeeded. Do not repeat the delegated task merely to obtain a response.",
+        "a void return admits no value but still acknowledges that the child ended",
+    );
+    let requests = provider.requests();
+    let parent_tools = requests[4]["tools"]
+        .as_array()
+        .expect("the parent request advertises tools")
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().expect("a tool name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parent_tools,
+        vec!["execute_remedy_plan"],
+        "the root also loses the spawn tool once the run-wide count is spent",
+    );
+}
+
+#[tokio::test]
+async fn an_empty_final_message_returns_nothing() {
+    let mut results = Vec::new();
+    for silent in [true, false] {
+        let dir = tempfile::tempdir().expect("a temp dir is creatable");
+        let provider = Provider::default();
+        let script = provider
+            .calls("delegate", serde_json::json!({"task": "Return nothing."}))
+            .declares_the_return()
+            .calls("delegate", serde_json::json!({"task": "Return nothing."}));
+        match silent {
+            true => script.says_nothing(),
+            false => script.says(""),
+        }
+        .says("Nothing crossed.");
+        let host = ToolHost::default();
+
+        let agent = delegating(agent(runtime(&dir, FORKING, ""), &provider, &host, &["delegate"]).await);
+        let outcome = agent.run(root(), "Delegate it.", Default::default()).await;
+
+        assert_eq!(outcome, Outcome::Answer("Nothing crossed.".to_string()));
+        results.push(provider.tool_result(4, "call_2"));
+    }
+    assert_eq!(
+        results[0], results[1],
+        "an empty final message closes the spawn exactly as a silent stop does"
+    );
+}
+
+#[tokio::test]
+async fn the_parent_records_the_spawn_result_it_reads() {
+    for child_says in [Some("The answer is forty-two."), Some(""), None] {
+        let dir = tempfile::tempdir().expect("a temp dir is creatable");
+        let provider = Provider::default();
+        let script = provider
+            .calls("delegate", serde_json::json!({"task": "Find the answer."}))
+            .declares_the_return()
+            .calls("delegate", serde_json::json!({"task": "Find the answer."}));
+        match child_says {
+            Some(text) => script.says(text),
+            None => script.says_nothing(),
+        }
+        .says("Done.");
+        let host = ToolHost::default();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let agent =
+            delegating(agent(runtime(&dir, FORKING, ""), &provider, &host, &["delegate"]).await).with_observer(tx);
+        agent.run(root(), "Delegate it.", Default::default()).await;
+        drop(agent);
+        let records = root_records(rx).await;
+
+        let spawn = appa_example_agent::CallId("call_2".to_string());
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| match record {
+                    appa_example_agent::Record::Returned { call, body } if *call == spawn => Some(body.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![provider.tool_result(4, "call_2")],
+            "{child_says:?}: the parent records exactly what its spawn call returned. Recorded: {records:?}",
+        );
+        assert!(
+            !records.iter().any(|record| matches!(
+                record,
+                appa_example_agent::Record::Substituted { call, .. } if *call == spawn
+            )),
+            "{child_says:?}: the spawn's close is not recorded as its output. Recorded: {records:?}",
+        );
+    }
+}
+
+async fn root_records(
+    mut rx: tokio::sync::mpsc::Receiver<appa_example_agent::Recorded>,
+) -> Vec<appa_example_agent::Record> {
+    let mut records = Vec::new();
+    while let Some(recorded) = rx.recv().await {
+        if recorded.trajectory == root() {
+            records.push(recorded.record);
+        }
+    }
+    records
+}
+
+#[tokio::test]
+async fn a_child_is_not_offered_another_spawn_or_told_to_delegate_again() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let policy = r#"
+version = 2
+
+[[policy.tool]]
+name = "delegate"
+parameters = { type = "object", properties = { task = { type = "string" } } }
+
+[[policy.tool]]
+name = "read_hr"
+delta = { audience = ["hr"] }
+
+[policy.deployment]
+context_control = true
+"#;
+    let provider = Provider::default();
+    provider
+        .calls("delegate", serde_json::json!({"task": "Read the record here."}))
+        .declares_the_return()
+        .calls("delegate", serde_json::json!({"task": "Read the record here."}))
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .says_nothing()
+        .says("The child ended, so I will not repeat its task.");
+    let host = ToolHost::default();
+
+    let agent = delegating(agent(runtime(&dir, policy, ""), &provider, &host, &["delegate", "read_hr"]).await)
+        .with_limits(Limits {
+            max_fork_depth: 1,
+            ..Limits::default()
+        });
+    let outcome = agent.run(root(), "Delegate the read.", Default::default()).await;
+
+    assert_eq!(
+        outcome,
+        Outcome::Answer("The child ended, so I will not repeat its task.".to_string())
+    );
+    let advertised = |request: &serde_json::Value| {
+        request["tools"]
+            .as_array()
+            .expect("a request advertises tools")
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().expect("a tool name").to_string())
+            .collect::<Vec<_>>()
+    };
+    let requests = provider.requests();
+    assert!(
+        advertised(&requests[0]).contains(&"delegate".to_string()),
+        "the root may spawn"
+    );
+    assert_eq!(
+        advertised(&requests[3]),
+        vec!["read_hr".to_string(), "execute_remedy_plan".to_string()],
+        "the child cannot spend a round on a spawn that the depth limit will refuse",
+    );
+    let feedback = provider.tool_result(4, "call_3");
+    assert!(
+        feedback.contains("This trajectory is at its child-depth limit; do not delegate again."),
+        "the child gets truthful host capability context: {feedback}",
+    );
+    assert!(
+        provider
+            .tool_result(5, "call_2")
+            .starts_with("[appa] the child trajectory ended and returned no value"),
+        "the parent gets non-sensitive completion evidence",
+    );
+}
+
+#[tokio::test]
+async fn the_fork_depth_ceiling_refuses_a_spawn_below_it() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let provider = Provider::default();
+    let delegate = || serde_json::json!({"task": "Go deeper."});
+    provider
+        .calls("delegate", delegate())
+        .declares_the_return()
+        .calls("delegate", delegate())
+        .calls("delegate", delegate())
+        .declares_the_return()
+        .calls("delegate", delegate())
+        .calls("delegate", delegate())
+        .says("I could not delegate further.")
+        .says("child done")
+        .says("Everything is done.");
+    let host = ToolHost::default();
+
+    let agent =
+        delegating(agent(runtime(&dir, FORKING, ""), &provider, &host, &["delegate"]).await).with_limits(Limits {
+            max_inference_rounds: 12,
+            max_forks: 8,
+            max_fork_depth: 2,
+            ..Limits::default()
+        });
+    let outcome = agent
+        .run(root(), "Delegate as deep as you can.", Default::default())
+        .await;
+
+    assert_eq!(outcome, Outcome::Answer("Everything is done.".to_string()));
+    let refusal = provider.tool_result(7, "call_6");
+    assert_eq!(
+        refusal, "no child was opened: this trajectory is at its child-depth limit",
+        "the third spawn sits at the ceiling and opens no child",
+    );
+    let requests = provider.requests();
+    let names = |nth: usize| {
+        requests[nth]["tools"]
+            .as_array()
+            .expect("a request advertises tools")
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().expect("a tool name"))
+            .collect::<Vec<_>>()
+    };
+    assert!(names(0).contains(&"delegate"), "the root may spawn");
+    assert!(
+        names(3).contains(&"delegate"),
+        "depth one may spawn when the limit is two"
+    );
+    assert_eq!(
+        names(6),
+        vec!["execute_remedy_plan"],
+        "the depth-two frame hides only the unavailable spawn tool",
+    );
+}
+
+#[tokio::test]
+async fn a_sanitized_child_return_reaches_the_parent_redacted() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let policy = r#"
+version = 2
+
+[[policy.tool]]
+name = "delegate"
+parameters = { type = "object", properties = { task = { type = "string" } } }
+
+[[policy.tool]]
+name = "read_hr"
+delta = { audience = ["internal"] }
+
+[[policy.sanitizer]]
+name = "scrub"
+on = ["tool_output"]
+[policy.sanitizer.permits]
+audience = { from = ["internal"], to = ["public"] }
+
+[policy.deployment]
+context_control = true
+"#;
+    let host = ToolHost::default();
+    host.answers("read_hr", "Alice Chen, SSN 4821-9930")
+        .sanitizes_to("Alice Chen, a staff member.");
+    let sanitizer_url = format!("{}/sanitizer", host.clone().serve().await);
+    let externals = format!("[externals.sanitizers.scrub]\nurl = \"{sanitizer_url}\"\n");
+
+    let provider = Provider::default();
+    provider
+        .calls("delegate", serde_json::json!({"task": "Look up Alice."}))
+        .declares_the_sanitized_return()
+        .calls("delegate", serde_json::json!({"task": "Look up Alice."}))
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .pursues_the_offer()
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .says("Alice Chen, SSN 4821-9930")
+        .says("Understood.");
+
+    let agent = delegating(
+        agent(
+            runtime(&dir, policy, &externals),
+            &provider,
+            &host,
+            &["delegate", "read_hr"],
+        )
+        .await,
+    );
+    agent.run(root(), "Find out about Alice.", Default::default()).await;
+
+    let crossed = provider.tool_result(7, "call_2");
+    assert_eq!(
+        crossed, "Alice Chen, a staff member.",
+        "the admitted return crosses, not the child's own words",
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_child_return_warns_that_child_effects_are_not_rolled_back() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let policy = r#"
+version = 2
+
+[[policy.tool]]
+name = "delegate"
+parameters = { type = "object", properties = { task = { type = "string" } } }
+
+[[policy.tool]]
+name = "read_hr"
+delta = { audience = ["internal"] }
+
+[[policy.sanitizer]]
+name = "scrub"
+on = ["tool_output"]
+[policy.sanitizer.permits]
+audience = { from = ["internal"], to = ["public"] }
+
+[policy.deployment]
+context_control = true
+"#;
+    let host = ToolHost::default();
+    host.answers("read_hr", "Alice Chen, SSN 4821-9930").sanitizes_nothing();
+    let sanitizer_url = format!("{}/sanitizer", host.clone().serve().await);
+    let externals = format!("[externals.sanitizers.scrub]\nurl = \"{sanitizer_url}\"\n");
+
+    let provider = Provider::default();
+    provider
+        .calls("delegate", serde_json::json!({"task": "Look up Alice privately."}))
+        .declares_the_sanitized_return()
+        .calls("delegate", serde_json::json!({"task": "Look up Alice privately."}))
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .pursues_the_offer()
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .says("Alice Chen, SSN 4821-9930")
+        .says("The child ended; I will not repeat its work.");
+
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let agent = delegating(
+        agent(
+            runtime(&dir, policy, &externals),
+            &provider,
+            &host,
+            &["delegate", "read_hr"],
+        )
+        .await,
+    )
+    .with_limits(Limits {
+        max_inference_rounds: 10,
+        ..Limits::default()
+    })
+    .with_observer(tx);
+    let outcome = agent.run(root(), "Delegate the lookup.", Default::default()).await;
+    drop(agent);
+    let records = root_records(rx).await;
+
+    assert_eq!(
+        outcome,
+        Outcome::Answer("The child ended; I will not repeat its work.".to_string())
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| matches!(record, appa_example_agent::Record::ReturnBlocked { .. })),
+        "the parent records the blocked return. Recorded: {records:?}",
+    );
+    assert!(
+        !records.iter().any(|record| matches!(
+            record,
+            appa_example_agent::Record::Returned { .. } | appa_example_agent::Record::Substituted { .. }
+        )),
+        "and no admitted return or spawn-close output. Recorded: {records:?}",
+    );
+    let feedback = provider.tool_result(7, "call_2");
+    assert!(feedback.contains("its return value was not admitted"));
+    assert!(feedback.contains("This does not roll back child side effects"));
+    assert!(feedback.contains("Do not repeat the delegated task merely because its return was blocked"));
+}
+
+#[tokio::test]
+async fn a_child_return_over_the_output_cap_still_crosses_whole() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let long = format!("Alice Chen. {}", "detail. ".repeat(10_000));
+    assert!(long.len() > 65_536, "the return must exceed the deployment's body cap");
+
+    let provider = Provider::default();
+    provider
+        .calls("delegate", serde_json::json!({"task": "Report in full."}))
+        .declares_the_return()
+        .calls("delegate", serde_json::json!({"task": "Report in full."}))
+        .says(&long)
+        .says("Got the full report.");
+    let host = ToolHost::default();
+
+    let agent = delegating(agent(runtime(&dir, FORKING, ""), &provider, &host, &["delegate"]).await);
+    let outcome = agent.run(root(), "Get the full report.", Default::default()).await;
+
+    assert_eq!(outcome, Outcome::Answer("Got the full report.".to_string()));
+    assert_eq!(
+        provider.tool_result(4, "call_2"),
+        long,
+        "the whole return crosses: the byte cap governs tool outputs, not the return channel",
+    );
+}
+
+const APPROVED_WIRE: &str = r#"
+version = 2
+
+[[policy.tool]]
+name = "wire"
+parameters = { type = "object", properties = { amount = { type = "integer" } } }
+requires = { attention = ["irreversible"] }
+delta = {}
+
+[[policy.authority]]
+name = "approver"
+[policy.authority.permits]
+attention = ["irreversible"]
+"#;
+
+#[tokio::test]
+async fn pursuing_a_surfaced_offer_authorizes_the_exact_call() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let host = ToolHost::default();
+    host.answers("wire", "wired").rules("approve");
+    let authority_url = format!("{}/authority", host.clone().serve().await);
+    let externals = format!("[externals.authorities.approver]\nurl = \"{authority_url}\"\n");
+
+    let provider = Provider::default();
+    provider
+        .calls("wire", serde_json::json!({"amount": 100}))
+        .pursues_the_offer()
+        .calls("wire", serde_json::json!({"amount": 100}))
+        .says("The transfer went through.");
+
+    let agent = agent(runtime(&dir, APPROVED_WIRE, &externals), &provider, &host, &["wire"]).await;
+    let outcome = agent.run(root(), "Wire 100.", Default::default()).await;
+
+    assert_eq!(outcome, Outcome::Answer("The transfer went through.".to_string()));
+    assert_eq!(
+        host.calls().iter().filter(|call| call["tool"] == "wire").count(),
+        1,
+        "the call runs once, and only after the offer authorized it",
+    );
+    assert_eq!(
+        provider.tool_result(3, "call_2"),
+        "wired",
+        "the authorized re-proposal runs and its output crosses",
+    );
+}
+
+const NARROWING: &str = r#"
+version = 2
+
+[[policy.tool]]
+name = "read_hr"
+delta = { audience = ["staff"] }
+
+[[policy.tool]]
+name = "send_email"
+requires = { audience = { contains = ["public"] } }
+delta = {}
+"#;
+
+const SUBSTITUTING: &str = r#"
+version = 2
+
+[[policy.tool]]
+name = "read_hr"
+delta = { audience = ["staff"] }
+
+[[policy.tool]]
+name = "send_email"
+parameters = { type = "object", properties = { body = { type = "string" } }, required = ["body"] }
+requires = { audience = { contains = ["public"] } }
+delta = {}
+
+[[policy.sanitizer]]
+name = "scrub"
+on = ["tool_input"]
+[policy.sanitizer.permits]
+audience = { from = ["staff"], to = ["public"] }
+"#;
+
+#[tokio::test]
+async fn pursuing_an_input_sanitizer_offer_runs_the_replaced_call() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let host = ToolHost::default();
+    host.answers("read_hr", "Alice Chen, Staff Engineer")
+        .answers("send_email", "queued")
+        .sanitizes_to(r#"{"body":"the figures, redacted"}"#);
+    let sanitizer_url = format!("{}/sanitizer", host.clone().serve().await);
+    let externals = format!("[externals.sanitizers.scrub]\nurl = \"{sanitizer_url}\"\n");
+
+    let provider = Provider::default();
+    provider
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .pursues_the_offer()
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .calls(
+            "send_email",
+            serde_json::json!({"body": "the figures, with Alice's salary"}),
+        )
+        .pursues_the_offer()
+        .calls("send_email", serde_json::json!({"body": "the figures, redacted"}))
+        .says("Sent.");
+
+    let agent = agent(
+        runtime(&dir, SUBSTITUTING, &externals),
+        &provider,
+        &host,
+        &["read_hr", "send_email"],
+    )
+    .await;
+    let outcome = agent.run(root(), "Mail the figures.", Default::default()).await;
+
+    assert_eq!(outcome, Outcome::Answer("Sent.".to_string()));
+    let sends: Vec<_> = host
+        .calls()
+        .into_iter()
+        .filter(|call| call["tool"] == "send_email")
+        .collect();
+    assert_eq!(
+        sends,
+        vec![serde_json::json!({"tool": "send_email", "arguments": {"body": "the figures, redacted"}})],
+        "the host runs the sanitizer's replacement, once, and never the model's arguments",
+    );
+    assert_eq!(
+        provider.tool_result(6, "call_5"),
+        "queued",
+        "the model proposes the arguments the remedy gave, and that call's output comes back",
+    );
+}
+
+const SUBSTITUTING_SPAWN: &str = r#"
+version = 2
+
+[[policy.tool]]
+name = "read_hr"
+delta = { audience = ["staff"] }
+
+[[policy.tool]]
+name = "send"
+parameters = { type = "object", properties = { body = { type = "string" } }, required = ["body"] }
+requires = { audience = { contains = ["public"] } }
+delta = {}
+
+[[policy.tool]]
+name = "delegate"
+parameters = { type = "object", properties = { task = { type = "string" } }, required = ["task"] }
+requires = { audience = { contains = ["public"] } }
+delta = {}
+
+[[policy.sanitizer]]
+name = "scrub"
+on = ["tool_input"]
+[policy.sanitizer.permits]
+audience = { from = ["staff"], to = ["public"] }
+
+[policy.deployment]
+context_control = true
+"#;
+
+#[tokio::test]
+async fn a_marked_spawn_is_offered_no_input_hop_while_an_ordinary_call_is() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let host = ToolHost::default();
+    host.answers("read_hr", "Alice Chen, Staff Engineer")
+        .answers("send", "sent")
+        .answers("delegate", "a child that must not run")
+        .sanitizes_to(r#"{"body":"the figures, redacted"}"#);
+    let sanitizer_url = format!("{}/sanitizer", host.clone().serve().await);
+    let externals = format!("[externals.sanitizers.scrub]\nurl = \"{sanitizer_url}\"\n");
+
+    let provider = Provider::default();
+    provider
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .pursues_the_offer()
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .calls("send", serde_json::json!({"body": "the figures"}))
+        .pursues_the_offer()
+        .calls("send", serde_json::json!({"body": "the figures, redacted"}))
+        .calls("delegate", serde_json::json!({"task": "look up Alice's salary"}))
+        .calls("read_hr", serde_json::json!({"who": "bob"}))
+        .says("Done.");
+
+    let agent = delegating(
+        agent(
+            runtime(&dir, SUBSTITUTING_SPAWN, &externals),
+            &provider,
+            &host,
+            &["read_hr", "send", "delegate"],
+        )
+        .await,
+    )
+    .with_limits(Limits {
+        max_inference_rounds: 10,
+        ..Limits::default()
+    });
+    let outcome = agent.run(root(), "Delegate the lookup.", Default::default()).await;
+
+    assert_eq!(outcome, Outcome::Answer("Done.".to_string()));
+    assert!(
+        harness::offer_id(&provider.tool_result(4, "call_3")).is_some(),
+        "the ordinary call's block offers its hop",
+    );
+    assert!(
+        harness::offer_id(&provider.tool_result(7, "call_6")).is_none(),
+        "the marked spawn's block offers nothing: {}",
+        provider.tool_result(7, "call_6"),
+    );
+    assert_eq!(
+        host.sanitizer_consults(),
+        1,
+        "the sanitizer ran for the ordinary call only"
+    );
+    assert_eq!(
+        host.calls(),
+        vec![
+            serde_json::json!({"tool": "read_hr", "arguments": {"who": "alice"}}),
+            serde_json::json!({"tool": "send", "arguments": {"body": "the figures, redacted"}}),
+            serde_json::json!({"tool": "read_hr", "arguments": {"who": "bob"}}),
+        ],
+        "the replacement runs, the spawn never reaches the host, and the next call runs",
+    );
+}
+
+#[tokio::test]
+async fn a_second_turn_continues_where_the_first_one_left_the_trajectory() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let provider = Provider::default();
+    provider
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .pursues_the_offer()
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .says("Alice is a Staff Engineer.")
+        .calls("read_hr", serde_json::json!({"who": "bob"}))
+        .says("Bob is a Principal Engineer.");
+    let host = ToolHost::default();
+    host.answers("read_hr", "Alice Chen, Staff Engineer");
+
+    let agent = agent(
+        runtime(&dir, NARROWING, ""),
+        &provider,
+        &host,
+        &["read_hr", "send_email"],
+    )
+    .await;
+    let mut transcript = appa_example_agent::Transcript::default();
+    let first = agent
+        .turn(root(), &mut transcript, "Who is Alice?", Default::default())
+        .await;
+    let second = agent
+        .turn(root(), &mut transcript, "And Bob?", Default::default())
+        .await;
+
+    assert_eq!(first, Outcome::Answer("Alice is a Staff Engineer.".to_string()));
+    assert_eq!(second, Outcome::Answer("Bob is a Principal Engineer.".to_string()));
+    assert_eq!(
+        provider.tool_result(5, "call_4"),
+        "Alice Chen, Staff Engineer",
+        "the second turn's read runs on the first turn's accepted label, unblocked",
+    );
+    let opening = provider.transcript(4);
+    assert!(
+        opening.iter().any(|message| message["content"] == "Who is Alice?"),
+        "and it sees the first turn's conversation. Showed: {opening:?}",
+    );
+}
+
+#[tokio::test]
+async fn a_budget_finalized_turn_leaves_its_transcript_behind() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let provider = Provider::default();
+    provider
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .says("I reached the limit after the lookup.");
+    let host = ToolHost::default();
+    host.answers("read_hr", "Alice Chen, Staff Engineer");
+
+    let agent = agent(runtime(&dir, NEUTRAL, ""), &provider, &host, &["read_hr"])
+        .await
+        .with_limits(Limits {
+            max_inference_rounds: 2,
+            ..Limits::default()
+        });
+    let mut transcript = appa_example_agent::Transcript::default();
+    let outcome = agent
+        .turn(root(), &mut transcript, "Who is Alice?", Default::default())
+        .await;
+
+    assert_eq!(
+        outcome,
+        Outcome::BudgetFinalized {
+            answer: Some("I reached the limit after the lookup.".to_string())
+        },
+        "the reserved round finalizes without tools",
+    );
+    let said: Vec<&str> = transcript
+        .messages()
+        .iter()
+        .filter_map(|message| message.content.as_deref())
+        .collect();
+    assert!(
+        said.contains(&"Who is Alice?")
+            && said.contains(&"Alice Chen, Staff Engineer")
+            && said.contains(&"I reached the limit after the lookup."),
+        "the task, admitted result, and final status survive the turn. Left: {said:?}",
+    );
+}
+
+#[tokio::test]
+async fn budget_finalization_closes_a_child_void_and_finishes_from_the_parent() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let provider = Provider::default();
+    provider
+        .calls("delegate", serde_json::json!({"task": "Look up Alice privately."}))
+        .declares_the_return()
+        .calls("delegate", serde_json::json!({"task": "Look up Alice privately."}))
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .says("The delegated lookup ended without an admitted result.");
+    let host = ToolHost::default();
+    host.answers("read_hr", "Alice Chen, SSN 4821-9930");
+
+    let agent = delegating(agent(runtime(&dir, FORKING, ""), &provider, &host, &["delegate", "read_hr"]).await)
+        .with_limits(Limits {
+            max_inference_rounds: 5,
+            max_fork_depth: 1,
+            ..Limits::default()
+        });
+    let outcome = agent.run(root(), "Delegate the lookup.", Default::default()).await;
+
+    assert_eq!(
+        outcome,
+        Outcome::BudgetFinalized {
+            answer: Some("The delegated lookup ended without an admitted result.".to_string())
+        }
+    );
+    let final_request = &provider.requests()[4];
+    assert!(
+        final_request.get("tools").is_none(),
+        "the reserved completion has no tools"
+    );
+    let final_messages = final_request["messages"].as_array().expect("a final transcript");
+    assert!(
+        final_messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.starts_with("[appa] the child trajectory ended"))
+        }),
+        "the root sees the void close",
+    );
+    assert!(
+        final_messages
+            .iter()
+            .all(|message| message["content"].as_str() != Some("Alice Chen, SSN 4821-9930")),
+        "the child's admitted body never enters the root finalization context",
+    );
+}
+
+#[tokio::test]
+async fn an_observer_receives_every_record_typed() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let provider = Provider::default();
+    provider
+        .calls("read_hr", serde_json::json!({"who": "alice"}))
+        .says("I could not read it.");
+    let host = ToolHost::default();
+    host.answers("read_hr", "Alice Chen, Staff Engineer");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let agent = agent(
+        runtime(&dir, NARROWING, ""),
+        &provider,
+        &host,
+        &["read_hr", "send_email"],
+    )
+    .await
+    .with_observer(tx);
+    agent.run(root(), "Who is Alice?", Default::default()).await;
+    drop(agent);
+
+    let mut records = Vec::new();
+    while let Some(recorded) = rx.recv().await {
+        assert_eq!(recorded.trajectory, root(), "a root run records under its root");
+        records.push(recorded.record);
+    }
+
+    let proposed = records
+        .iter()
+        .find_map(|record| match record {
+            appa_example_agent::Record::Proposes { call, tool, .. } => Some((call.clone(), tool.clone())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the proposal is recorded. Recorded: {records:?}"));
+    assert_eq!(
+        proposed,
+        (appa_example_agent::CallId("call_0".to_string()), "read_hr".to_string())
+    );
+
+    let blocked = records
+        .iter()
+        .find_map(|record| match record {
+            appa_example_agent::Record::Blocked { call, feedback, .. } => Some((call.clone(), feedback.clone())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the block is recorded. Recorded: {records:?}"));
+    assert_eq!(blocked.0, proposed.0, "under the call id the host is rendering against");
+    assert_eq!(
+        blocked.1,
+        provider.tool_result(1, "call_0"),
+        "in the same words the model was given",
+    );
+    assert!(
+        records.contains(&appa_example_agent::Record::Answers {
+            text: "I could not read it.".to_string()
+        }),
+        "and the run's answer closes the record. Recorded: {records:?}",
+    );
+}
+
+#[tokio::test]
+async fn a_call_its_annotator_cannot_classify_is_refused_and_the_run_goes_on() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let policy = r#"
+version = 2
+
+[[policy.annotator]]
+name = "classify"
+inputs = { subject = "$tool_call.arguments.who" }
+
+[[policy.tool]]
+name = "read_hr"
+parameters = { type = "object", properties = { who = { type = "string" } }, required = ["who"], additionalProperties = false }
+annotator = "classify"
+
+[[policy.tool]]
+name = "send_email"
+"#;
+    let host = ToolHost::default();
+    host.answers("read_hr", "Alice Chen, Staff Engineer")
+        .answers("send_email", "sent");
+    let annotator_url = format!("{}/annotator", host.clone().serve().await);
+    let externals = format!("[externals.annotators.classify]\nurl = \"{annotator_url}\"\n");
+    let decisions = Decisions::recording();
+
+    let provider = Provider::default();
+    provider
+        .calls("read_hr", serde_json::json!({"who": "nobody"}))
+        .calls("send_email", serde_json::json!({"to": "alice"}))
+        .says("I could not read the record, so I only sent the note.");
+
+    let agent = agent(
+        runtime(&dir, policy, &externals),
+        &provider,
+        &host,
+        &["read_hr", "send_email"],
+    )
+    .await;
+    let outcome = agent
+        .run(root(), "Look up nobody and tell Alice.", Default::default())
+        .await;
+
+    assert_eq!(
+        outcome,
+        Outcome::Answer("I could not read the record, so I only sent the note.".to_string()),
+        "an unanswered annotation costs the one call, not the run",
+    );
+    assert_eq!(
+        host.calls(),
+        vec![serde_json::json!({"tool": "send_email", "arguments": {"to": "alice"}})],
+        "the unclassified call never reached the host; the next one ran",
+    );
+    let reply = provider.tool_result(1, "call_0");
+    assert!(
+        reply.starts_with(
+            "[appa] this call was refused and did not run: annotator=classify error=non_success status=404"
+        ),
+        "the model reads the runtime's own refusal: {reply}",
+    );
+    assert!(
+        decisions
+            .recorded()
+            .iter()
+            .any(|line| line.starts_with("appa: [agent-test] refused read_hr: annotator=classify")),
+        "the refusal is a decision line of its own: {:?}",
+        decisions.recorded(),
+    );
+}

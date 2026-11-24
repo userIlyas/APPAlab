@@ -1,0 +1,161 @@
+name: Update OpenAPPA in Archestra
+
+on:
+  # release.yml calls this workflow after publishing. For a release published
+  # any other way, dispatch this workflow on main with its tag.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published stable OpenAPPA tag to retry (for example v0.30.0)
+        type: string
+        required: true
+  workflow_call:
+    inputs:
+      release_tag:
+        type: string
+        required: true
+      source_commit:
+        type: string
+        required: true
+    secrets:
+      # Passed by name only: the publish job's archestra-update environment
+      # supplies the value (see that job).
+      APPA_ARCHESTRA_UPDATER_PRIVATE_KEY:
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: appa-archestra-update
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate release and prepare Cargo update
+    if: >-
+      github.repository == 'archestra-ai/OpenAPPA' &&
+      (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.prepare.outputs.changed }}
+    steps:
+      - name: Checkout updater
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: openappa
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout Archestra main
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: archestra-ai/archestra
+          ref: main
+          path: archestra
+          persist-credentials: false
+
+      - name: Install Archestra's pinned Rust toolchain
+        working-directory: archestra/platform
+        run: rustup show active-toolchain
+
+      - name: Verify release and regenerate Cargo pins and lockfile
+        id: prepare
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 openappa/.github/scripts/appa-archestra-update.py prepare
+          --source openappa --target archestra --tag "$RELEASE_TAG"
+          --expected-sha "$SOURCE_COMMIT" --bundle prepared/update.json
+
+      - name: Compile the embedded OpenAPPA bridge
+        id: compile
+        if: steps.prepare.outputs.changed == 'true'
+        # Compatibility failures belong on the draft PR for human repair.
+        # The publishing job reports failure after opening that draft.
+        continue-on-error: true
+        working-directory: archestra/platform
+        run: cargo check --locked --manifest-path archestra-rs/Cargo.toml -p openappa_rs
+
+      - name: Record compilation result for human review
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          COMPILE_OUTCOME: ${{ steps.compile.outcome }}
+        run: >-
+          python3 openappa/.github/scripts/appa-archestra-update.py record-check
+          --bundle prepared/update.json --outcome "$COMPILE_OUTCOME"
+
+      - name: Upload validated update
+        if: steps.prepare.outputs.changed == 'true'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: appa-archestra-update
+          path: prepared/update.json
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    name: Propose draft Archestra update
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    # Holds APPA_ARCHESTRA_UPDATER_PRIVATE_KEY; deploys from main only. A
+    # called workflow sees only the secrets its caller passes, so release.yml
+    # passes the key by name; GitHub then resolves it from this job's
+    # environment. A dispatch reads the environment directly.
+    environment:
+      name: archestra-update
+      deployment: false # A secrets and branch gate; nothing is deployed.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read # Download the validated bundle from this workflow run.
+    steps:
+      # This fresh runner never executes Archestra or release build scripts.
+      - name: Checkout updater
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: openappa
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download validated update from this run
+        uses: actions/download-artifact@v8.0.2
+        with:
+          name: appa-archestra-update
+          path: prepared
+
+      - name: Create Archestra-only installation token
+        id: app-token
+        uses: archestra-ai/.github/actions/github-app-token@v1.25.2
+        with:
+          app-id: ${{ vars.APPA_ARCHESTRA_UPDATER_APP_ID }}
+          private-key: ${{ secrets.APPA_ARCHESTRA_UPDATER_PRIVATE_KEY }}
+          owner: archestra-ai
+          repositories: archestra
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open draft PR and close superseded automation PRs
+        id: publish
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_READ_TOKEN: ${{ github.token }}
+          # The updater App's bot account. The shared token action outputs
+          # only the token, so the slug is spelled out here.
+          BOT_LOGIN: openappa-archestra-updater[bot]
+        run: >-
+          python3 openappa/.github/scripts/appa-archestra-update.py publish
+          --source openappa --bundle prepared/update.json --bot-login "$BOT_LOGIN"
+
+      - name: Report incompatible bridge after proposing the update
+        if: steps.publish.outputs.compile_passed == 'false'
+        run: |
+          echo "::error::The release update draft requires an Archestra bridge compatibility fix. See compilation logs and native PR checks."
+          exit 1

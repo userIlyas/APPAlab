@@ -1,0 +1,17 @@
+# Sharp is the only dependency permitted to build if scripts are explicitly
+# enabled for a reviewed rebuild. Normal installs remain script-free below.
+allowBuilds:
+  sharp: true
+
+# Prevent dependency lifecycle scripts from running during installation.
+# Run `pnpm rebuild <package-name>` after review when a package needs one.
+ignoreScripts: true
+
+# Quarantine newly published package versions for seven days.
+minimumReleaseAge: 10080
+
+# @streamdown/math, mermaid, micromark-extension-math, and rehype-katex still
+# require the vulnerable 0.16 line. Keep the patched version until they upgrade;
+# 0.18.11 is deprecated upstream, so use the reviewed 0.18.10 release.
+overrides:
+  katex@<0.18.2: 0.18.10

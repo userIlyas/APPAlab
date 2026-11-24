@@ -1,0 +1,246 @@
+//! Reporting for an authenticated host that embeds the runtime in its own process.
+use std::sync::Arc;
+
+use super::{
+    Mode, Selection, YellArgs, client,
+    report::{Author, Harness, HarnessName, ReportRequest, YellMessage},
+};
+use crate::api::{Actor, Runtime};
+
+/// Host-supplied context and tool arguments. The receiver and actor must come
+/// from the embedding host, never from model-controlled tool arguments.
+pub struct Request {
+    pub actor: Actor,
+    /// The name the receiver files this host's reports under.
+    pub harness: HarnessName,
+    pub endpoint: String,
+    /// Public deployment hostname. Do not supply a machine name or a full URL.
+    pub hostname: Option<String>,
+    pub message: String,
+    pub with_trajectory: bool,
+}
+
+/// Send a report using the same field classification, size limits, signature,
+/// and transport as the standalone runtime. Requires a released yell call from
+/// this actor's hook and the deployment's explicit reporting opt-in.
+#[tracing::instrument(target = "appa_telemetry", name = "appa.yell", skip_all)]
+pub async fn send(runtime: &Arc<Runtime>, request: Request) -> Result<String, String> {
+    if !runtime.agent_yell() {
+        return Err("Agent reporting is disabled".into());
+    }
+    if request.hostname.as_ref().is_some_and(|host| {
+        host.is_empty()
+            || host.len() > 253
+            || !host
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-'))
+    }) {
+        return Err("Invalid reporting hostname".into());
+    }
+    let args = YellArgs {
+        message: request.message,
+        with_trajectory: request.with_trajectory,
+    };
+    let message = YellMessage::new(&args.message).map_err(|error| error.to_string())?;
+    let receiver = client::Receiver::parse(&request.endpoint).ok_or_else(|| {
+        "The reporting receiver must be HTTPS, or HTTP to a loopback address, without credentials".to_string()
+    })?;
+    let (acting, _) = runtime
+        .take_vouched_by(&args.ticket(), &request.actor)
+        .map_err(|_| "No unambiguous released yell call exists for this request".to_string())?;
+    let report = ReportRequest {
+        message,
+        author: Author::Agent,
+        mode: Mode::Baseline,
+        selection: if args.with_trajectory {
+            Selection::Vouched(acting.root.clone())
+        } else {
+            Selection::RulesOnly
+        },
+        harness: Harness::Embedded(request.harness),
+        hostname: request.hostname,
+    };
+    let finished = runtime
+        .report_off_thread(report)
+        .await
+        .map_err(|_| "The report is too large to send".to_string())?;
+    crate::telemetry::yell(&finished, &acting.root);
+    let receipt = client::send(&finished, &receiver)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(receipt.receipt_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::{Config, HostDefaults},
+        hooks,
+    };
+    use appa_eventlog::{Backend, LogStore};
+    use appa_runtime_api::{HookDecision, HookEvent, ProposedCall, TrajectoryId};
+    use std::time::Duration;
+
+    fn runtime(enabled: bool) -> Arc<Runtime> {
+        let mut config = Config::hosted(
+            "[policy]\nversion=2\n[[policy.tool]]\nname='yell'\ndelta={}\n",
+            HostDefaults::new(Duration::from_secs(1), 4096),
+            |_| None,
+        )
+        .unwrap();
+        config.reporting.agent_yell = enabled;
+        Arc::new(Runtime::open_with_store(config, Arc::new(LogStore::open(Backend::Memory).unwrap()), None).unwrap())
+    }
+
+    fn request() -> Request {
+        Request {
+            actor: Actor {
+                root: TrajectoryId("private-session-id".into()),
+                child: None,
+            },
+            harness: HarnessName::parse("test-platform").expect("a harness name"),
+            endpoint: "http://127.0.0.1:1".into(),
+            hostname: Some("platform.example.com".into()),
+            message: "The feedback is confusing".into(),
+            with_trajectory: true,
+        }
+    }
+
+    async fn release(runtime: &Runtime, request: &Request) {
+        runtime.create_session(request.actor.root.clone(), None).unwrap();
+        let call = ProposedCall {
+            tool: "yell".into(),
+            arguments: serde_json::value::to_raw_value(
+                &serde_json::json!({ "message": request.message, "with_trajectory": request.with_trajectory }),
+            )
+            .unwrap(),
+            cwd: None,
+        };
+        assert!(matches!(
+            hooks::handle(
+                runtime,
+                HookEvent::ToolCall {
+                    actor: request.actor.clone(),
+                    call,
+                    call_id: None,
+                    spawn: None,
+                    prompt: None,
+                    ruling: None,
+                    declares: None,
+                }
+            )
+            .await,
+            HookDecision::AllowCall { .. }
+        ));
+    }
+
+    #[test]
+    fn a_harness_name_is_spelled_as_a_package_name_within_a_bound() {
+        assert!(HarnessName::parse("test-platform").is_ok());
+        for invalid in [
+            "",
+            "Test Platform",
+            "-lead",
+            &"a".repeat(HarnessName::MAX_LEN + 1),
+            "claude-code",
+            "kagent",
+            "embedded",
+        ] {
+            assert!(HarnessName::parse(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_disabled_unvouched_and_cross_session_reports() {
+        assert!(send(&runtime(false), request()).await.is_err());
+        let runtime = runtime(true);
+        let mut invalid = request();
+        invalid.hostname = Some("https://user:secret@example.com/path".into());
+        assert!(send(&runtime, invalid).await.is_err());
+        assert!(send(&runtime, request()).await.is_err());
+        let mut request = request();
+        release(&runtime, &request).await;
+        request.actor.root = TrajectoryId("other-session".into());
+        assert!(send(&runtime, request).await.is_err());
+    }
+
+    /// A request refused for its endpoint leaves the release for a correct one.
+    #[tokio::test]
+    async fn an_invalid_endpoint_leaves_the_release_unspent() {
+        let runtime = runtime(true);
+        let mut request = request();
+        release(&runtime, &request).await;
+        let ticket = YellArgs {
+            message: request.message.clone(),
+            with_trajectory: request.with_trajectory,
+        }
+        .ticket();
+        request.endpoint = "http://example.com/".into();
+        assert!(send(&runtime, request).await.is_err());
+        assert!(runtime.take_vouched(&ticket).is_ok(), "the release is still there");
+    }
+
+    /// A request under another session, or another actor in this one, cannot spend this
+    /// actor's release.
+    #[tokio::test]
+    async fn a_cross_session_request_leaves_the_release_unspent() {
+        let runtime = runtime(true);
+        let request = request();
+        release(&runtime, &request).await;
+        let mut foreign_root = super::tests::request();
+        foreign_root.actor.root = TrajectoryId("other-session".into());
+        let mut foreign_child = super::tests::request();
+        foreign_child.actor.child = Some(TrajectoryId("a-subagent".into()));
+        for foreign in [foreign_root, foreign_child] {
+            assert!(send(&runtime, foreign).await.is_err());
+        }
+        let ticket = YellArgs {
+            message: request.message.clone(),
+            with_trajectory: request.with_trajectory,
+        }
+        .ticket();
+        assert_eq!(runtime.take_vouched(&ticket).map(|(actor, _)| actor), Ok(request.actor));
+    }
+
+    #[tokio::test]
+    async fn sends_a_filtered_signed_report_and_consumes_the_release() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| async move {
+                    tx.send((headers, body)).await.unwrap();
+                    axum::Json(serde_json::json!({"receipt_id":"test-receipt","duplicate":false}))
+                },
+            ),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let runtime = runtime(true);
+        let mut request = request();
+        request.endpoint = format!("http://{address}/");
+        release(&runtime, &request).await;
+        assert_eq!(send(&runtime, request).await.unwrap(), "test-receipt");
+        let (headers, body) = rx.recv().await.unwrap();
+        assert_eq!(headers["content-encoding"], "gzip");
+        assert!(headers["x-appa-signature"].to_str().unwrap().starts_with("v1="));
+        let mut plain = String::new();
+        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(body.as_ref()), &mut plain).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&plain).unwrap();
+        assert_eq!(document["runtime"]["serving"]["harness"], "test-platform");
+        assert_eq!(document["schema"], "openappa.yell.v1");
+        assert_eq!(document["runtime"]["serving"]["hostname"], "platform.example.com");
+        assert!(!plain.contains("private-session-id"));
+        assert!(
+            send(&runtime, super::tests::request())
+                .await
+                .unwrap_err()
+                .contains("released")
+        );
+        server.abort();
+    }
+}

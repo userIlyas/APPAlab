@@ -1,0 +1,822 @@
+//! The runtime endpoint: its one validated value, who owns it, and what an
+//! activation may do about it.
+
+use crate::loopback_http::{self, Answer, Deadline};
+use crate::runtime_start::STOP_BUDGET;
+#[cfg(unix)]
+use std::ffi::OsStr;
+use std::net::SocketAddr;
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::process::Command;
+use std::time::Duration;
+
+use super::InitError;
+use super::config::ComposedPolicy;
+use super::paths::same_file;
+#[cfg(windows)]
+use super::powershell;
+
+/// The address the deployment's runtime listens on and every consumer talks to.
+///
+/// One value, validated once before any mutation, delivered explicitly to each
+/// consumer rather than left to per-file default constants. The production
+/// address is fixed; `APPA_ENDPOINT` overrides it in debug builds only, the seam
+/// the endpoint tests and a second test deployment need
+/// ([`crate::runtime_url::deployment_url`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    url: String,
+}
+
+impl Endpoint {
+    pub(super) fn resolve() -> Result<Self, InitError> {
+        Self::parse(&crate::runtime_url::deployment_url())
+    }
+
+    /// `http://` plus a loopback literal and a port. No path, no trailing slash,
+    /// no hostname: anything else is refused up front rather than half-applied.
+    pub(crate) fn parse(text: &str) -> Result<Self, InitError> {
+        let malformed = |reason: &str| InitError::MalformedEndpoint {
+            value: text.to_owned(),
+            reason: reason.to_owned(),
+        };
+        let authority = text
+            .strip_prefix("http://")
+            .ok_or_else(|| malformed("it must begin with http://"))?;
+        if authority.contains('/') {
+            return Err(malformed("it must carry no path and no trailing slash"));
+        }
+        let listen: SocketAddr = authority
+            .parse()
+            .map_err(|_| malformed("it must be a literal address and port, such as 127.0.0.1:8787"))?;
+        if !listen.ip().is_loopback() {
+            return Err(malformed("it must be a loopback address"));
+        }
+        if listen.port() == 0 {
+            return Err(malformed("it must name a fixed port"));
+        }
+        Ok(Self {
+            url: format!("http://{authority}"),
+        })
+    }
+
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn loopback(&self) -> loopback_http::Endpoint {
+        loopback_http::Endpoint::parse(&self.url).expect("a parsed endpoint is an http:// URL naming its host")
+    }
+
+    /// Every question init asks a runtime goes out through here, each bounded by
+    /// one deadline for its whole round trip.
+    fn ask(&self, method: &str, path: &str, budget: Duration) -> Result<Answer, String> {
+        loopback_http::request(&self.loopback(), method, path, b"", &Deadline::spanning(budget))
+    }
+}
+
+const PROBE_BUDGET: Duration = Duration::from_secs(2);
+
+/// A reload validates and composes the whole policy before it answers.
+const RELOAD_BUDGET: Duration = Duration::from_secs(10);
+
+/// What this activation did about the policy the running runtime serves.
+///
+/// The starter leaves an already-healthy runtime alone, and that process keeps serving the
+/// policy it loaded at startup. A restart loads this file itself, so the keys agree and
+/// there is nothing to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeOutcome {
+    /// Serving the configuration this activation validated, with nothing to reconcile.
+    Healthy,
+    /// Served an older policy until this activation reloaded it.
+    Reloaded,
+}
+
+impl RuntimeOutcome {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            RuntimeOutcome::Healthy => "healthy",
+            RuntimeOutcome::Reloaded => "healthy (policy reloaded)",
+        }
+    }
+}
+
+/// Who is answering the endpoint, as far as one probe can establish.
+///
+/// A healthy runtime left by an install under a different `APPA_INSTALL_DIR` or
+/// `APPA_DATA_DIR` is foreign: the activation stops it when it is this user's
+/// own appa process, and refuses it by pid otherwise. Stale runtimes are
+/// cleared before this classification through their separate health protocol.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EndpointOwner {
+    /// Nothing answered, or what answered serves no fingerprint. Before the
+    /// start this is the ordinary case; after it, it is a failure.
+    Unidentified,
+    /// The binary whose bytes were offered for comparison, serving this
+    /// configuration, in the process it names.
+    Deployment { pid: i32 },
+    /// A different build or a different configuration, naming the pid that
+    /// serves it.
+    Foreign { pid: i32 },
+}
+
+/// How often init looks at a runtime it asked to stop. It waits [`STOP_BUDGET`],
+/// the budget of every wait for a stopping runtime: a runtime that outlives one
+/// of them has outlived all of them.
+const STOP_POLL: Duration = Duration::from_millis(50);
+
+/// The endpoint's health answer; `None` when nothing answers it successfully.
+pub(crate) fn endpoint_health(endpoint: &Endpoint) -> Option<String> {
+    match endpoint.ask("GET", "/health", PROBE_BUDGET) {
+        Ok(answer) if answer.is_success() => Some(String::from_utf8_lossy(&answer.body).trim().to_owned()),
+        Ok(_) | Err(_) => None,
+    }
+}
+
+pub(crate) fn positive_pid(pid: &str) -> Option<i32> {
+    if pid.is_empty() || pid.starts_with('0') || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+pub(crate) fn stale_pid(answer: &str) -> Option<i32> {
+    positive_pid(answer.strip_prefix("stale ")?)
+}
+
+/// Stop the exact stale APPA runtime named by the endpoint before classifying
+/// any remaining responder as foreign.
+///
+/// The runtime's own health protocol names its pid. The pid is not trusted by
+/// itself; init applies the same same-user/process-name check as the shipped
+/// starter before sending a signal. An `ok`, malformed, or absent health answer
+/// never grants shutdown authority.
+pub(super) fn clear_stale_endpoint(endpoint: &Endpoint) -> Result<(), InitError> {
+    let Some(answer) = endpoint_health(endpoint) else {
+        return Ok(());
+    };
+    let Some(pid) = stale_pid(&answer) else {
+        return Ok(());
+    };
+    if !is_owned_appa_runtime(pid)? {
+        return Err(InitError::RuntimeIdentity {
+            endpoint: endpoint.url().to_owned(),
+            message: format!(
+                "the endpoint names stale pid {pid}, but it is not this user's appa runtime; not stopping it"
+            ),
+        });
+    }
+    // Close the validation-to-signal race: the process must still be the one
+    // answering with the same stale pid immediately before it is terminated.
+    match endpoint_health(endpoint) {
+        None => return Ok(()),
+        Some(ref current) if current == "ok" => return Ok(()),
+        Some(ref current) if stale_pid(current) == Some(pid) => {}
+        Some(_) => {
+            return Err(InitError::RuntimeIdentity {
+                endpoint: endpoint.url().to_owned(),
+                message: format!("the endpoint changed ownership before stale pid {pid} could be stopped"),
+            });
+        }
+    }
+    terminate_owned_appa_runtime(pid, endpoint)?;
+
+    let deadline = std::time::Instant::now() + STOP_BUDGET;
+    while std::time::Instant::now() < deadline {
+        match endpoint_health(endpoint) {
+            None => return Ok(()),
+            Some(ref current) if current == "ok" => return Ok(()),
+            Some(ref current) if stale_pid(current) == Some(pid) => {
+                std::thread::sleep(STOP_POLL);
+            }
+            Some(_) => {
+                return Err(InitError::RuntimeIdentity {
+                    endpoint: endpoint.url().to_owned(),
+                    message: format!("the endpoint changed ownership while stale pid {pid} was stopping"),
+                });
+            }
+        }
+    }
+    Err(InitError::RuntimeSurvived {
+        pid,
+        endpoint: endpoint.url().to_owned(),
+    })
+}
+
+/// Signal `pid`, confirming immediately before that it is still this user's
+/// appa runtime: the check-to-signal window is what a forged answer would use.
+fn terminate_owned_appa_runtime(pid: i32, endpoint: &Endpoint) -> Result<(), InitError> {
+    if !is_owned_appa_runtime(pid)? {
+        return Err(InitError::RuntimeIdentity {
+            endpoint: endpoint.url().to_owned(),
+            message: format!("pid {pid} is not this user's appa runtime; not stopping it"),
+        });
+    }
+    terminate_appa_pid(pid)
+}
+
+/// Stop the appa runtime answering the endpoint as `pid`, this deployment's
+/// or an earlier one's, and wait until the endpoint no longer answers from it.
+pub(super) fn stop_owned_appa_runtime(pid: i32, endpoint: &Endpoint) -> Result<(), InitError> {
+    Ok(crate::runtime_start::stop_pid(
+        &endpoint.loopback(),
+        endpoint.url(),
+        pid,
+    )?)
+}
+
+#[cfg(unix)]
+pub(crate) fn process_exists(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(windows)]
+pub(crate) fn process_exists(pid: i32) -> bool {
+    powershell(
+        "if (Get-Process -Id $env:APPA_STALE_PID -ErrorAction SilentlyContinue) { 'alive' }",
+        [("APPA_STALE_PID", pid.to_string())],
+    )
+    .is_ok_and(|answer| answer.trim() == "alive")
+}
+
+#[cfg(unix)]
+pub(crate) fn is_owned_appa_runtime(pid: i32) -> Result<bool, InitError> {
+    if pid == std::process::id() as i32 {
+        return Ok(false);
+    }
+    let query = |field: &str| -> Option<String> {
+        let output =
+            crate::child_process::output(Command::new("ps").args(["-o", field, "-p", &pid.to_string()])).ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let Some(uid) = query("uid=").and_then(|uid| uid.parse::<u32>().ok()) else {
+        return Ok(false);
+    };
+    if uid != unsafe { libc::geteuid() } {
+        return Ok(false);
+    }
+    let Some(command_name) = query("comm=") else {
+        return Ok(false);
+    };
+    Ok(Path::new(&command_name).file_name().and_then(OsStr::to_str) == Some("appa"))
+}
+
+#[cfg(unix)]
+pub(crate) fn terminate_appa_pid(pid: i32) -> Result<(), InitError> {
+    if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+        return Ok(());
+    }
+    let source = std::io::Error::last_os_error();
+    if source.kind() == std::io::ErrorKind::NotFound {
+        return Ok(());
+    }
+    Err(InitError::InstallRuntime {
+        path: PathBuf::from(format!("pid {pid}")),
+        source,
+    })
+}
+
+#[cfg(windows)]
+const WINDOWS_APPA_IDENTITY_SCRIPT: &str = r#"
+$appaPid = [int]$env:APPA_STALE_PID
+$appaProcess = Get-Process -Id $appaPid -ErrorAction SilentlyContinue
+$appaState = 'missing'
+if ($null -ne $appaProcess) {
+    $appaState = 'foreign'
+    $appaCim = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $appaPid" -ErrorAction SilentlyContinue
+    $appaOwner = if ($null -ne $appaCim) {
+        Invoke-CimMethod -InputObject $appaCim -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+    } else {
+        $null
+    }
+    $appaCallerSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($appaProcess.ProcessName -ieq 'appa' -and
+        $null -ne $appaCim -and $appaCim.Name -ieq 'appa.exe' -and
+        $null -ne $appaOwner -and $appaOwner.ReturnValue -eq 0 -and
+        $appaOwner.Sid -eq $appaCallerSid) {
+        $appaState = 'owned'
+    }
+}
+"#;
+
+#[cfg(windows)]
+pub(crate) fn is_owned_appa_runtime(pid: i32) -> Result<bool, InitError> {
+    let command = format!("{WINDOWS_APPA_IDENTITY_SCRIPT}\n$appaState");
+    let answer = powershell(&command, [("APPA_STALE_PID", pid.to_string())])?;
+    Ok(answer.trim() == "owned")
+}
+
+#[cfg(windows)]
+pub(crate) fn terminate_appa_pid(pid: i32) -> Result<(), InitError> {
+    // Resolve the process object first and stop that object, not a freshly
+    // looked-up PID. The SID/name checks are repeated in this same PowerShell
+    // invocation so an elevated init never turns a forged health answer into
+    // authority to terminate another user's process.
+    let command = format!(
+        "{WINDOWS_APPA_IDENTITY_SCRIPT}\n\
+         if ($appaState -eq 'missing') {{ exit 0 }}\n\
+         if ($appaState -ne 'owned') {{ throw 'pid is not this user''s appa runtime' }}\n\
+         if (-not $appaProcess.HasExited) {{ \
+             Stop-Process -InputObject $appaProcess -Force -ErrorAction Stop \
+         }}"
+    );
+    powershell(&command, [("APPA_STALE_PID", pid.to_string())]).map(drop)
+}
+
+/// Who owns the endpoint: this deployment, another one, or a process that will not say.
+///
+/// A deployment is a build *and* the configuration it serves. Comparing builds alone makes
+/// every install of one build look like the same deployment, which is how an install ends
+/// up reloading, and reporting on, a runtime that is not its own.
+pub(crate) fn endpoint_owner(binary: &Path, config: &Path, endpoint: &Endpoint) -> Result<EndpointOwner, InitError> {
+    let expected = crate::runtime_cli::binary_digest(binary).map_err(|source| InitError::InstallRuntime {
+        path: binary.to_path_buf(),
+        source,
+    })?;
+    match endpoint.ask("GET", "/binary-fingerprint", PROBE_BUDGET) {
+        Ok(answer) if answer.is_success() => {
+            classify_endpoint_owner(&expected, config, endpoint, &String::from_utf8_lossy(&answer.body))
+        }
+        Ok(_) | Err(_) => Ok(EndpointOwner::Unidentified),
+    }
+}
+
+/// A process is this deployment only when it names both this build and this configuration.
+/// Anything else — a different build, a different config, or an answer that names no
+/// config at all — is another deployment, to be stopped before this install proceeds.
+/// Either way the answer must name the pid that serves it: a runtime that cannot be
+/// stopped by pid can be neither cleared nor rolled back.
+fn classify_endpoint_owner(
+    expected: &str,
+    config: &Path,
+    endpoint: &Endpoint,
+    answer: &str,
+) -> Result<EndpointOwner, InitError> {
+    let (identity, rest) = answer.split_once('\n').unwrap_or((answer, ""));
+    let mut fields = identity.split_whitespace();
+    let actual = fields.next().unwrap_or_default();
+    let pid = fields
+        .next()
+        .and_then(positive_pid)
+        .ok_or_else(|| InitError::RuntimeIdentity {
+            endpoint: endpoint.url().to_owned(),
+            message: "the answering runtime does not identify its pid. Stop it, then rerun the install.".to_owned(),
+        })?;
+    // Everything after the first newline is the path, less the one the transport appends:
+    // a config path may itself hold a newline, and splitting again would truncate it.
+    let serves = rest.strip_suffix('\n').unwrap_or(rest);
+    let serves = Path::new(serves);
+    if actual == expected && !serves.as_os_str().is_empty() && (serves == config || same_file(serves, config)) {
+        Ok(EndpointOwner::Deployment { pid })
+    } else {
+        Ok(EndpointOwner::Foreign { pid })
+    }
+}
+
+/// Reconcile the policy a surviving runtime serves with the file this activation validated.
+///
+/// The starter replaces a runtime whose executable changed, and that fresh process loads
+/// this file itself. A runtime it left running does not: it still serves what it loaded at
+/// startup, and a config written since is on disk only. A divergence is reloaded, and the
+/// reload must be confirmed by the key the runtime serves afterwards: a plugin bound to a
+/// runtime serving another policy is the skew activation exists to prevent.
+///
+/// A config this process cannot compose is never assumed to agree: the runtime is always
+/// reloaded, and the reload resolves the secret where the runtime runs, which is the
+/// environment that has it. With no key to compare, the confirmation is the runtime's own:
+/// it validates this file before it swaps, so the key it serves after a reload it accepted
+/// is this file's.
+pub(crate) fn reconcile_policy(
+    endpoint: &Endpoint,
+    config: &Path,
+    composed: &ComposedPolicy,
+) -> Result<RuntimeOutcome, InitError> {
+    let serving = serving_policy_key(endpoint)?;
+    if let ComposedPolicy::Key(key) = composed
+        && *key == serving
+    {
+        return Ok(RuntimeOutcome::Healthy);
+    }
+    reload_policy(endpoint, config)?;
+    let serving = serving_policy_key(endpoint)?;
+    match composed {
+        ComposedPolicy::Key(key) if *key != serving => Err(InitError::PolicyKey {
+            endpoint: endpoint.url().to_owned(),
+            message: "runtime did not confirm the prepared policy after reload".into(),
+        }),
+        ComposedPolicy::Key(_) | ComposedPolicy::Unknowable => Ok(RuntimeOutcome::Reloaded),
+    }
+}
+
+/// The policy key the endpoint answers under. A runtime that does not answer for one
+/// cannot be reconciled, and a plugin bound to it is the skew init exists to prevent.
+fn serving_policy_key(endpoint: &Endpoint) -> Result<String, InitError> {
+    let refused = |message: String| InitError::PolicyKey {
+        endpoint: endpoint.url().to_owned(),
+        message,
+    };
+    let answer = endpoint.ask("GET", "/policy-key", PROBE_BUDGET).map_err(refused)?;
+    if !answer.is_success() {
+        return Err(refused(format!("/policy-key answered HTTP {}", answer.status)));
+    }
+    let key = String::from_utf8_lossy(&answer.body).trim().to_owned();
+    if key.is_empty() {
+        return Err(refused("the answer names no policy key".to_owned()));
+    }
+    Ok(key)
+}
+
+/// Ask the running runtime to serve the configuration on disk.
+///
+/// The endpoint's owner is this deployment by the time this runs, so the reload reads this
+/// deployment's file. The runtime validates it again before it swaps: a refusal here is a
+/// fault worth naming, not a receipt footnote, because the older policy keeps serving.
+fn reload_policy(endpoint: &Endpoint, config: &Path) -> Result<(), InitError> {
+    let refused = |message: String| InitError::ReloadRefused {
+        endpoint: endpoint.url().to_owned(),
+        path: config.to_path_buf(),
+        message,
+    };
+    let answer = endpoint.ask("POST", "/reload", RELOAD_BUDGET).map_err(refused)?;
+    let reason = String::from_utf8_lossy(&answer.body).trim().to_owned();
+    match (answer.is_success(), reason.is_empty()) {
+        (true, _) => Ok(()),
+        (false, true) => Err(refused(format!("/reload answered HTTP {}", answer.status))),
+        (false, false) => Err(refused(reason)),
+    }
+}
+
+/// The endpoint answers for this deployment: this build, serving this configuration.
+/// Answers with the pid of the process serving it.
+pub(crate) fn verify_runtime_deployment(runtime: &Path, config: &Path, endpoint: &Endpoint) -> Result<i32, InitError> {
+    match endpoint_owner(runtime, config, endpoint)? {
+        EndpointOwner::Deployment { pid } => Ok(pid),
+        EndpointOwner::Unidentified => Err(unidentified(endpoint)),
+        EndpointOwner::Foreign { pid } => Err(InitError::RuntimeIdentity {
+            endpoint: endpoint.url().to_owned(),
+            message: format!("another appa deployment (pid {pid}) is answering. Stop it, then rerun the install."),
+        }),
+    }
+}
+
+/// A listener that serves no appa identity is nobody's to stop from here.
+pub(super) fn unidentified(endpoint: &Endpoint) -> InitError {
+    InitError::RuntimeIdentity {
+        endpoint: endpoint.url().to_owned(),
+        message: "it does not identify itself as an appa runtime. Stop it, then rerun the install.".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn endpoint_accepts_loopback_and_refuses_everything_else() {
+        assert_eq!(
+            Endpoint::parse("http://127.0.0.1:8787").unwrap().url(),
+            "http://127.0.0.1:8787"
+        );
+        assert!(Endpoint::parse("http://[::1]:9000").is_ok());
+        for rejected in [
+            "https://127.0.0.1:8787",
+            "http://127.0.0.1:8787/",
+            "http://127.0.0.1:8787/mcp",
+            "http://localhost:8787",
+            "http://10.0.0.1:8787",
+            "http://127.0.0.1:0",
+            "127.0.0.1:8787",
+        ] {
+            assert!(
+                matches!(Endpoint::parse(rejected), Err(InitError::MalformedEndpoint { .. })),
+                "accepted {rejected}"
+            );
+        }
+    }
+
+    /// A stand-in the ownership check can find and the signal can reach.
+    ///
+    /// macOS kills a copied platform binary outright -- a copy of `/bin/sh` or
+    /// `/bin/sleep` dies with SIGKILL before it runs a single instruction -- so
+    /// a test built on one would pass without ever exercising the stop,
+    /// because a killed process is also a stopped one. `perl` copies and runs.
+    #[cfg(unix)]
+    const STAND_IN: &str = "/usr/bin/perl";
+
+    /// What every starter runs: the subcommand plus the endpoint it binds.
+    #[cfg(unix)]
+    const RUNTIME_ARGUMENTS: &[&str] = &["runtime", "--listen", "127.0.0.1:8787"];
+
+    /// A process whose executable really *is* `at`, started with `arguments`, so
+    /// the ownership check sees the process name it decides on.
+    ///
+    /// The stand-in is reaped on its own thread. A dead child that nobody has
+    /// waited for is a zombie, and `kill(pid, 0)` still succeeds on one, so
+    /// without the reaper these tests could not tell a stopped process from a
+    /// running one. In production a stopped runtime is never init's child.
+    #[cfg(unix)]
+    fn process_executing(at: &Path, arguments: &[&str]) -> Option<i32> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !Path::new(STAND_IN).is_file() {
+            return None;
+        }
+        fs::create_dir_all(at.parent().expect("a parent")).expect("the directory exists");
+        fs::copy(STAND_IN, at).expect("the stand-in executable is copied");
+        fs::set_permissions(at, fs::Permissions::from_mode(0o755)).expect("the stand-in is executable");
+
+        // The stand-in announces itself by creating a file. Waiting on a signal
+        // it sends is the only reliable liveness proof here: a copied binary the
+        // platform refuses to run leaves a zombie that `kill(pid, 0)` still
+        // reports as alive, so checking the pid would accept a process that
+        // never ran.
+        let ready = at.with_extension("ready");
+        let script = "open(my $f, '>', $ARGV[0]) or die; close $f; sleep 30";
+        let spawn_deadline = std::time::Instant::now() + STOP_BUDGET;
+        let mut child = loop {
+            match crate::child_process::spawn(Command::new(at).args(["-e", script]).arg(&ready).args(arguments)) {
+                Ok(child) => break child,
+                Err(source)
+                    if source.raw_os_error() == Some(libc::ETXTBSY) && std::time::Instant::now() < spawn_deadline =>
+                {
+                    std::thread::sleep(STOP_POLL);
+                }
+                Err(source) => panic!("the stand-in process starts: {source}"),
+            }
+        };
+        let pid = child.id() as i32;
+        std::thread::spawn(move || child.wait());
+
+        let deadline = std::time::Instant::now() + STOP_BUDGET;
+        while std::time::Instant::now() < deadline {
+            if ready.is_file() {
+                return Some(pid);
+            }
+            std::thread::sleep(STOP_POLL);
+        }
+        // This platform will not run the stand-in at all. Skip rather than
+        // report a pass that exercised nothing.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        None
+    }
+
+    /// Whether a pid is still running, once its reaper has had a moment.
+    #[cfg(unix)]
+    fn still_running(pid: i32) -> bool {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// A loopback fixture serving `answers` in turn, with the request lines it served. A
+    /// probe's path is part of the contract it has with the runtime, so a test that cares
+    /// which endpoint init asks reads them.
+    fn recorded_answers(answers: Vec<String>) -> (Endpoint, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        recorded_statuses(answers.into_iter().map(|answer| ("200 OK", answer)).collect())
+    }
+
+    /// [`recorded_answers`] where each answer carries its own status line.
+    fn recorded_statuses(
+        answers: Vec<(&'static str, String)>,
+    ) -> (Endpoint, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback health fixture binds");
+        let endpoint = Endpoint::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = std::sync::Arc::clone(&asked);
+        std::thread::spawn(move || {
+            for (status, answer) in answers {
+                let (mut connection, _) = listener.accept().expect("the health probe connects");
+                let mut request = [0u8; 2048];
+                let read = connection.read(&mut request).unwrap_or(0);
+                let requested = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                recorder
+                    .lock()
+                    .expect("the request recorder is never poisoned")
+                    .push(requested);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+                connection
+                    .write_all(response.as_bytes())
+                    .expect("the health answer writes");
+            }
+        });
+        (endpoint, asked)
+    }
+
+    #[test]
+    fn only_canonical_stale_health_answers_grant_a_pid() {
+        assert_eq!(stale_pid("stale 42"), Some(42));
+        for answer in [
+            "",
+            "ok",
+            "stale",
+            "stale ",
+            "stale 0",
+            "stale 01",
+            "stale -1",
+            "stale 42 extra",
+        ] {
+            assert_eq!(stale_pid(answer), None, "accepted {answer:?}");
+        }
+    }
+
+    #[test]
+    fn only_this_build_serving_this_config_is_this_deployment() {
+        let endpoint = Endpoint::parse("http://127.0.0.1:8787").expect("the endpoint parses");
+        let classify = |expected: &str, config: &Path, answer: &str| {
+            classify_endpoint_owner(expected, config, &endpoint, answer).expect("the answer classifies")
+        };
+        let mine = Path::new("/home/user/config/appa.toml");
+        assert_eq!(
+            classify("same", mine, "same 42\n/home/user/config/appa.toml"),
+            EndpointOwner::Deployment { pid: 42 }
+        );
+        // The build alone never settles it: one build serves as many deployments as there
+        // are configurations, and each is a stranger to the others.
+        assert_eq!(
+            classify("same", mine, "same 42\n/home/other/config/appa.toml"),
+            EndpointOwner::Foreign { pid: 42 }
+        );
+        // A path with spaces is one path, not two fields.
+        let spaced = Path::new("/home/user/Application Support/appa.toml");
+        assert_eq!(
+            classify("same", spaced, "same 42\n/home/user/Application Support/appa.toml"),
+            EndpointOwner::Deployment { pid: 42 }
+        );
+        // On Unix a directory name may hold a newline, so the path is read as the whole
+        // remainder of the answer the runtime composes — and a transport that appends a
+        // newline of its own does not turn one deployment into a stranger.
+        let newlined = Path::new("/home/user/two\nlines/appa.toml");
+        assert_eq!(
+            classify("same", newlined, "same 42\n/home/user/two\nlines/appa.toml"),
+            EndpointOwner::Deployment { pid: 42 }
+        );
+        assert_eq!(
+            classify("same", mine, "same 42\n/home/user/config/appa.toml\n"),
+            EndpointOwner::Deployment { pid: 42 }
+        );
+        assert_eq!(
+            classify("same", mine, "different 42\n/home/user/config/appa.toml"),
+            EndpointOwner::Foreign { pid: 42 }
+        );
+        // An answer that names no configuration cannot claim to be this deployment, and
+        // one that names no pid cannot be stopped, so it is refused outright.
+        assert_eq!(classify("same", mine, "same 42"), EndpointOwner::Foreign { pid: 42 });
+        assert!(matches!(
+            classify_endpoint_owner("same", mine, &endpoint, "different"),
+            Err(InitError::RuntimeIdentity { .. })
+        ));
+    }
+
+    #[test]
+    fn a_serving_policy_key_is_read_from_the_policy_route() {
+        let (endpoint, asked) = recorded_answers(vec!["c54f1509".to_string()]);
+        assert_eq!(serving_policy_key(&endpoint).expect("the key reads"), "c54f1509");
+        assert_eq!(
+            asked.lock().expect("the request recorder is never poisoned").as_slice(),
+            ["GET /policy-key HTTP/1.1".to_string()],
+            "the probe reads the policy route, and reads it without mutating"
+        );
+    }
+
+    /// A runtime that answers nothing usable, and a port nothing answers on, both
+    /// refuse init: a plugin bound to a runtime whose policy cannot be established is
+    /// the skew init exists to prevent.
+    #[test]
+    fn a_runtime_that_does_not_answer_for_its_policy_refuses_init() {
+        let blank = recorded_answers(vec![String::new()]).0;
+        assert!(matches!(serving_policy_key(&blank), Err(InitError::PolicyKey { .. })));
+        let unbound = Endpoint::parse("http://127.0.0.1:1").expect("the endpoint parses");
+        assert!(matches!(serving_policy_key(&unbound), Err(InitError::PolicyKey { .. })));
+    }
+
+    #[test]
+    fn a_matching_policy_key_reconciles_without_asking_or_reloading() {
+        // One answer is served: the key probe. A reload would need a second connection,
+        // so reaching one at all would hang rather than pass.
+        let endpoint = recorded_answers(vec!["agreed".to_string()]).0;
+        let config = PathBuf::from("/home/user/config/appa.toml");
+        assert_eq!(
+            reconcile_policy(&endpoint, &config, &ComposedPolicy::Key("agreed".to_string()))
+                .expect("the reconcile completes"),
+            RuntimeOutcome::Healthy
+        );
+    }
+
+    #[test]
+    fn a_reload_that_installed_this_deployments_policy_is_reported_as_reloaded() {
+        let (endpoint, _asked) = recorded_answers(vec![
+            "older".to_string(),
+            r#"{"policy_key":"this-deployment","policy_identity":"x","changed":true}"#.to_string(),
+            "this-deployment".to_string(),
+        ]);
+        let config = PathBuf::from("/home/user/config/appa.toml");
+        assert_eq!(
+            reconcile_policy(&endpoint, &config, &ComposedPolicy::Key("this-deployment".to_string()))
+                .expect("the reconcile completes"),
+            RuntimeOutcome::Reloaded
+        );
+    }
+
+    #[test]
+    fn a_refused_reload_names_the_runtimes_reason() {
+        let reason = "the jev annotator names APPA_PROVIDER_JEV_API_KEY, which is not set";
+        let endpoint = recorded_statuses(vec![("422 Unprocessable Entity", reason.to_string())]).0;
+        let config = PathBuf::from("/home/user/config/appa.toml");
+        assert!(matches!(
+            reload_policy(&endpoint, &config),
+            Err(InitError::ReloadRefused { message, .. }) if message == reason
+        ));
+    }
+
+    /// A config this process cannot compose is reloaded even when the runtime already
+    /// serves the key it would have had: not knowing is never agreeing.
+    #[test]
+    fn a_config_this_process_cannot_compose_is_settled_by_the_reload_the_runtime_accepts() {
+        let (endpoint, asked) = recorded_answers(vec![
+            "serving".to_string(),
+            r#"{"policy_key":"serving","policy_identity":"x","changed":false}"#.to_string(),
+            "serving".to_string(),
+        ]);
+        let config = PathBuf::from("/home/user/config/appa.toml");
+        assert_eq!(
+            reconcile_policy(&endpoint, &config, &ComposedPolicy::Unknowable).expect("the reconcile completes"),
+            RuntimeOutcome::Reloaded
+        );
+        assert!(
+            asked
+                .lock()
+                .expect("the request recorder is never poisoned")
+                .iter()
+                .any(|request| request.starts_with("POST /reload")),
+            "the reload is asked for"
+        );
+    }
+
+    #[test]
+    fn a_reload_that_serves_another_policy_refuses_init() {
+        let endpoint = recorded_answers(vec![
+            "older".to_string(),
+            r#"{"policy_key":"older","policy_identity":"x","changed":false}"#.to_string(),
+            "older".to_string(),
+        ])
+        .0;
+        let config = PathBuf::from("/home/user/config/appa.toml");
+        assert!(matches!(
+            reconcile_policy(&endpoint, &config, &ComposedPolicy::Key("this-deployment".to_string())),
+            Err(InitError::PolicyKey { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_reclaims_an_unlinked_runtime_named_by_its_stale_health_answer() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let replaced = directory.path().join("bin/appa");
+        let Some(pid) = process_executing(&replaced, RUNTIME_ARGUMENTS) else {
+            return;
+        };
+        fs::remove_file(&replaced).expect("the installed binary is unlinked while its runtime remains");
+        let endpoint = recorded_answers(vec![format!("stale {pid}"), format!("stale {pid}")]).0;
+
+        clear_stale_endpoint(&endpoint).expect("init stops its stale unlinked runtime");
+
+        assert!(!still_running(pid), "the stale runtime still owns its process");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_spoofed_stale_pid_does_not_grant_process_shutdown() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let other = directory.path().join("bin/not-appa");
+        let Some(pid) = process_executing(&other, RUNTIME_ARGUMENTS) else {
+            return;
+        };
+        let endpoint = recorded_answers(vec![format!("stale {pid}")]).0;
+
+        let refused = clear_stale_endpoint(&endpoint);
+
+        assert!(matches!(refused, Err(InitError::RuntimeIdentity { .. })));
+        assert!(still_running(pid), "a non-appa process was terminated");
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+}

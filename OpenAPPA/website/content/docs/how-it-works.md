@@ -1,0 +1,206 @@
+---
+title: How it works
+category: Deep Dive
+order: 2
+description: Deterministic security guarantees, flow tracking, and how agents self-correct.
+---
+
+## OpenAPPA enforces information-flow policy proactively
+
+OpenAPPA sits between an agent and its tools to answer one question before every action: *is this data allowed to go to this destination?*
+
+Powered by **APPA** (Agentic Permissions Policy Algebra), OpenAPPA tracks data sensitivity and trust across the tools an agent uses. The security engine stays outside the agent loop, so prompt injections cannot alter or bypass policy rules.
+
+OpenAPPA also helps the agent remain useful under security restrictions. If an action is blocked by policy, OpenAPPA returns ways to continue: request human approval, clean sensitive fields, or isolate a read in a subagent.
+
+:::video-how-it-works:::
+
+## The Core Concepts
+
+OpenAPPA operates with three concepts:
+
+1. **Security Label**
+
+   A trajectory is an agent's work on a conversation or task, including its tool calls. For each trajectory, OpenAPPA keeps a security label and the policy configuration needed to evaluate its next action. Each decision accounts for what the agent has already read and done.
+
+   The security label can become more restrictive as the agent works, but it cannot become less restrictive. Once the agent reads restricted or untrusted data, those restrictions stay with the session.
+
+   :::fig-label-fold:::
+
+   Audience and Trust make up the security label. OpenAPPA also tracks Effects and checks Attention requirements:
+
+   1. **Audience:** Who is authorized to access data in this agent session. Reading data for a smaller audience restricts where the agent can send data later. For example, after reading an internal customer record, the agent cannot send session data to a public destination. An audience can be as specific as the members of one Slack channel: the contract extracts the channel ID from the tool's arguments, so reading channel `C0123` labels the data with that channel's membership, and posting to it requires that they are already valid readers.
+   2. **Trust:** How much the data in the session can be trusted. Trust follows who can write the text, not who can read it. Text that only members of the organization and its collaborators wrote, such as a team discussion in an internal channel or on a public repository, keeps the session's trust, and so does text one accountable publisher controls, such as a vendor's documentation or a release index. Text on a surface anyone can write to, such as a forum answer or an outside contributor's comment, lowers it, and tools that require trusted input will no longer be allowed to run.
+   3. **Effect:** What the agent has already done, such as sending an email or changing a system. Effects accumulate in the session history. A policy can require an effect to have happened, or prevent an action after an effect has happened.
+   4. **Attention:** Approval or review required for a specific action. Unlike effects, attention does not accumulate. An approval clears the attention requirement for that action only, and later calls must request attention again.
+
+2. **Tool Contracts**
+
+   Every tool has a contract in the OpenAPPA policy. The contract tells OpenAPPA how the tool interacts with the agent's security state:
+
+   - **`delta`:** How data returned by the tool changes the security label.
+   - **`forwards`:** The label of content the tool sends beyond its arguments, such as a stored file that it mails. Most tools omit it.
+   - **`requires`:** Which requirements the data the call sends must satisfy for OpenAPPA to allow the action. OpenAPPA checks them before the call: against the session's label, combined with `forwards`.
+   - **`effects`:** Which effects are recorded after a tool runs successfully.
+
+   OpenAPPA uses the first explicit contract whose argument selectors match. If none match, the policy can route the call through a wildcard (`name = "*"`) annotator. Once a contract matches, a schema error refuses the call without falling through.
+
+   For example, a CRM tool can label its result as internal, while an email tool can require the recipient to be included in the session's audience.
+
+3. **Remedy Plans**
+
+   When an action does not meet its tool contract, OpenAPPA blocks it and returns the remedy plans allowed by the policy. A plan can involve cleaning data with a [sanitizer](#sanitizers), receiving approval from an [authority](#authorities), accepting a narrower audience, withholding a tool result, or isolating a sensitive read in a [subagent](#subagent-reads).
+
+   An offered plan can still be denied by an approval service or fail during data cleaning. If no permitted remedy succeeds, the action remains blocked.
+
+   :::fig-remedy-plan:::
+
+## Keeping Agents Useful Under Restrictions
+
+If the security label becomes more restrictive as the agent works, how can the agent still do something useful?
+
+OpenAPPA can ask for approval for a specific action or clean data before the agent sees it. It also uses information about each tool call and who may access the data to apply the appropriate restrictions. The policy configuration defines when these options are available.
+
+### Authorities
+
+An authority can approve a specific action that the session's restrictions would otherwise block. It can be a person, an approval service, or an LLM evaluator. Approval does not make the security label less restrictive; it only allows that one action.
+
+For example, an agent has read a private customer report and wants to email it to an external auditor. An authority can approve that email without approving future emails or changing the session's restrictions.
+
+```toml
+[[policy.authority]]
+name = "reviewer"
+
+[policy.authority.permits]
+# Allow the reviewer to approve sharing
+# outside the session's audience.
+audience_missing = ["public"]
+
+[externals.authorities.reviewer]
+# OpenAPPA's built-in human-in-the-loop authority.
+builtin = "hitl"
+```
+
+See [Authorities in Policy configuration](/contracts#authorities) for configuration and supported implementations.
+
+### Sanitizers
+
+A sanitizer cleans data before the agent receives it or sends it to a tool. Cleaning data before the agent sends it can allow an action that would otherwise be blocked.
+
+For a side-effecting tool result the integration can withhold, the agent can instead run the tool without receiving any result output. A successful call still records its effects, but its result adds no Value or Label restriction to the trajectory.
+
+For example, a sanitizer removes customer names and email addresses from a support ticket. The policy permits the agent to share that cleaned version in a public bug report.
+
+```toml
+[[policy.sanitizer]]
+name = "remove_customer_details"
+on = ["tool_output"]
+
+[policy.sanitizer.permits]
+# Allow the cleaned result to be shared publicly.
+audience = { from = ["internal"], to = ["public"] }
+
+[externals.sanitizers.remove_customer_details]
+# Replace with your internal sanitization service URL.
+url = "https://sanitizer.corp.example/sanitize"
+```
+
+See [Sanitizers in Policy configuration](/contracts#sanitizers) for service configuration and where cleaning can happen.
+
+### Annotators
+
+An annotator classifies a tool call. It can determine the call's output restrictions (`delta`), the restrictions of content it sends (`forwards`), requirements (`requires`), and effects. The `jev` builtin determines audience and trust only: no effects, history, or attention marks. OpenAPPA checks the resulting contract before allowing the call.
+
+For example, a Python script can classify files by directory: files in `/srv/public-docs` can be shared publicly, while files in `/srv/customer-records` are restricted to internal users.
+
+```toml
+[[policy.annotator]]
+name = "classify_file"
+ranks = ["suspicious"]
+audiences = ["internal"]
+marks = []
+effects = []
+
+[[policy.tool]]
+name = "read_file"
+# Ask the annotator to classify the file being read.
+annotator = "classify_file"
+
+[externals.annotators.classify_file]
+command = ["python3", "./classify_file.py"]
+```
+
+An annotator can run as a local script or an external service. When the call itself does not say what the annotator needs to know — a `git push` names a remote, not who can read the repository, and `gh pr view` names a number, not who wrote the comments — a context provider of the deployment finds the facts first, and the annotator classifies from them. See [Annotators in Policy configuration](/contracts#annotators) for configuration, the request and response format, and limits on its answers.
+
+### Subagent Reads
+
+A subagent reads sensitive data in a separate context and returns only what the policy allows. For example, it can summarize a private ticket and pass the summary through a sanitizer, letting the main agent use the cleaned result in a public bug report if the policy permits.
+
+Before the subagent starts, the main agent sets the return requirements, including any cleaning. These also limit what the subagent can read. OpenAPPA blocks results that do not meet them.
+
+See [Subagent Returns](/contracts#subagent-returns) for integration requirements and configuration.
+
+### Subagent forks and root forks
+
+A `trajectory family` contains one root and its spawned subagents in the same event log. OpenAPPA distinguishes a `subagent fork` inside that family from a `root fork` that starts another family.
+
+| Operation | What opens | What remains connected |
+|---|---|---|
+| Resume or compact a conversation while keeping its session ID | The existing root reopens. | Its existing policy state and history remain in place. No fork is needed. |
+| Spawn a subagent, such as Claude Code's `Agent` tool | A child trajectory binds to an approved spawn in the same family. | The family shares effect history, and a child answer crosses a checked return path. |
+| Run a `fan-out spawn`, such as Claude Code's `Workflow` tool | Each subagent the spawn starts binds its own fork under the spawn's one approval, starting at the parent's label at that moment. | The same as a single spawn, for each subagent: every answer crosses the checked return path on its own. |
+| Open an independent conversation from copied context | The embedding integration can open a new root family from an identified source trajectory. | Only the source state frozen at opening is inherited. There is no subagent return path or continuing synchronization. |
+
+A root fork belongs to the source family's `deployment`. It keeps the source trajectory's label and authority denials, and the family's committed effects and unsettled effect reservations. Parent and fork then evolve independently. A reservation inherited while a parent call was unfinished remains conservative in the fork; a later parent result does not settle it there. Active dispatches and remedy offers are not copied.
+
+An embedding opens a root fork explicitly with `Runtime::open_root_fork`. It must establish which trajectory supplied the copied context: a new session ID alone does not prove that it is a fork. The Claude Code integration establishes it from the protected launch. `clappa --resume <id> --fork-session` names the source, and the new root forks from it. A session ID change inside one launch continues the same family. See [Session ID changes](/claude-code#session-id-changes).
+
+## Every agent decides under its deployment's current policy
+
+A `deployment` is the line of policies that one runtime, or one organization in an embedding host, serves. Each published policy is a numbered `policy revision`. Every `trajectory family` belongs to one deployment. The next decision in every family, new or already running, is made under the deployment's current revision, its head.
+
+The family log records which revision decided each batch. Replay judges each batch under that revision, so a new policy never changes what an earlier record meant. An earlier revision only replays: it consults no annotator, authority, or audience source. A deployment can therefore remove a connection together with the policy rules that used it. No running agent is left asking a service that is gone.
+
+**A publish orders against every decision.** A decision commits only while the revision that made it is still the head. The store checks this in the same transaction that appends the decision. After a publish commits, every decision that commits was made under the published revision. A decision made under the previous revision is refused at commit. The runtime then makes it again under the new head, including any consult it needs, and the agent receives that answer. A publish is a compare-and-swap on the head the publisher read, so concurrent publishers cannot overwrite each other.
+
+**A tool call that is already running finishes.** Its release committed before the publish, so the call completes. A publish does not wait for running tool calls. The release recorded the call's terms: its `delta`, its tags, and the effects it reserved. The result's label is the meet of those terms and the head's declaration of the call, so a new revision can tighten a running call's result but never loosen it. If the release bound an output sanitizer that the head no longer declares, the result is withheld from the agent.
+
+**A pending remedy does not survive a publish.** An offer that the agent has not executed, and an approval that it has not spent, were planned under the previous revision. After a publish, neither one stands. Executing the offer consults no authority, and the runtime tells the agent to propose the call again. The head then decides the call and offers its own remedy plans, so the agent continues under the current policy.
+
+**Trust levels carry across by name.** A label records its trust as a rank in the policy's trust chain. When a revision renames or reorders the chain, every label a family holds moves to the rank with the same name. This includes labels stored for the family outside its log, such as a peer message held for it. A value at a rank the new chain drops falls to the lowest rank. A return floor at a dropped rank rises to the highest. A chain change never raises the trust of data or lowers a requirement. Audience atoms are names, so they carry across unchanged.
+
+**Effect kinds match by name.** A revision that renames an effect kind starts a new history for the new name. A `requires.effects` check on the new name does not see effects recorded under the old name.
+
+## Example: sharing information from a private customer ticket
+
+The example shows an agent reading a private customer ticket and then trying to share information from it.
+
+The agent has three tools:
+
+- **`get_ticket_from_crm`:** Read a customer support ticket.
+- **`send_email`:** Send an email to a recipient.
+- **`file_github_issue`:** Create a public GitHub issue.
+
+The policy says:
+
+- CRM tickets are internal.
+- Emails may only go to people authorized to see the session's data.
+- Public GitHub issues cannot contain internal data.
+
+The policy also allows a sanitizer to remove customer details and a person to approve sharing outside the company.
+
+See the [customer-ticket policy example](/contracts#example-customer-ticket-policy) for the tool rules and service configuration.
+
+### What happens when the agent reads a ticket?
+
+The agent has three options when reading the ticket:
+
+1. **Read the original ticket itself.** Its session becomes internal. It can email colleagues, but posting publicly or emailing an external recipient requires approval.
+2. **Have a sanitizer remove customer details first.** The agent sees only the cleaned ticket. This example's policy permits that cleaned version to be shared publicly.
+3. **Have a subagent read the original ticket.** The subagent examines the private information and returns a sanitized result. The main agent never sees the private details and can use the cleaned result in public tools.
+
+:::fig-two-endings:::
+
+Suppose the agent takes the first option: it reads the original ticket and tries to email an external auditor at `auditor@external.com`. OpenAPPA blocks the email and offers human approval. If approved, that particular email is sent. Future external emails still need their own approval.
+
+The agent can still finish useful work with private data, but sharing it outside the company requires either cleaning it or obtaining permission.

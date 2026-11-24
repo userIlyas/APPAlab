@@ -1,0 +1,271 @@
+#!/bin/sh
+# Install the released `appa` binary for this machine:
+#
+#   curl -fsSL https://openappa.com/install.sh | sh
+#
+# Every release ships one archive per platform beside a SHA256SUMS list. The
+# script resolves the latest release tag (or `APPA_VERSION`), downloads the
+# archive and the list from that one release, verifies the digest, and installs
+# `appa` into `APPA_INSTALL_DIR` (default `~/.local/bin`). It never runs
+# `appa plugin install`: changing the Claude Code profile is the person's call.
+#
+# When the GitHub CLI (`gh`) is installed and signed in, the script also checks
+# the archive's build provenance: OpenAPPA's release workflow on main must have
+# attested exactly these bytes. `APPA_VERIFY_PROVENANCE` is `auto` (the
+# default: check when gh can), `require` (refuse without the check) or `skip`.
+#
+# Linux and macOS on x86_64 and aarch64 only. Windows users unpack the zip from
+# the releases page. `APPA_REPOSITORY_URL` exists for appa-install-test.sh,
+# which serves a local release.
+set -eu
+
+repository=${APPA_REPOSITORY_URL:-https://github.com/archestra-ai/OpenAPPA}
+# Provenance always names the project's own repository and release workflow,
+# wherever the archive was downloaded from.
+provenance_repository=archestra-ai/OpenAPPA
+provenance=${APPA_VERIFY_PROVENANCE:-auto}
+tag_pattern='^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$'
+
+fail() {
+  printf 'appa-install: %s\n' "$1" >&2
+  exit 1
+}
+
+# Terminal dress, matching the vocabulary the Rust half prints: a mark in the
+# left margin, names in one column, commands set apart. One decision for the
+# whole run, and plain unless both streams are a terminal that has not asked to
+# go without escapes -- so a redirected stream never receives them.
+if [ -t 1 ] && [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != dumb ]; then
+  dim=$(printf '\033[2m')
+  bold=$(printf '\033[1m')
+  green=$(printf '\033[1;32m')
+  off=$(printf '\033[0m')
+else
+  dim=''
+  bold=''
+  green=''
+  off=''
+fi
+
+# Narration goes to stderr; the receipt to stdout, where a caller reads it.
+# Success is the only mark: an install that worked says so once, and what is
+# left to do is instructions, not a warning.
+step() { printf '  %s%s%s\n' "$dim" "$1" "$off" >&2; }
+installed() { printf '\n  %s✓%s %s%s%s\n' "$green" "$off" "$bold" "$1" "$off"; }
+note() { printf '\n  %s\n' "$1"; }
+command_line() { printf '      %s%s%s\n' "$bold" "$1" "$off"; }
+friendly() { case $1 in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
+
+command -v curl >/dev/null 2>&1 || fail "curl is required"
+case $provenance in
+  auto | require | skip) ;;
+  *) fail "APPA_VERIFY_PROVENANCE must be auto, require or skip" ;;
+esac
+# The digest comes from the same host as the archive, so the transport must be
+# HTTPS, redirects included. Only appa-install-test.sh's loopback release is
+# served over plain HTTP.
+case $repository in
+  http://127.0.0.1:*) protocols=http,https ;;
+  *) protocols=https ;;
+esac
+# A stalled release host fails the install instead of holding the shell.
+fetch() {
+  curl -fsS --proto "=$protocols" --proto-redir "=$protocols" \
+    --connect-timeout 15 --speed-limit 1024 --speed-time 30 "$@"
+}
+
+if command -v sha256sum >/dev/null 2>&1; then
+  digest() { sha256sum "$1" | cut -d' ' -f1; }
+elif command -v shasum >/dev/null 2>&1; then
+  digest() { shasum -a 256 "$1" | cut -d' ' -f1; }
+else
+  fail "sha256sum or shasum is required to verify the download"
+fi
+
+system=$(uname -s)
+machine=$(uname -m)
+case $system in
+  Linux) platform=unknown-linux-gnu ;;
+  Darwin) platform=apple-darwin ;;
+  *) fail "no release binary for $system; see $repository/releases" ;;
+esac
+case $machine in
+  x86_64 | amd64) architecture=x86_64 ;;
+  aarch64 | arm64) architecture=aarch64 ;;
+  *) fail "no release binary for $system $machine; see $repository/releases" ;;
+esac
+archive=appa-$architecture-$platform.tar.gz
+
+if [ -n "${APPA_INSTALL_DIR:-}" ]; then
+  install_dir=$APPA_INSTALL_DIR
+elif [ -n "${HOME:-}" ]; then
+  install_dir=$HOME/.local/bin
+else
+  fail "set APPA_INSTALL_DIR: HOME is not set"
+fi
+# Hooks and `clappa` are rendered with this path, from any working directory.
+case $install_dir in
+  /*) ;;
+  *) fail "APPA_INSTALL_DIR must be an absolute path" ;;
+esac
+# mv would move the new binary inside a directory at the target and succeed.
+[ ! -d "$install_dir/appa" ] ||
+  fail "$install_dir/appa is a directory; move it aside and rerun"
+
+if [ -n "${APPA_VERSION:-}" ]; then
+  tag=$APPA_VERSION
+else
+  latest=$(fetch -o /dev/null -w '%{redirect_url}' "$repository/releases/latest") ||
+    fail "could not resolve the latest release from $repository"
+  case $latest in
+    "$repository/releases/tag/"*) tag=${latest#"$repository/releases/tag/"} ;;
+    *) fail "unexpected redirect for the latest release: $latest" ;;
+  esac
+fi
+# The character check comes first because `grep -q` succeeds when any single
+# line matches, so a multi-line value would otherwise pass a guard whose whole
+# job is to constrain what reaches a URL.
+case $tag in
+  *[!0-9A-Za-z.-]*) fail "not a release tag: $tag" ;;
+esac
+printf '%s\n' "$tag" | grep -Eq "$tag_pattern" || fail "not a release tag: $tag"
+
+work=$(mktemp -d)
+staged=
+cleanup() {
+  rm -rf "$work"
+  if [ -n "$staged" ]; then
+    rm -f "$staged"
+  fi
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT HUP TERM
+
+# The list and the archive come from the same pinned release, never from
+# `latest`, so a release published mid-run cannot pair one with the other.
+release=$repository/releases/download/$tag
+step "$(printf 'Downloading appa %s for %s-%s' "$tag" "$architecture" "$platform")"
+fetch -L -o "$work/SHA256SUMS" "$release/SHA256SUMS" ||
+  fail "could not download $release/SHA256SUMS"
+fetch -L -o "$work/$archive" "$release/$archive" ||
+  fail "could not download $release/$archive"
+
+listed=$(grep -E "^[0-9a-f]{64}  $archive\$" "$work/SHA256SUMS" || true)
+[ "$(printf '%s\n' "$listed" | grep -c .)" -eq 1 ] ||
+  fail "SHA256SUMS does not list $archive exactly once"
+expected=${listed%% *}
+actual=$(digest "$work/$archive")
+[ "$actual" = "$expected" ] || fail "checksum mismatch for $archive"
+
+# The checksum proves the download arrived intact; provenance proves OpenAPPA's
+# release workflow, on main and on a GitHub-hosted runner, built these bytes.
+# Releases sign it in the shared archestra-ai/.github attest-provenance.yml, a
+# job no build step runs in; releases before that signed in release.yml itself.
+# Without gh (or signed out) `auto` installs on the checksum alone. A failed
+# check is never skipped.
+if [ "$provenance" != skip ]; then
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    step "$(printf 'Verifying the build provenance of %s' "$archive")"
+    verified=
+    for signer in archestra-ai/.github/.github/workflows/attest-provenance.yml \
+      "$provenance_repository/.github/workflows/release.yml"; do
+      if gh attestation verify "$work/$archive" \
+        --repo "$provenance_repository" \
+        --signer-workflow "$signer" \
+        --source-ref refs/heads/main \
+        --deny-self-hosted-runners >/dev/null 2>>"$work/provenance.err"; then
+        verified=1
+        break
+      fi
+    done
+    if [ -z "$verified" ]; then
+      cat "$work/provenance.err" >&2
+      fail "$archive has no build provenance from OpenAPPA's release workflow; APPA_VERIFY_PROVENANCE=skip installs on the checksum alone"
+    fi
+  elif [ "$provenance" = require ]; then
+    fail "APPA_VERIFY_PROVENANCE=require needs the GitHub CLI (gh), signed in"
+  fi
+fi
+
+# The digest is published by the same host that serves the archive, so it
+# proves the download arrived intact, not that the release is honest. The Rust
+# half of this project validates every archive entry before extracting one;
+# match that here rather than rely on tar, whose treatment of `..` and absolute
+# members differs between GNU and BSD.
+entries=$(tar -tzf "$work/$archive") || fail "$archive is not a readable archive"
+[ "$(printf '%s\n' "$entries" | grep -c .)" -le 16 ] ||
+  fail "$archive holds more entries than a release archive carries"
+if ! printf '%s\n' "$entries" | while IFS= read -r entry; do
+  case $entry in
+    /* | .. | ../* | */.. | */../*) exit 1 ;;
+  esac
+done; then
+  fail "$archive holds an entry that escapes the directory it unpacks into"
+fi
+
+mkdir "$work/extract" || fail "could not create a staging directory"
+tar -xzf "$work/$archive" -C "$work/extract" || fail "could not unpack $archive"
+# A symlink would pass -f by resolving elsewhere, and that elsewhere is what
+# would be installed.
+if [ ! -f "$work/extract/appa" ] || [ -L "$work/extract/appa" ]; then
+  fail "$archive does not contain appa"
+fi
+
+# An installed appa is replaced only by one that runs here.
+version=$("$work/extract/appa" --version) ||
+  fail "the $tag binary does not run on this system; Linux needs glibc 2.34 or newer"
+[ -n "$version" ] || fail "the $tag binary reported no version"
+
+# The previous appa stays in place until the new one is completely written
+# beside it, so a failed copy never leaves the directory without a working
+# binary.
+mkdir -p "$install_dir" || fail "could not create $install_dir"
+staged=$install_dir/appa.$$.new
+install -m 755 "$work/extract/appa" "$staged" ||
+  fail "could not write $staged"
+mv -f "$staged" "$install_dir/appa" || fail "could not replace $install_dir/appa"
+staged=
+installed "Installed $version to $(friendly "$install_dir/appa")"
+case :${PATH:-}: in
+  *":$install_dir:"*)
+    note 'Next, protect Claude Code:'
+    command_line 'appa plugin install claude-code'
+    ;;
+  *)
+    # Not on PATH is the ordinary case for ~/.local/bin, so it reads as the
+    # first of two steps rather than something that went wrong.
+    #
+    # Naming the file and reloading it is the whole step: a reader should not
+    # have to know which profile their shell reads, nor that a new shell is
+    # needed. fish keeps its own path command. A shell this does not know gets
+    # the bare line to place itself, which is all that can honestly be said.
+    add_to_path=
+    case ${SHELL##*/} in
+      fish)
+        add_to_path="fish_add_path $install_dir"
+        ;;
+      bash)
+        # The tilde stays unexpanded on purpose: this is a line the reader
+        # pastes, and their shell expands it when they do.
+        if [ "$(uname -s)" = Darwin ]; then
+          add_to_path="echo 'export PATH=\"$install_dir:\$PATH\"' >> ~/.bash_profile && source ~/.bash_profile"
+        else
+          add_to_path="echo 'export PATH=\"$install_dir:\$PATH\"' >> ~/.bashrc && source ~/.bashrc"
+        fi
+        ;;
+      zsh)
+        add_to_path="echo 'export PATH=\"$install_dir:\$PATH\"' >> ~/.zshrc && source ~/.zshrc"
+        ;;
+    esac
+    if [ -n "$add_to_path" ]; then
+      note 'Next, add appa to your PATH. Run this once:'
+      command_line "$add_to_path"
+    else
+      note 'Next, add appa to your PATH. Put this in your shell profile:'
+      command_line "export PATH=\"$install_dir:\$PATH\""
+    fi
+    note 'Then protect Claude Code:'
+    command_line 'appa plugin install claude-code'
+    ;;
+esac
+printf '\n'

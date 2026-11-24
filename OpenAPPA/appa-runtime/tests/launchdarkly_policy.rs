@@ -1,0 +1,175 @@
+//! LaunchDarkly battery: coarse internal reads; every write needs review, deletes are sensitive.
+use crate::common;
+
+use appa_runtime::api::{AuditEvent, AuditLabel, RemedyOutcome, Runtime};
+use appa_runtime_api::{HookDecision, ProposedCall};
+use common::{actor, battery_runtime, members_source, propose, ran, raw, root, unsanitized_offer_of};
+use std::sync::Arc;
+
+fn call(tool: &str, request: serde_json::Value) -> ProposedCall {
+    ProposedCall {
+        tool: format!("mcp/launchdarkly/{tool}"),
+        arguments: raw(serde_json::json!({ "request": request })),
+        cwd: None,
+    }
+}
+
+async fn runtime(dir: &tempfile::TempDir) -> Arc<Runtime> {
+    let source = members_source().await;
+    battery_runtime(
+        dir.path(),
+        "launchdarkly",
+        &format!(
+            r#"[policy]
+version = 2
+
+[policy.audience]
+internal = ["people:members"]
+
+[[policy.authority]]
+name = "launchdarkly-operator"
+permits = {{ attention = ["launchdarkly-review"] }}
+
+[externals]
+timeout_ms = 30000
+review_timeout_ms = 600000
+max_body_bytes = 1048576
+
+[externals.authorities.launchdarkly-operator]
+# Approves when asked. The stock "approve" is applied at the block, which this test reads.
+command = ["/bin/sh", "-c", 'cat > /dev/null; printf "%s" "{{\"version\":1,\"answer\":{{\"ruling\":\"approve\"}}}}"']
+
+[externals.audience.people]
+url = "{source}"
+selectors = [{{ template = "members", feeds = "internal" }}]
+"#
+        ),
+    )
+    .await
+}
+
+/// A flag read narrows the trajectory to internal and enters `suspicious`: what it
+/// returned cannot then be written back to LaunchDarkly as trusted configuration.
+#[tokio::test]
+async fn a_read_is_internal_and_suspicious() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime(&dir).await;
+
+    let read = call(
+        "get-feature-flag",
+        serde_json::json!({ "projectKey": "acme", "featureFlagKey": "checkout-v2" }),
+    );
+    let offer = unsanitized_offer_of(&propose(&runtime, read.clone()).await);
+    assert!(matches!(
+        runtime.execute_remedy(&actor(), offer).await,
+        RemedyOutcome::Authorized { .. }
+    ));
+    assert_eq!(
+        propose(&runtime, read.clone()).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    ran(&runtime, read).await;
+
+    // Internal already: the audit log and the AI Config reads run outright.
+    for read in [
+        call(
+            "get-audit-log-entries",
+            serde_json::json!({ "spec": "proj/acme:env/*:flag/checkout-v2" }),
+        ),
+        call("list-ai-configs", serde_json::json!({ "projectKey": "acme" })),
+    ] {
+        assert_eq!(
+            propose(&runtime, read.clone()).await,
+            HookDecision::AllowCall { spawn: None },
+            "{}",
+            read.tool
+        );
+        ran(&runtime, read).await;
+    }
+
+    // Every read admitted its result as suspicious data the organization's members may see.
+    let admitted: Vec<AuditLabel> = runtime
+        .audit(&root())
+        .unwrap()
+        .into_iter()
+        .filter_map(|entry| match entry.event {
+            AuditEvent::Admitted { label } => Some(label),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        admitted,
+        vec![
+            AuditLabel {
+                trust: "suspicious".to_string(),
+                audience: "internal".to_string()
+            };
+            3
+        ]
+    );
+
+    // Suspicious configuration cannot be written back, reviewer or not.
+    for write in [
+        call(
+            "update-feature-flag",
+            serde_json::json!({ "projectKey": "acme", "featureFlagKey": "checkout-v2", "patchWithComment": {} }),
+        ),
+        call(
+            "delete-feature-flag",
+            serde_json::json!({ "projectKey": "acme", "featureFlagKey": "checkout-v2" }),
+        ),
+    ] {
+        assert!(
+            !matches!(propose(&runtime, write.clone()).await, HookDecision::AllowCall { .. }),
+            "{}",
+            write.tool
+        );
+    }
+}
+
+/// A write's own result label never gates it: a trusted write waits only for the reviewer,
+/// whose mandate attends the mark and nothing else, and records its effect: the sensitive
+/// kind for a delete, the ordinary kind for a change.
+#[tokio::test]
+async fn a_write_needs_review_and_records_its_effect() {
+    for (write, effect) in [
+        (
+            call(
+                "create-feature-flag",
+                serde_json::json!({ "projectKey": "acme", "featureFlagBody": { "key": "checkout-v2", "name": "Checkout v2" } }),
+            ),
+            "launchdarkly.changed",
+        ),
+        (
+            call(
+                "delete-ai-config",
+                serde_json::json!({ "projectKey": "acme", "configKey": "support-bot" }),
+            ),
+            "launchdarkly.sensitive",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime(&dir).await;
+        let decision = propose(&runtime, write.clone()).await;
+        assert!(!matches!(decision, HookDecision::AllowCall { .. }), "{}", write.tool);
+        assert!(matches!(
+            runtime.execute_remedy(&actor(), unsanitized_offer_of(&decision)).await,
+            RemedyOutcome::Authorized { .. }
+        ));
+        assert_eq!(
+            propose(&runtime, write.clone()).await,
+            HookDecision::AllowCall { spawn: None }
+        );
+        ran(&runtime, write).await;
+        let effects: Vec<_> = runtime
+            .audit(&root())
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| match entry.event {
+                AuditEvent::Released { tool, effects, .. } if tool.starts_with("mcp/launchdarkly/") => Some(effects),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(effects, vec![vec![effect]]);
+    }
+}

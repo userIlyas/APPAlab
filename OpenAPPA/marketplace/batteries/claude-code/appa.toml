@@ -1,0 +1,251 @@
+# Claude Code rules: the maps that bind the `coding` and `file-tracker`
+# batteries' canonical tools to Claude Code's own, then the built-in tools only
+# Claude Code offers. The built-in tool set varies by Claude Code version;
+# regenerate the list from a live session when it drifts. Include the `coding`
+# battery beside this one, and the `file-tracker` battery before both to keep a
+# label on every file.
+
+# Claude Code spells each argument as the canonical tools do. Bash and
+# PowerShell results stay confined so a sanitizer the root declares can run
+# on them. A root that binds `coding.strip-instructions` confines WebFetch
+# itself. WebSearch stays unconfined: Claude Code's replacement of its result
+# is not verified live.
+[aliases.tool.coding]
+shell = [{ name = "host/claude-code/Bash", args = { command = "command" }, confined = true }]
+powershell = [{ name = "host/claude-code/PowerShell", args = { command = "command" }, confined = true }]
+read_file = [{ name = "host/claude-code/Read", args = { file_path = "file_path" } }]
+search_files = [{ name = "host/claude-code/Grep", args = { path = "path" } }]
+write_file = [{ name = "host/claude-code/Write", args = { file_path = "file_path" } }]
+edit_file = [{ name = "host/claude-code/Edit", args = { file_path = "file_path" } }]
+fetch_url = [{ name = "host/claude-code/WebFetch", args = { url = "url" } }]
+web_search = [{ name = "host/claude-code/WebSearch" }]
+
+# The `file-tracker` battery's tools, where a deployment includes it. Its rules
+# come first, so they decide the calls of every tool this map binds; Claude
+# Code's Bash names the files and hosts a command reaches only under `clappa`.
+# Without the battery, this map binds nothing and the `coding` rules decide.
+[aliases.tool.file-tracker]
+shell = [{ name = "host/claude-code/Bash", args = { network_hosts = "network_hosts" } }]
+read = [{ name = "host/claude-code/Read" }]
+write = [{ name = "host/claude-code/Write" }]
+edit = [{ name = "host/claude-code/Edit" }]
+unmediated = [
+  { name = "host/claude-code/PowerShell" },
+  { name = "host/claude-code/Monitor" },
+  { name = "host/claude-code/Grep" },
+  { name = "host/claude-code/NotebookEdit" },
+]
+
+[policy]
+version = 2
+
+# Monitor runs a shell command, or opens a WebSocket, and its output reaches
+# the model as later notifications that no tool result carries. Its Annotator
+# labels the call before it runs, as the `coding` battery's shell Annotator does.
+[[policy.annotator]]
+name = "claude-code.monitor-requirements"
+builtin = "claude-code"
+
+[[policy.tool]]
+name = "host/claude-code/Monitor"
+description = "Runs a shell command or opens a WebSocket and streams each output line to the agent."
+annotator = "claude-code.monitor-requirements"
+
+# --- tools whose results stay inside the session's trust boundary ---
+
+[[policy.tool]]
+name = "host/claude-code/AskUserQuestion"
+delta = {}
+
+# An artifact is private to this user until they share it from claude.ai, so
+# publishing, its data and its comments reach `self`.
+[[policy.tool]]
+name = "host/claude-code/Artifact"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/ArtifactComments"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/ArtifactData"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/BashOutput"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/CronCreate"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/CronDelete"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/CronList"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/EndConversation"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/EnterPlanMode"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/EnterWorktree"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/ExitPlanMode"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/ExitWorktree"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/Glob"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/KillShell"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/LSP"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/ListAgents"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/ListMcpResourcesTool"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/NotebookEdit"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/PushNotification"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/ReadMcpResourceDirTool"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/ReportFindings"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/ScheduleWakeup"
+delta = {}
+
+# A feedback draft is queued locally and sent only after this user approves it.
+[[policy.tool]]
+name = "host/claude-code/SendFeedback"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/SendUserFile"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/Skill"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/SlashCommand"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/TaskCreate"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/TaskGet"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/TaskList"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/TaskOutput"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/TaskStop"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/TaskUpdate"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/TodoWrite"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/ToolSearch"
+delta = {}
+
+# --- tools that bring outside content into the session ---
+
+# An inbox message and a resource of any MCP server arrive without the label
+# of whoever wrote them. GitHub notifications carry comments anyone can write.
+[[policy.tool]]
+name = "host/claude-code/FetchInboxMessage"
+delta = { trust = "suspicious" }
+
+[[policy.tool]]
+name = "host/claude-code/ReadMcpResourceTool"
+delta = { trust = "suspicious" }
+
+[[policy.tool]]
+name = "host/claude-code/ReadNotifications"
+delta = { trust = "suspicious" }
+
+# A claude.ai design-system project is shared with this user's organization.
+[[policy.tool]]
+name = "host/claude-code/DesignSync"
+requires = { audience = { contains = ["internal"] } }
+delta = {}
+
+# A routine runs in a cloud session this policy does not protect, so its
+# prompt may reach anyone. Run titles and logs quote what that session read
+# from repositories, issues and web pages.
+[[policy.tool]]
+name = "host/claude-code/RemoteTrigger(action:list_runs)"
+delta = { trust = "suspicious" }
+
+[[policy.tool]]
+name = "host/claude-code/RemoteTrigger(action:get_run_log)"
+delta = { trust = "suspicious" }
+
+[[policy.tool]]
+name = "host/claude-code/RemoteTrigger(action:list)"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/RemoteTrigger(action:get)"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/RemoteTrigger"
+requires = { audience = { contains = ["internal"] } }
+delta = {}
+
+# A name belongs to a session of the same organization or user, so a send is an
+# internal sink. A root whose runtime verifies protected peers precedes this
+# rule with its exceptions for their addresses.
+[[policy.tool]]
+name = "host/claude-code/SendMessage"
+requires = { audience = { contains = ["internal"] } }
+delta = {}

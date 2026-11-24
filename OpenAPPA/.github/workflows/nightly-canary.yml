@@ -1,0 +1,153 @@
+name: Nightly Canary
+
+# Nightly defended-vs-empty canary: `bench-corp canary` runs both APPA arms
+# (guarded `appa`, empty `appa-open`) over the full scenario set under the
+# redteam-chaos prompt profile, on the pinned model pair. Red means the
+# harness broke or the defended arm leaked — never a model-score dip; the
+# empty arm is reported for context only. The run summary also subtracts the
+# empty arm's provider-reported model tokens from the defended arm's over
+# whole trajectories. This is not a count of APPA-added prompt tokens.
+#
+# Results stay internal: the run directory is uploaded as a workflow
+# artifact, the verdict goes to Slack, and nothing is committed back.
+#
+# Model access: the OpenRouter key is the ci-appa-canary-openrouter-api-key
+# secret in GCP Secret Manager, not a GitHub secret. The keyless account
+# ci-appa-canary reads it and nothing else, and trusts only this file on main
+# (infra gcp/workload_identity/ci-secrets.tf and ci-workflow-trust.tf). To
+# rotate the key, add a new version (infra gcp/workload_identity/README.md,
+# "Rotating a CI secret").
+# Slack: APPA_CANARY_SLACK_WEBHOOK_URL in the `canary` environment (incoming
+# webhook; skipped when absent). The environment admits main only.
+# Optional GCS copy of the run records: set the APPA_CANARY_GCS_BUCKET
+# repository variable (bucket name, no gs:// prefix). The upload uses
+# appa-demo-image-push, which trusts this file only on main.
+
+on:
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: nightly-canary
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    name: Defended vs empty
+    runs-on: ubuntu-latest
+    # Holds the Slack webhook; deploys from main only.
+    environment:
+      name: canary
+      deployment: false # A secrets and branch gate; nothing is deployed.
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      id-token: write # Workload Identity Federation: the key read and the GCS upload.
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Setup Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt --no-self-update && rustup default stable
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+
+      # Authenticates as the read-only secrets account. The GCS upload below
+      # authenticates again as appa-demo-image-push, which replaces it.
+      - name: Authenticate to read the canary key
+        uses: archestra-ai/.github/actions/google-auth@v1.25.2
+        with:
+          service_account: ci-appa-canary@friendly-path-465518-r6.iam.gserviceaccount.com
+          workload_identity_provider: projects/354887056155/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider
+
+      - name: Read the canary key
+        id: canary-secrets
+        uses: google-github-actions/get-secretmanager-secrets@v3.0.0
+        with:
+          secrets: |-
+            openrouter_api_key:friendly-path-465518-r6/ci-appa-canary-openrouter-api-key
+
+      - name: Check the canary key
+        env:
+          OPENROUTER_API_KEY: ${{ steps.canary-secrets.outputs.openrouter_api_key }}
+        run: |
+          # A placeholder version (not an OpenRouter key) would otherwise fail
+          # every model call and read as a harness failure.
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "::error::ci-appa-canary-openrouter-api-key is empty. Add a version in Secret Manager (infra gcp/workload_identity/README.md, \"Rotating a CI secret\")."
+            exit 1
+          fi
+          echo "::add-mask::$OPENROUTER_API_KEY"
+          case "$OPENROUTER_API_KEY" in
+            sk-or-*) ;;
+            *)
+              echo "::error::ci-appa-canary-openrouter-api-key does not hold an OpenRouter key (no sk-or- prefix). Add a version with the real key."
+              exit 1
+              ;;
+          esac
+
+      - name: Run canary
+        env:
+          OPENROUTER_API_KEY: ${{ steps.canary-secrets.outputs.openrouter_api_key }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: uv run --project bench/corp bench-corp canary
+
+      - name: Locate run records
+        if: always()
+        id: rundir
+        run: |
+          dir=$(find bench/corp/runs -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n 1 || true)
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: Upload run records
+        if: ${{ always() && steps.rundir.outputs.dir != '' }}
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: canary-run-${{ github.run_id }}
+          path: ${{ steps.rundir.outputs.dir }}
+
+      - name: Authenticate to Google Cloud
+        if: ${{ always() && vars.APPA_CANARY_GCS_BUCKET != '' && steps.rundir.outputs.dir != '' }}
+        uses: archestra-ai/.github/actions/google-auth@v1.25.2
+        with:
+          service_account: appa-demo-image-push@friendly-path-465518-r6.iam.gserviceaccount.com
+          workload_identity_provider: projects/354887056155/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider
+
+      - name: Set up Google Cloud
+        if: ${{ always() && vars.APPA_CANARY_GCS_BUCKET != '' && steps.rundir.outputs.dir != '' }}
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Upload run records to GCS
+        if: ${{ always() && vars.APPA_CANARY_GCS_BUCKET != '' && steps.rundir.outputs.dir != '' }}
+        env:
+          BUCKET: ${{ vars.APPA_CANARY_GCS_BUCKET }}
+          RUN_DIR: ${{ steps.rundir.outputs.dir }}
+        run: gcloud storage cp -r "$RUN_DIR" "gs://$BUCKET/canary/"
+
+      - name: Notify Slack
+        if: always()
+        env:
+          WEBHOOK: ${{ secrets.APPA_CANARY_SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_DIR: ${{ steps.rundir.outputs.dir }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then
+            echo "APPA_CANARY_SLACK_WEBHOOK_URL not configured; skipping"
+            exit 0
+          fi
+          if [ -n "$RUN_DIR" ] && [ -f "$RUN_DIR/slack.json" ]; then
+            curl -sf -X POST -H 'Content-Type: application/json' \
+              --data @"$RUN_DIR/slack.json" "$WEBHOOK"
+          else
+            printf '{"text":"🔥 APPA nightly canary crashed before reporting: %s"}' "$RUN_URL" |
+              curl -sf -X POST -H 'Content-Type: application/json' --data @- "$WEBHOOK"
+          fi

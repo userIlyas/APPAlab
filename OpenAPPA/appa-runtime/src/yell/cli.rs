@@ -1,0 +1,459 @@
+//! `appa yell` — telling the OpenAPPA team that this deployment is in the way.
+//!
+//! Two questions, always in this order, and the report is finished before the second one is
+//! asked: a person approves the exact file that will leave the machine, not a promise about
+//! it. `-y` answers both with yes.
+//!
+//! The document is built by the runtime, not here. That is the point of the split: this
+//! process never holds an unclassified byte of a session, and the only thing it adds to the
+//! report is the message the person typed.
+
+use std::io::{BufRead, IsTerminal, Read, Write};
+use std::process::ExitCode;
+use std::time::Duration;
+
+use super::client;
+use super::report::{Finished, Origin, Report, ReportId, UnreachableClass, YellMessage};
+use super::{Author, Mode, OmittedReason};
+
+/// How long the runtime gets to build a report. Longer than a hook's budget: a long session's
+/// facts are stripped, serialized and gzipped before the answer comes back.
+const BUILD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The marks a person reads the run by: a question, a step that succeeded, one that did not.
+const ASK: &str = "?";
+const TICK: &str = "✓";
+const CROSS: &str = "✗";
+const WARN: &str = "!";
+
+/// Run one yell to completion.
+pub fn run(url: &str, yes: bool, trajectory: Option<String>, message: Vec<String>) -> ExitCode {
+    // Before anything is asked: a build with nowhere to send to has nothing to ask about.
+    let Some((receiver, source)) = client::Receiver::resolve() else {
+        return fail(&client::SendFailure::NoReceiver);
+    };
+    let message = match message_from(&message) {
+        Ok(message) => message,
+        Err(refusal) => return fail(&refusal),
+    };
+    let mode = match yes {
+        true => Mode::Pseudonymized,
+        false => ask_pseudonymization(),
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => return fail(&format!("no async runtime: {error}")),
+    };
+    runtime.block_on(yell(url, yes, trajectory.as_deref(), message, mode, receiver, source))
+}
+
+async fn yell(
+    url: &str,
+    yes: bool,
+    trajectory: Option<&str>,
+    message: YellMessage,
+    mode: Mode,
+    receiver: client::Receiver,
+    source: client::Source,
+) -> ExitCode {
+    let finished = match build(url, trajectory, &message, mode).await {
+        Ok(finished) => finished,
+        Err(class) => match local(message, mode, class) {
+            Ok(finished) => finished,
+            Err(oversize) => return fail(&oversize),
+        },
+    };
+    let written = match super::report::write(finished, &std::env::temp_dir()) {
+        Ok(written) => written,
+        Err(error) => return fail(&error),
+    };
+    let path = written.path.display();
+    println!();
+    println!("{TICK} Report written to {path}");
+    if let Some(warning) = omission_warning(&written.finished) {
+        println!("{WARN} {warning}");
+        if yes {
+            println!("  --yes is set, so this incomplete report will still be sent.");
+        }
+    }
+    println!();
+    let destination = destination(source);
+    match yes {
+        true => println!("Sending it to {destination}."),
+        false => {
+            if !confirm(
+                &format!("Share it with {destination}?"),
+                true,
+                &mut std::io::stdin().lock(),
+            ) {
+                println!();
+                println!("Not sent. The report stays at {path}.");
+                return ExitCode::SUCCESS;
+            }
+        }
+    }
+    println!();
+    match client::send(&written.finished, &receiver).await {
+        Ok(receipt) => {
+            let already = match receipt.duplicate {
+                true => " (we already had this one)",
+                false => "",
+            };
+            println!(
+                "{TICK} Sent{already}, thank you. Your reference is {}.",
+                reference(&receipt.receipt_id)
+            );
+            ExitCode::SUCCESS
+        }
+        Err(failure) => {
+            let code = fail(&failure);
+            eprintln!("  The report stays at {path}.");
+            code
+        }
+    }
+}
+
+/// Where the report goes, as the person is told it. Whoever set an override knows where it
+/// points, so the address itself is not repeated; the tag says only that one is in effect.
+fn destination(source: client::Source) -> &'static str {
+    match source {
+        client::Source::CompiledIn => "the OpenAPPA team",
+        client::Source::Environment => "the OpenAPPA team (via APPA_YELL_ENDPOINT)",
+    }
+}
+
+/// The start of a receipt id: enough for a person to quote and the team to find, and short
+/// enough to read aloud.
+fn reference(receipt_id: &str) -> &str {
+    receipt_id.get(..10).unwrap_or(receipt_id)
+}
+
+/// One failure, on stderr, and the exit code that goes with it.
+fn fail(error: &impl std::fmt::Display) -> ExitCode {
+    eprintln!("{CROSS} appa yell: {error}");
+    ExitCode::FAILURE
+}
+
+/// Ask the runtime for the whole document.
+///
+/// This request carries the message the person has just typed and has not yet agreed to send
+/// anywhere, so it must reach the runtime on this machine or nothing at all. The endpoint is a
+/// loopback literal, checked here rather than resolved; no proxy is consulted, whatever the
+/// environment says; and a redirect is not followed, because a redirect is another
+/// destination.
+async fn build(
+    url: &str,
+    trajectory: Option<&str>,
+    message: &YellMessage,
+    mode: Mode,
+) -> Result<Finished, UnreachableClass> {
+    let endpoint = runtime_report_url(url).ok_or(UnreachableClass::NotLoopback)?;
+    // `reqwest` refuses to build any client until a provider is installed, TLS or not.
+    crate::tls::install_crypto_provider();
+    let client = reqwest::Client::builder()
+        .timeout(BUILD_TIMEOUT)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| UnreachableClass::NotListening)?;
+    let answer = client
+        .post(endpoint)
+        .json(&serde_json::json!({
+            "message": message,
+            "pseudonymize": mode == Mode::Pseudonymized,
+            "trajectory": trajectory,
+        }))
+        .send()
+        .await
+        .map_err(|error| match error.is_timeout() {
+            true => UnreachableClass::Timeout,
+            false => UnreachableClass::NotListening,
+        })?;
+    let status = answer.status();
+    if !status.is_success() {
+        return Err(UnreachableClass::Refused {
+            status: status.as_u16(),
+        });
+    }
+    // Bounded by what a report may weigh, because whatever is on that port has not earned
+    // the right to decide how much memory this process commits.
+    let plain = client::bounded_body(answer, super::report::MAX_PLAIN_BYTES)
+        .await
+        .map_err(|refusal| match refusal {
+            client::BodyRefusal::Transport => UnreachableClass::Timeout,
+            client::BodyRefusal::TooLarge => UnreachableClass::NotARuntime,
+        })?;
+    // Something answered on the runtime's port. Whether it *is* the runtime is a different
+    // question, and these bytes are about to be written to disk and offered for sending.
+    Finished::of(plain)
+        .ok()
+        .filter(|finished| is_a_report(&finished.plain))
+        .ok_or(UnreachableClass::NotARuntime)
+}
+
+/// What the person needs to know before approving a report with missing diagnostic evidence.
+/// Delivery and collection are separate outcomes: a receiver can successfully accept a
+/// report that contains no trajectory.
+fn omission_warning(finished: &Finished) -> Option<&'static str> {
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        trajectory: TrajectoryProbe,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TrajectoryProbe {
+        omitted_reason: Option<OmittedReason>,
+    }
+
+    let reason = serde_json::from_slice::<Probe>(&finished.plain)
+        .ok()?
+        .trajectory
+        .omitted_reason?;
+    Some(match reason {
+        OmittedReason::Ambiguous => {
+            "Diagnostic collection is incomplete: trajectory evidence is missing because more than one family was recently active. \
+             Nothing was guessed. Rerun with the intended harness session's family root, for example --trajectory cc:<session-id>."
+        }
+        OmittedReason::NoRecentTrajectory => {
+            "Diagnostic collection is incomplete: no matching trajectory was recently active."
+        }
+        OmittedReason::LogUnavailable => {
+            "Diagnostic collection is incomplete: the runtime could not read the selected trajectory log."
+        }
+        OmittedReason::RuntimeUnavailable => "Diagnostic collection is incomplete: the runtime could not be reached.",
+        OmittedReason::NotRequested => "Diagnostic collection is incomplete: trajectory evidence was not requested.",
+    })
+}
+
+/// Whether the answer claims to be the document this build knows how to send.
+///
+/// A discriminator, not an identity check: it separates the runtime from whatever else may be
+/// listening on that port, and nothing here proves the answer came from a runtime. Read
+/// through a probe rather than a `Value`, so a large document is not also materialized as a
+/// tree of nodes to look at one string.
+fn is_a_report(plain: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        schema: String,
+    }
+    serde_json::from_slice::<Probe>(plain).is_ok_and(|probe| probe.schema == super::report::SCHEMA)
+}
+
+/// `<url>/report`, when `url` is `http://<loopback literal>[:port]` and nothing else.
+///
+/// A host *name* is refused rather than resolved: `localhost` is whatever the resolver says
+/// today, and what this posts is a person's unreviewed words. Credentials, a path, a query and
+/// a fragment are all refused too — the runtime's own flag has none of them, so a URL carrying
+/// one was written by something other than this deployment.
+fn runtime_report_url(url: &str) -> Option<reqwest::Url> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let plain_loopback = parsed.scheme() == "http" && client::is_loopback(&parsed);
+    let bare = parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+        && matches!(parsed.path(), "" | "/");
+    match plain_loopback && bare {
+        true => parsed.join("report").ok(),
+        false => None,
+    }
+}
+
+/// The report a person gets when no runtime answers. "It is not running" is a common thing to
+/// be angry about, and this is how that anger arrives.
+fn local(message: YellMessage, mode: Mode, class: UnreachableClass) -> Result<Finished, super::Oversize> {
+    Report::unreachable(ReportId::generate(), Origin::new(Author::Cli, mode), message, class).finalize()
+}
+
+/// The message: the words on the command line, or everything on stdin, or one typed line.
+fn message_from(words: &[String]) -> Result<YellMessage, String> {
+    if !words.is_empty() {
+        return YellMessage::new(&words.join(" ")).map_err(|refusal| refusal.to_string());
+    }
+    let raw = match std::io::stdin().is_terminal() {
+        true => {
+            println!("{}", bold("What is APPA doing wrong?"));
+            prompt("> ", &mut std::io::stdin().lock()).unwrap_or_default()
+        }
+        false => {
+            let mut piped = String::new();
+            std::io::stdin()
+                .read_to_string(&mut piped)
+                .map_err(|error| format!("stdin is not readable: {error}"))?;
+            piped
+        }
+    };
+    YellMessage::new(&raw).map_err(|refusal| refusal.to_string())
+}
+
+/// The first question. Its wording is the whole of what the person is agreeing to, so it names
+/// what pseudonymization replaces rather than calling it "additional privacy".
+fn ask_pseudonymization() -> Mode {
+    println!();
+    match confirm(
+        "Pseudonymize your policy's names (tools, effects, authorities, sanitizers,\n  \
+         trust ranks, audiences) as tokens like tool-1? Your message is never changed.",
+        false,
+        &mut std::io::stdin().lock(),
+    ) {
+        true => Mode::Pseudonymized,
+        false => Mode::Baseline,
+    }
+}
+
+/// A yes/no question. A line ended with Enter that is neither yes nor no, including an empty
+/// one, takes the caller-supplied default. Input that closes before Enter answers no unless
+/// it says yes: nobody is there to accept the default.
+fn confirm(question: &str, default: bool, input: &mut impl BufRead) -> bool {
+    let suffix = match default {
+        true => "[Y/n]",
+        false => "[y/N]",
+    };
+    let Some(answer) = prompt(&format!("{ASK} {}  {suffix} ", bold(question)), input) else {
+        return false;
+    };
+    match (answer.trim().to_ascii_lowercase().as_str(), answer.ends_with('\n')) {
+        ("y" | "yes", _) => true,
+        ("n" | "no", _) | (_, false) => false,
+        (_, true) => default,
+    }
+}
+
+/// One line from the person. `None` when there is nobody there.
+fn prompt(question: &str, input: &mut impl BufRead) -> Option<String> {
+    print!("{question}");
+    std::io::stdout().flush().ok()?;
+    let mut line = String::new();
+    match input.read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(line),
+    }
+}
+
+/// Bold when a person is looking at a terminal; plain when the output is a file or a pipe.
+fn bold(text: &str) -> String {
+    match std::io::stdout().is_terminal() {
+        true => format!("\x1b[1m{text}\x1b[0m"),
+        false => text.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn words_on_the_command_line_are_one_message() {
+        let message = message_from(&["the".into(), "hook".into(), "blocked".into()]).expect("a message");
+        assert_eq!(
+            serde_json::to_value(&message).expect("a message serializes"),
+            serde_json::json!("the hook blocked")
+        );
+    }
+
+    /// Enter takes the default; a closed input is nobody agreeing to anything.
+    #[test]
+    fn a_closed_input_answers_no_and_an_empty_line_the_default() {
+        assert!(!confirm("Share it?", true, &mut &b""[..]));
+        assert!(confirm("Share it?", true, &mut &b"\n"[..]));
+        assert!(!confirm("Share it?", false, &mut &b"\n"[..]));
+        assert!(!confirm("Share it?", true, &mut &b"n\n"[..]));
+        assert!(confirm("Share it?", false, &mut &b"yes"[..]));
+        assert!(!confirm("Share it?", true, &mut &b" "[..]));
+        assert!(!confirm("Share it?", true, &mut &b"maybe"[..]));
+        assert!(confirm("Share it?", true, &mut &b"maybe\n"[..]));
+    }
+
+    #[test]
+    fn an_empty_command_line_message_is_refused() {
+        assert!(message_from(&["   ".into()]).is_err());
+    }
+
+    /// The message goes to the runtime before anyone has agreed to send it anywhere, so the
+    /// runtime has to be on this machine and named as an address rather than as a name someone
+    /// else's resolver answers.
+    #[test]
+    fn only_a_loopback_literal_is_a_runtime() {
+        for reachable in [
+            "http://127.0.0.1:8787",
+            "http://127.0.0.1:8787/",
+            "http://[::1]:8787",
+            "http://127.0.0.1",
+        ] {
+            let endpoint = runtime_report_url(reachable).unwrap_or_else(|| panic!("{reachable} is this machine"));
+            assert_eq!(endpoint.path(), "/report");
+            assert!(client::is_loopback(&endpoint));
+        }
+        for refused in [
+            "http://localhost:8787",
+            "https://127.0.0.1:8787",
+            "http://10.0.0.1:8787",
+            "http://user@127.0.0.1:8787/",
+            "http://127.0.0.1@evil.example/",
+            "http://evil.example/127.0.0.1",
+            "http://127.0.0.1:8787/somewhere",
+            "127.0.0.1:8787",
+            "",
+        ] {
+            assert!(runtime_report_url(refused).is_none(), "{refused} is not this machine");
+        }
+    }
+
+    /// Asking the runtime builds a client, which this crate's `reqwest` refuses to do until a
+    /// crypto provider is installed. A `yell` with no runtime up must produce the metadata-only
+    /// report, not a panic.
+    #[tokio::test]
+    async fn a_runtime_that_is_not_there_is_a_class_and_not_a_panic() {
+        let message = YellMessage::new("nobody is home").expect("a message");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral loopback port");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+        let url = format!("http://{addr}");
+        let refusal = build(&url, None, &message, Mode::Baseline)
+            .await
+            .expect_err("nothing is listening on closed port");
+        assert_eq!(refusal, UnreachableClass::NotListening);
+        assert!(
+            local(message, Mode::Baseline, refusal).is_ok(),
+            "the report is still made"
+        );
+    }
+
+    /// Something answering on the runtime's port is not the runtime. What it says is written to
+    /// disk and offered for sending, so it is checked for being the document this build sends.
+    #[test]
+    fn only_this_schema_is_a_report() {
+        assert!(is_a_report(br#"{"schema":"openappa.yell.v1","message":"x"}"#));
+        assert!(!is_a_report(br#"{"schema":"openappa.yell.v2"}"#));
+        assert!(!is_a_report(b"{}"));
+        assert!(!is_a_report(b"<html>not a runtime</html>"));
+    }
+
+    #[test]
+    fn every_omitted_trajectory_is_visible_before_sharing() {
+        for (reason, expected) in [
+            ("ambiguous", "more than one family"),
+            ("no_recent_trajectory", "no matching trajectory"),
+            ("log_unavailable", "could not read"),
+            ("runtime_unavailable", "could not be reached"),
+            ("not_requested", "not requested"),
+        ] {
+            let finished = Finished::of(
+                serde_json::to_vec(&serde_json::json!({
+                    "schema": super::super::report::SCHEMA,
+                    "trajectory": { "omitted_reason": reason },
+                }))
+                .expect("the fixture serializes"),
+            )
+            .expect("the fixture fits");
+            assert!(
+                omission_warning(&finished).is_some_and(|warning| warning.contains(expected)),
+                "{reason} gets an actionable warning"
+            );
+        }
+
+        let complete = Finished::of(br#"{"schema":"openappa.yell.v1","trajectory":{"facts":[]}}"#.to_vec())
+            .expect("the fixture fits");
+        assert_eq!(omission_warning(&complete), None);
+    }
+}

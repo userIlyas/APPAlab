@@ -1,0 +1,39 @@
+# The trust level starts at internal, then drops to vendor and untrusted.
+mcp/shell/run_command {
+  command: "make test"
+}
+expect allow
+
+mcp/slack/post_message {
+  channel: "#eng"
+  text: "tests green"
+}
+expect allow
+
+mcp/docs/read_vendor_doc {}
+expect allow
+
+mcp/shell/run_command {
+  command: "make release"
+}
+expect deny
+
+mcp/slack/post_message {
+  channel: "#eng"
+  text: "vendor notes attached"
+}
+expect allow
+
+mcp/mail/read_inbound {}
+expect allow
+
+mcp/slack/post_message {
+  channel: "#eng"
+  text: "forwarding"
+}
+expect deny
+
+mcp/shell/run_command {
+  command: "make release"
+}
+expect deny

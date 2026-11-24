@@ -1,0 +1,186 @@
+from __future__ import annotations
+
+import os
+from datetime import datetime
+from typing import Any
+
+import httpx
+
+from services.common import appa_taint
+from services.common.auth import ServiceTokenProvider
+from services.common.llm import raise_upstream_llm_error
+from services.common.tracing import observation, trace_headers
+
+
+class MemoryClient:
+    def __init__(self, tokens: ServiceTokenProvider) -> None:
+        self.base_url = os.getenv("MEMORY_URL", "http://memory-api:8002")
+        self.tokens = tokens
+        try:
+            # Recall invokes the configured embedding provider.
+            self.timeout = float(os.getenv("MEMORY_HTTP_TIMEOUT_SECONDS", "60"))
+        except ValueError:
+            self.timeout = 60.0
+
+    async def last_skill(self, user_id: str, conversation_id: str) -> str | None:
+        result = await self._request("GET", f"/api/v1/working/routing/{user_id}/{conversation_id}")
+        return result["intent"]
+
+    async def recall(
+        self, user_id: str, query: str, conversation_id: str, limit: int = 8
+    ) -> list[dict[str, Any]]:
+        payload = {
+            "agent_id": "banking-agent",
+            "user_id": user_id,
+            "query": query,
+            "conversation_id": conversation_id,
+            "memory_types": ["episodic", "semantic", "procedural"],
+            "limit_per_layer": max(1, min(limit, 20)),
+        }
+        result = await appa_taint.taint_gate.recall_memory(
+            conversation_id,
+            lambda: self._request("POST", "/api/v1/context", json=payload),
+            query=query,
+        )
+        return result["memories"]
+
+    async def create_action(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        action_type: str,
+        parameters: dict[str, Any],
+        expires_at: datetime,
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/api/v1/working/actions",
+            json={
+                "agent_id": "banking-agent",
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "action_type": action_type,
+                "parameters": parameters,
+                "expires_at": expires_at.isoformat(),
+            },
+        )
+
+    async def stage_candidate(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        requested_memory_type: str,
+        content: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/api/v1/working/candidates",
+            json={
+                "agent_id": "banking-agent",
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "requested_memory_type": requested_memory_type,
+                "content": content,
+                "metadata": metadata,
+            },
+        )
+
+    async def store_turn(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        user_message: str,
+        assistant_message: str,
+        intent: str,
+        tool_calls: list[str],
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/api/v1/working/turns",
+            json={
+                "agent_id": "banking-agent",
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "user_message": user_message,
+                "assistant_message": assistant_message,
+                "intent": intent,
+                "tool_calls": tool_calls,
+            },
+        )
+
+    async def conversations(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        result = await self._request(
+            "GET",
+            f"/api/v1/working/conversations/banking-agent/{user_id}",
+            params={"limit": limit},
+        )
+        return result["conversations"]
+
+    async def conversation_messages(
+        self, user_id: str, conversation_id: str
+    ) -> list[dict[str, Any]]:
+        result = await self._request(
+            "GET",
+            f"/api/v1/working/banking-agent/{user_id}/{conversation_id}",
+        )
+        return result["messages"]
+
+    async def get_action(self, memory_id: str, user_id: str) -> dict[str, Any]:
+        return await self._request(
+            "GET",
+            f"/api/v1/working/actions/{memory_id}",
+            params={"agent_id": "banking-agent", "user_id": user_id},
+        )
+
+    async def patch_action(
+        self, memory_id: str, user_id: str, metadata: dict[str, Any]
+    ) -> dict[str, Any]:
+        return await self._request(
+            "PATCH",
+            f"/api/v1/working/actions/{memory_id}",
+            json={
+                "agent_id": "banking-agent",
+                "user_id": user_id,
+                "metadata": metadata,
+            },
+        )
+
+    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        token = await self.tokens.get()
+        payload = kwargs.get("json")
+        layers = (
+            payload.get("memory_types")
+            if path == "/api/v1/context" and isinstance(payload, dict)
+            else None
+        )
+        layer = "working" if path.startswith("/api/v1/working/") else None
+        with observation(
+            "memory.client.call",
+            input={"method": method, "path": path, **kwargs},
+            metadata={"endpoint": self.base_url},
+            memory_layer=layer,
+            memory_layers=layers,
+        ) as span:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.request(
+                    method,
+                    f"{self.base_url}{path}",
+                    headers={"Authorization": f"Bearer {token}", **trace_headers()},
+                    **kwargs,
+                )
+                try:
+                    body = response.json()
+                except ValueError:
+                    body = response.text
+                span.update(output=body, metadata={"http_status": response.status_code})
+                raise_upstream_llm_error(response)
+                response.raise_for_status()
+                return body
+
+
+# Public import retained for existing integrations.
+from services.common.travel import TravelA2AClient  # noqa: E402, F401

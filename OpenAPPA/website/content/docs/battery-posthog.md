@@ -1,0 +1,42 @@
+---
+title: PostHog battery
+category: Batteries
+order: 6.72
+description: Rules for PostHog's MCP server, all 44 registry tools, with internal analytics reads and reviewed writes.
+sidebar: false
+breadcrumb: PostHog
+---
+
+The PostHog battery covers PostHog's official MCP server: all 44 tools in its registry. The hosted endpoint exposes one feature subset per `features` query parameter and every tool without it, so the battery names the whole registry.
+
+Writes need `posthog-review`. The Claude Code and kagent plugin defaults permit every mark, so the person running the session reviews them; another root config must define an Authority permitting the mark.
+
+[View the battery source](https://github.com/archestra-ai/OpenAPPA/tree/main/marketplace/batteries/posthog).
+
+## Tool behavior
+
+- Analytics queries, insights, dashboards, error tracking, experiment results, survey statistics, LLM analytics, and event and property definitions hold what the customer's end users produced. They return untrusted `internal` data.
+- The query tools read only: `query-run` accepts a trends, funnel, or HogQL node and posts it to PostHog's query endpoint.
+- `docs-search` returns public PostHog documentation and sends its query to Inkeep, so its input must be public.
+- Creating or updating an insight, a dashboard, or a survey requires trusted internal data and review, and records `posthog.changed`.
+- Feature flag and experiment writes record `posthog.sensitive`: a flag gates production behaviour, and an experiment owns the flag it launches. Every deletion records `posthog.sensitive` too.
+
+## Sanitizers
+
+When the deployment binds a sanitizer below, the battery confines the results of all 44 tools. A read that narrows the session then offers, beside the plain narrowing, each sanitizer below that the deployment binds, and the agent chooses. A chosen sanitizer runs a model on the confined result with the sanitizer's `hint`. The model's output enters the session at the label the sanitizer's `permits` declare, and the raw result never reaches the agent.
+
+| Sanitizer | `permits` | Effect |
+|---|---|---|
+| `posthog.strip-instructions` | `trust`: `suspicious` → `trusted` | Removes every instruction from the result and keeps the data. The read does not lower the session's trust, so it adds no trust gap to a later call that requires `trusted` data. The audience stays `internal`. |
+
+A sanitizer settles one dimension of a narrowing. When a read narrows both trust and audience, the other dimension stays a narrowing, which the agent accepts. A sanitizer never clears a requirement, such as a review mark.
+
+The model for each sanitizer is configured in the deployment, not in the battery. A sanitizer runs only when the root config binds it under `[externals.sanitizers]`: for example `builtin = "llm"` with an `[externals.llm]` profile, `builtin = "claude-code"` where the `claude` CLI is installed, or a `url`. The default config of the Claude Code plugin binds every battery sanitizer to `claude-code`, so in `clappa` sessions it is active once the battery is installed. A sanitizer that the root does not bind is not offered, and the results that only it covers are not confined. The battery then decides as it would without sanitizers.
+
+APPA does not verify what the model removed: binding a sanitizer registers it as trusted. A root rule for a tool takes precedence over the battery's rule, and a root rule without the battery's tag offers no sanitizer. To change a sanitizer's hint, declare a `[[policy.sanitizer]]` with the same name in the root config. The root declaration replaces the battery's whole, so copy its `on`, `tags`, and `permits`.
+
+## Limit
+
+PostHog API keys do not expose per-project reader boundaries to policy, so all analytics reads default to `internal`. To restrict an agent to a specific project, pin it in your root policy using argument selectors.
+
+`switch-organization` and `switch-project` move which project later calls target. They change no PostHog data and carry no effect. Pin one project in a root rule when it must not move.
