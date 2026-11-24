@@ -1,0 +1,15 @@
+# A deploy needs a backup. A migration can run one time.
+mcp/ops/deploy {}
+expect deny
+
+mcp/ops/backup {}
+expect allow
+
+mcp/ops/deploy {}
+expect allow
+
+mcp/ops/migrate {}
+expect allow
+
+mcp/ops/migrate {}
+expect deny

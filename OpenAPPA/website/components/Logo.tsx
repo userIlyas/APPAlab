@@ -1,0 +1,396 @@
+import type { CSSProperties, ReactNode } from "react";
+
+/* Pixel-grid wordmark: each letter is a 5-wide bitmap on a 9-row grid —
+   caps on rows 0-6, lowercase x-height on rows 2-6, descenders on rows 7-8.
+   Solid blocks (no pixel gaps) so it stays crisp at small sizes. Lowercase
+   letters render dimmed for the two-tone look. */
+
+const GLYPHS: Record<string, string[]> = {
+  O: ["01110", "10001", "10001", "10001", "10001", "10001", "01110", "00000", "00000"],
+  A: ["01110", "10001", "10001", "11111", "10001", "10001", "10001", "00000", "00000"],
+  P: ["11110", "10001", "10001", "11110", "10000", "10000", "10000", "00000", "00000"],
+  p: ["00000", "00000", "11110", "10001", "10001", "10001", "11110", "10000", "10000"],
+  e: ["00000", "00000", "01110", "10001", "11111", "10000", "01111", "00000", "00000"],
+  n: ["00000", "00000", "10110", "11001", "10001", "10001", "10001", "00000", "00000"],
+};
+
+const CELL = 10;
+const LETTER_COLS = 6; // 5 glyph columns + 1 spacing column
+const ROWS = 9;
+const CAP_ROWS = 7;
+
+/* Pixel-grid mascot on the same grid as the wordmark, ported from the
+   <appa-mark> custom element (components/pixel-marks.ts).
+   1 body · 3 dim (muzzle, paws) · 2 nose · 4 eyes */
+
+const MARK_COLS = 24;
+const MARK_ROWS = 22;
+const MARK_LEG_ROW = 20; // first of the two rows that are legs and paws
+
+function seg(...runs: [string, number][]): string {
+  let s = "";
+  for (const [ch, n] of runs) s += ch.repeat(n);
+  return s;
+}
+
+const BEAST = [
+  seg([".", 5], ["1", 2], [".", 10], ["1", 2], [".", 5]),
+  seg([".", 5], ["1", 2], [".", 10], ["1", 2], [".", 5]),
+  seg([".", 4], ["1", 16], [".", 4]),
+  seg([".", 3], ["1", 18], [".", 3]),
+  seg([".", 3], ["1", 18], [".", 3]),
+  seg([".", 3], ["1", 18], [".", 3]),
+  seg([".", 3], ["1", 3], ["4", 3], ["1", 6], ["4", 3], ["1", 3], [".", 3]),
+  seg([".", 3], ["1", 3], ["4", 3], ["1", 6], ["4", 3], ["1", 3], [".", 3]),
+  seg([".", 3], ["1", 3], ["4", 3], ["1", 6], ["4", 3], ["1", 3], [".", 3]),
+  seg([".", 3], ["1", 18], [".", 3]),
+  seg([".", 3], ["1", 7], ["3", 4], ["1", 7], [".", 3]),
+  seg([".", 3], ["1", 7], ["3", 1], ["2", 2], ["3", 1], ["1", 7], [".", 3]),
+  seg([".", 3], ["1", 18], [".", 3]),
+  seg([".", 4], ["1", 16], [".", 4]),
+  seg([".", 1], ["1", 22], [".", 1]),
+  seg(["1", 24]),
+  seg(["1", 24]),
+  seg(["1", 24]),
+  seg(["1", 24]),
+  seg(["1", 24]),
+  seg(["1", 5], [".", 2], ["1", 4], [".", 2], ["1", 4], [".", 2], ["1", 5]),
+  seg(["3", 5], [".", 2], ["3", 4], [".", 2], ["3", 4], [".", 2], ["3", 5]),
+];
+
+const MARK_FILL: Record<string, string> = {
+  "1": "var(--text-strong)",
+  "3": "var(--text-weak)",
+  "2": "var(--bg)",
+  "4": "var(--bg)",
+};
+
+export function PixelMark({
+  size = 26,
+  style,
+  className,
+}: {
+  size?: number;
+  style?: CSSProperties;
+  className?: string;
+}) {
+  const height = Math.round((size * MARK_ROWS) / MARK_COLS);
+  const body: ReactNode[] = [];
+  const eyes: ReactNode[] = [];
+  // The two bottom rows are the legs; each side is its own group so the
+  // dancing mark can step with them in turn.
+  const legsLeft: ReactNode[] = [];
+  const legsRight: ReactNode[] = [];
+  BEAST.forEach((row, y) => {
+    for (let x = 0; x < MARK_COLS; x++) {
+      const c = row[x];
+      if (c === ".") continue;
+      // Body pixel behind each eye: blinking scales the eye away and must
+      // reveal fur, not the page background (the eye fill IS the bg color).
+      if (c === "4") {
+        body.push(<rect key={`b${x}-${y}`} x={x} y={y} width={1} height={1} fill={MARK_FILL["1"]} />);
+      }
+      const rect = <rect key={`${x}-${y}`} x={x} y={y} width={1} height={1} fill={MARK_FILL[c]} />;
+      if (c === "4") eyes.push(rect);
+      else if (y >= MARK_LEG_ROW) (x < MARK_COLS / 2 ? legsLeft : legsRight).push(rect);
+      else body.push(rect);
+    }
+  });
+  return (
+    <svg
+      viewBox={`0 0 ${MARK_COLS} ${MARK_ROWS}`}
+      width={size}
+      height={height}
+      className={className}
+      shapeRendering="crispEdges"
+      role="img"
+      aria-label="OpenAPPA mascot"
+      style={{ display: "block", overflow: "visible", ...style }}
+    >
+      <g className="appa-mark-float">
+        {body}
+        <g className="appa-mark-legs-left">{legsLeft}</g>
+        <g className="appa-mark-legs-right">{legsRight}</g>
+        <g className="appa-mark-eyes">{eyes}</g>
+      </g>
+    </svg>
+  );
+}
+
+const ALERT_COLS = 34;
+const ALERT_ROWS = 22;
+
+const ALERT_BEAST = [
+  "..........11..........11..........",
+  "..........11..........11..........",
+  ".........1111111111111111.........",
+  "YY......111111111111111111......YY",
+  ".YY.....111111111111111111.....YY.",
+  "..YYY...11EE1111111111EE11...YYY..",
+  "...YYY..1113E11111111E3111..YYY...",
+  "....YY..11111E111111E11111..YY....",
+  "........11EE1111111111EE11........",
+  ".YY.....111111333333111111.....YY.",
+  ".YY.....11111133TT33111111.....YY.",
+  "....Y...1111113KKKK3111111...Y....",
+  "........1111113KKKK3111111........",
+  "...YY....111113KKKK311111....YY...",
+  "..YYY.111111113TTTT311111111.YYY..",
+  ".YY...1111111111111111111111...YY.",
+  ".....111111111111111111111111.....",
+  ".....111111111111111111111111.....",
+  ".....111111111111111111111111.....",
+  ".....111111111111111111111111.....",
+  ".....11111..1111..1111..11111.....",
+  ".....33333..3333..3333..33333.....",
+];
+
+const ALERT_FILL: Record<string, string> = {
+  "1": "var(--text-strong)",
+  "3": "var(--text-weak)",
+  E: "var(--bg)",
+  K: "var(--appa-throat, var(--text-strong))",
+  T: "var(--appa-teeth, var(--bg))",
+  Y: "var(--spark, #fcc405)",
+};
+
+export function PixelAlertMark({
+  size = 136,
+  style,
+  className,
+}: {
+  size?: number;
+  style?: CSSProperties;
+  className?: string;
+}) {
+  const height = Math.round((size * ALERT_ROWS) / ALERT_COLS);
+  const body: ReactNode[] = [];
+  const sparks: ReactNode[] = [];
+  ALERT_BEAST.forEach((row, y) => {
+    for (let x = 0; x < ALERT_COLS; x++) {
+      const c = row[x];
+      if (c === ".") continue;
+      const rect = <rect key={`a${x}-${y}`} x={x} y={y} width={1} height={1} fill={ALERT_FILL[c]} />;
+      if (c === "Y") {
+        sparks.push(rect);
+      } else {
+        body.push(rect);
+      }
+    }
+  });
+  return (
+    <svg
+      viewBox={`0 0 ${ALERT_COLS} ${ALERT_ROWS}`}
+      width={size}
+      height={height}
+      className={className ? `appa-alert-mark ${className}` : "appa-alert-mark"}
+      shapeRendering="crispEdges"
+      role="img"
+      aria-label="OpenAPPA alert mark"
+      style={{ display: "block", overflow: "visible", ...style }}
+    >
+      <g className="appa-alert-body appa-alert-shake">{body}</g>
+      <g className="appa-alert-sparks">{sparks}</g>
+    </svg>
+  );
+}
+
+interface Pixel {
+  x: number;
+  y: number;
+  dim: boolean;
+}
+
+function layoutWord(word: string) {
+  const pixels: Pixel[] = [];
+  word.split("").forEach((letter, index) => {
+    const glyph = GLYPHS[letter];
+    if (!glyph) return;
+    const dim = letter === letter.toLowerCase();
+    glyph.forEach((row, y) => {
+      row.split("").forEach((bit, x) => {
+        if (bit === "1") pixels.push({ x: index * LETTER_COLS + x, y, dim });
+      });
+    });
+  });
+  return { pixels, width: (word.length * LETTER_COLS - 1) * CELL };
+}
+
+export interface WordmarkOptions {
+  /** Gap around each pixel inside its cell; 0 = solid blocks. */
+  gap?: number;
+  shape?: "square" | "dot" | "rounded";
+  /** Render lowercase letters in the weak color. */
+  dimLowercase?: boolean;
+}
+
+export function PixelWordmark({
+  word,
+  capHeight,
+  style,
+  className,
+  gap = 0,
+  shape = "square",
+  dimLowercase = true,
+}: {
+  word: string;
+  /** Fixed cap height in px; omit for fluid sizing via `style`. */
+  capHeight?: number;
+  style?: CSSProperties;
+  className?: string;
+} & WordmarkOptions) {
+  const { pixels, width } = layoutWord(word);
+  const height = ROWS * CELL;
+  const boxHeight = capHeight ? (capHeight * ROWS) / CAP_ROWS : undefined;
+  const size = CELL - gap * 2;
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      height={boxHeight}
+      width={boxHeight ? (boxHeight * width) / height : undefined}
+      className={className}
+      style={style}
+      preserveAspectRatio="xMinYMid meet"
+      role="img"
+      aria-label="OpenAPPA"
+      shapeRendering={shape === "dot" ? "auto" : "crispEdges"}
+    >
+      {pixels.map(({ x, y, dim }) => {
+        const fill = dimLowercase && dim ? "var(--text-weak)" : "currentColor";
+        if (shape === "dot") {
+          return (
+            <circle key={`${x}-${y}`} cx={x * CELL + CELL / 2} cy={y * CELL + CELL / 2} r={size / 2} fill={fill} />
+          );
+        }
+        return (
+          <rect
+            key={`${x}-${y}`}
+            x={x * CELL + gap}
+            y={y * CELL + gap}
+            width={size}
+            height={size}
+            rx={shape === "rounded" ? 2 : 0}
+            fill={fill}
+          />
+        );
+      })}
+    </svg>
+  );
+}
+
+/* The lockup is sized entirely from one length, `--logo-h` (the wordmark's cap
+   height): every gap, the mark, and the tagline are proportions of it in CSS.
+   That lets a caller scale the whole thing fluidly — the hero clamps it
+   against the viewport — instead of wrapping the mark onto its own line when
+   a fixed pixel width stops fitting.
+
+   `height` seeds that variable. A number is pixels; a string is any CSS
+   length, so a caller can hand it a clamp() and get a fluid lockup. It has to
+   arrive as a prop rather than a stylesheet override — the variable is set
+   inline here, and inline styles win. */
+export function Logo({ height = 15 }: { height?: number | string }) {
+  const logoHeight = typeof height === "number" ? `${height}px` : height;
+  return (
+    <span className="logo-lockup" style={{ "--logo-h": logoHeight } as CSSProperties}>
+      <PixelMark className="logo-mark" />
+      <span className="logo-word-group">
+        <PixelWordmark word="OpenAPPA" className="logo-word" />
+        <span className="logo-tagline">Preview &amp; RFC</span>
+      </span>
+    </span>
+  );
+}
+
+/* The same arrangement as `Logo`, drawn as one SVG instead of three boxes held
+   together by CSS — which is what makes it a file you can hand someone. The
+   CSS lockup's proportions are restated here in the wordmark's own units, with
+   one cap height as the unit, so the two stay the same shape. No tagline: the
+   asset outlives whatever status line the site is carrying this month. */
+export function PixelLockup({
+  capHeight = 30,
+  className,
+  style,
+}: {
+  /** Cap height in px; the whole lockup scales from it. */
+  capHeight?: number;
+  className?: string;
+  style?: CSSProperties;
+}) {
+  // Whole units throughout: the CSS proportions land on fractions, and a
+  // viewBox of `0 -20.61111 640.3333 111.2222` is a poor thing to hand
+  // someone. Rounding moves the mark by less than a third of one of its own
+  // pixels.
+  const unit = CAP_ROWS * CELL; // one cap height, in wordmark units
+  const markWidth = Math.round((26 / 15) * unit); // .logo-mark: --logo-h * 26/15
+  const markHeight = Math.round((markWidth * MARK_ROWS) / MARK_COLS);
+  const wordHeight = ROWS * CELL;
+  const { pixels, width: wordWidth } = layoutWord("OpenAPPA");
+  const wordX = markWidth + Math.round(0.7 * unit); // .logo-lockup: gap = --logo-h * 0.7
+  // Centred on the word box, then lifted a row so it centres on the caps.
+  const markY = Math.round((wordHeight - markHeight) / 2 - unit / 7);
+
+  const top = Math.min(0, markY);
+  const height = Math.max(wordHeight, markY + markHeight) - top;
+  const width = wordX + wordWidth;
+  const scale = markWidth / MARK_COLS;
+
+  const body: ReactNode[] = [];
+  const eyes: ReactNode[] = [];
+  BEAST.forEach((row, y) => {
+    for (let x = 0; x < MARK_COLS; x++) {
+      const cell = row[x];
+      if (cell === ".") continue;
+      // An eye is the background colour painted over fur, so the body pixel
+      // underneath has to be there for the blink to reveal something.
+      if (cell === "4") {
+        body.push(<rect key={`u${x}-${y}`} x={x} y={y} width={1} height={1} fill={MARK_FILL["1"]} />);
+      }
+      const rect = <rect key={`${x}-${y}`} x={x} y={y} width={1} height={1} fill={MARK_FILL[cell]} />;
+      (cell === "4" ? eyes : body).push(rect);
+    }
+  });
+
+  return (
+    <svg
+      viewBox={`0 ${top} ${width} ${height}`}
+      width={(capHeight * width) / unit}
+      height={(capHeight * height) / unit}
+      className={className}
+      style={style}
+      shapeRendering="crispEdges"
+      role="img"
+      aria-label="OpenAPPA"
+    >
+      {/* Two groups, not one: the float animation animates `transform`, and a
+          CSS transform overrides the attribute it lands on — putting both on
+          one group silently drops the scale and the mascot renders at a fifth
+          of its size. The outer group places it; the inner one moves. */}
+      <g transform={`translate(0 ${markY}) scale(${scale})`}>
+        <g className="appa-mark-float">
+          {body}
+          {/* Same group and class as the standalone mark, so the lockup blinks
+              on the page and the GIF export finds the eyes to close. */}
+          <g className="appa-mark-eyes">{eyes}</g>
+        </g>
+      </g>
+      <g transform={`translate(${wordX} 0)`}>
+        {pixels.map(({ x, y, dim }) => (
+          <rect
+            key={`w${x}-${y}`}
+            x={x * CELL}
+            y={y * CELL}
+            width={CELL}
+            height={CELL}
+            fill={dim ? "var(--text-weak)" : "currentColor"}
+          />
+        ))}
+      </g>
+    </svg>
+  );
+}
+
+/** Raw pixel grid of the wordmark, for canvas renderers (e.g. tutorial figures). */
+export function logoPixelData() {
+  const { pixels, width } = layoutWord("OpenAPPA");
+  return { pixels, width, cell: CELL, capHeight: CAP_ROWS * CELL };
+}

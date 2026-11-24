@@ -1,0 +1,9 @@
+OpenAPPA demo deployed in namespace {{ .Release.Namespace }}.
+
+To access the dashboard:
+  kubectl port-forward -n {{ .Release.Namespace }} svc/kagent-ui 8080:8080
+
+Next steps:
+  1. Open http://localhost:8080 in your browser.
+  2. Select Agents -> appa-guide -> Chat, and send: init
+  3. Approve the proposed policy to activate the demo agents.

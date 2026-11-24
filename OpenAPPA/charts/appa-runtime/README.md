@@ -1,0 +1,260 @@
+# appa-runtime
+
+Shared OpenAPPA runtime for a Kubernetes cluster. One replica. Agents
+that set `APPA_RUNTIME_URL` to this Service, with `APPA_ENABLED=true`,
+are gated by the policy in the ConfigMap.
+
+The image of this chart version is `ghcr.io/archestra-ai/appa-runtime:v0.46.1`. # x-release-please-version
+
+OpenAPPA publishes its images to `ghcr.io/archestra-ai/<image>` and its charts to `ghcr.io/archestra-ai/charts/<chart>`. A `v<version>` image tag never moves. `latest` names the newest stable release. Each chart pulls its images by the digest released with it. `ghcr.io/archestra-ai/ci/<image>` holds unreleased builds of `main`.
+
+## Install
+
+Install a released chart from Artifact Registry after setting
+`APPA_VERSION` to an OpenAPPA release that contains the chart:
+
+```sh
+helm install appa-runtime oci://ghcr.io/archestra-ai/charts/appa-runtime \
+  --version "$APPA_VERSION" --namespace appa --create-namespace
+```
+
+Install from a repository checkout during development:
+
+```sh
+helm install appa-runtime charts/appa-runtime --namespace appa --create-namespace
+```
+
+An unreleased checkout can name an image tag that is not published yet.
+Set `image.repository` and `image.tag` to the image built from that
+checkout.
+
+## appa-guide
+
+The chart can install the configuring kagent Agent with the runtime:
+
+```sh
+helm install appa-runtime oci://ghcr.io/archestra-ai/charts/appa-runtime \
+  --version "$APPA_VERSION" --namespace appa --create-namespace \
+  --set appaGuide.enabled=true \
+  --set appaGuide.namespace=kagent
+```
+
+The option is off by default because the runtime chart also supports
+clusters without kagent. The target namespace, kagent model config, and
+tool-server name are configurable under `appaGuide`. An empty
+`appaGuide.skill.ref` pins the skill to the chart's `v<appVersion>` tag.
+An override must name a branch or tag. kagent 0.9.12 cannot initialize
+Git skills from commit SHAs; the chart rejects SHA-shaped overrides before
+deployment. This limitation does not affect marketplace package commit pins.
+
+Enabling `appaGuide` opens a separate guide MCP listener on Service port
+`18788`. Only the `appa-guide` Agent receives that URL and management
+toolset. The chart adds a NetworkPolicy that permits that port only from
+the labeled guide pod, plus a Role allowing the runtime ServiceAccount to
+get and patch its one policy ConfigMap. Every guide MCP call also consumes
+a one-shot APPA vouch, so direct calls cannot read or mutate management
+state. The normal `/mcp` endpoint remains remedy-only.
+
+The runtime binds the pod network directly. Point agents at:
+
+```text
+http://appa-runtime.appa.svc.cluster.local:18787
+```
+
+## Demo fixtures
+
+`appa-kagent-demo` is a separate fixture-only chart. It points its Agents
+at this Service and supplies an inert policy template for `appa-guide` to
+review. It does not install a runtime, serving policy, persistence,
+provider configuration, ModelConfig, or second `appa-guide`.
+
+## Persistence
+
+Off by default. The trajectory log and a writable batteries overlay
+then live on emptyDir and die with the pod.
+
+```sh
+helm upgrade appa-runtime charts/appa-runtime --namespace appa \
+  --set persistence.enabled=true \
+  --set persistence.size=8Gi
+```
+
+Use an existing claim:
+
+```sh
+helm upgrade appa-runtime charts/appa-runtime --namespace appa \
+  --set persistence.enabled=true \
+  --set persistence.existingClaim=appa-data
+```
+
+With persistence on, the runtime uses this lookup order:
+
+1. `/var/lib/appa/batteries` for the operator-managed overlay.
+2. `/var/lib/appa/release-batteries` for the latest verified release.
+3. `/opt/appa/batteries` for the batteries built into the running image.
+
+The appa-guide skill can refresh the second directory from the latest
+published semver release after approval. It verifies the batteries archive
+against that release's `SHA256SUMS` and validates the serving root
+config. It retains the previous layer until policy reload succeeds, then
+commits the refresh. A refused reload rolls the layer back. The operator
+overlay stays unchanged. Without a persistent volume the
+skill does not refresh either directory.
+
+If a process stops between the two directory renames, the chart's init
+container restores `.release-batteries.previous` before the runtime
+starts. The prior layer remains on the PVC throughout the transaction.
+
+## Runtime upgrades
+
+The chart runs one replica with the `Recreate` strategy. An upgrade restarts
+the runtime. With persistence enabled, stored trajectory families resume
+from the same PVC after startup.
+
+The runtime's SQLite database uses schema 9. Supported existing databases
+upgrade in place and keep their trajectories. An image without schema 9
+support refuses to open that database. An image rollback does not downgrade
+the stored schema: preserve the PVC and use a compatible runtime.
+
+Pause policy and battery changes until the replacement runtime is ready.
+
+## Policy
+
+The chart mounts a bootstrap policy that lets appa-guide inspect the
+cluster and requires human approval for policy management. Every
+unrelated tool remains fail-closed. Typed runtime MCP tools validate,
+publish, reload, and roll back policy and battery changes. Set
+`config.existingConfigMap` to manage that ConfigMap yourself.
+
+For a complete small configuration tree, `config.files` maps relative paths to
+`{data: <canonical base64>, executable: <boolean>}`. The chart stores those bytes
+under SHA-256 keys and projects their original paths below `/etc/appa` with mode
+`0444` or `0555`. `config.contents` remains the root policy at `config.key`.
+The runtime working directory is `/etc/appa`, so declared relative helper paths
+retain their layout. File contents and executable intent affect the pod checksum.
+Paths must be relative, with no empty, dot, parent, backslash, colon, or control-character
+components; components beginning with `..` are reserved. File/parent collisions
+and collisions with the root policy are refused before deployment.
+
+The encoded tree budget is 750 KiB, including a conservative allowance for keys,
+paths and metadata. For larger trees, populate a PVC with the complete prepared
+tree and set `config.existingClaim` to its name. The chart mounts it read-only at
+`/etc/appa`; it does not create, populate, verify or delete this claim. Files must
+be readable by runtime UID 65532, and helpers must retain executable permission.
+The root policy must exist at `config.key`. This mode is mutually exclusive with
+`config.contents`, `config.files`, and `config.existingConfigMap`, and does not
+support appa-guide's ConfigMap editing. Changes to an external volume require an
+operator-controlled rollout; the chart cannot hash its contents. Configuration
+files are not Secrets: do not embed credentials in Helm values or ConfigMaps.
+
+When `config.contents` stays empty, an upgrade replaces the live policy
+key if it is still the packaged bootstrap. It preserves that key when
+appa-guide or an operator has changed it. Setting `config.contents`
+explicitly makes Helm replace that key. An existing ConfigMap always
+remains under the operator's ownership.
+
+Keep `config.key` unchanged after appa-guide manages that key. Helm
+treats another key as a new policy and initializes it from chart values.
+
+Live preservation requires a cluster-connected `helm upgrade`, because
+it reads the ConfigMap with Helm `lookup`. Template-only GitOps renderers
+cannot see live state. Set `config.contents` or `config.existingConfigMap`
+when Argo CD or another template-only renderer owns the release.
+
+Do not run `helm upgrade` while appa-guide applies a policy. Helm reads
+the live key during template rendering; a concurrent later write wins.
+
+## Network access
+
+`/hook` and remedy-only `/mcp` are unauthenticated. For kagent, `/hook`
+accepts the human ruling on a gated call, so any pod that reaches the
+runtime port can submit a ruling. The chart NetworkPolicy is the
+boundary for these routes. It is on by default and requires a CNI that
+enforces NetworkPolicy; without one, every pod that reaches the Service
+can call `/hook`.
+
+The default policy admits the runtime port only from these peers:
+
+- kagent Agent pods in the `kagent` namespace. kagent labels each Agent
+  pod `app: kagent` and `kagent: <agent name>`. Its controller and MCP
+  tool-server pods do not carry these labels.
+- pods of this release, for the chart's own connection test.
+- the appa-guide pod, on both ports, when `appaGuide` is enabled.
+
+Agents in other namespaces need a peer of their own.
+`networkPolicy.ingress` is a list of Kubernetes `NetworkPolicyPeer`
+objects. It replaces the default peer, so list every namespace whose
+agents call the runtime:
+
+```yaml
+networkPolicy:
+  ingress:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kagent
+      podSelector:
+        matchLabels:
+          app: kagent
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: team-agents
+      podSelector:
+        matchLabels:
+          app: kagent
+```
+
+The chart refuses an enabled policy with no peers.
+
+The runtime also enforces two checks of its own. It refuses every request
+that carries an `Origin` header, so a browser page cannot drive the
+listener. It returns `403` on `/reload`, `/status`, `/policy-key`, and
+`/binary-fingerprint` unless the network peer is loopback.
+
+When appa-guide is enabled, guide MCP port `18788` admits only the guide
+pod. A one-shot vouch still refuses a direct `/guide-mcp` call that never
+passed a gated ToolCall. A client that can reach both `/hook` and
+`/guide-mcp` can complete the gated approval path, so the vouch does not
+replace the NetworkPolicy.
+
+## Batteries
+
+`GET /batteries` lists the batteries this image (and overlay) can
+include. An `include = ["batteries/<name>/appa.toml"]` line in the
+root policy resolves against those directories. Root rules still run
+first.
+
+This runtime serves many users, so `env.APPA_BATTERY_TARGET` defaults to
+`multi-user`: each included battery composes its multi-user target
+policy. Set it to `single-user` only for a runtime that acts for one
+person.
+
+`env.APPA_SESSION_PRINCIPAL` defaults to `none`. Set it to `wire` to make
+the user that kagent names in its `x-user-id` header each session's
+principal, the member of its `self` audience. The principal must be an
+email address, or the session start is refused. `/hook` does not
+authenticate its caller, so set `wire` only when kagent authenticates
+its users (for example behind oauth2-proxy) and the NetworkPolicy keeps
+other clients off `/hook`.
+
+A multi-user target may route member lookups to a roster in the root
+policy. The GitHub battery names people `github:<numeric id>` and asks
+`[externals.audience.host-members]`. When `appa_include_battery` adds
+such a battery, it appends the missing roster empty:
+
+```toml
+[externals.audience.host-members]
+readers = {}
+```
+
+An empty roster maps nobody, so every lookup through it denies until you
+map each member to an address, through `appa_update_policy` or your own
+ConfigMap:
+
+```toml
+[externals.audience.host-members]
+readers = { "github:583231" = "ana@corp.example" }
+```
+
+`gh api users/<login> --jq .id` prints a GitHub account's numeric id. A
+root you write yourself (`config.contents`, `config.existingConfigMap`)
+must declare the roster too, or the runtime refuses it.

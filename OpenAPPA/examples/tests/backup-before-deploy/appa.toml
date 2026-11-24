@@ -1,0 +1,26 @@
+# Two history checks. A deploy needs a completed backup earlier in the
+# trajectory. A migration may run once: a second one is denied while the first
+# is recorded.
+
+[policy]
+version = 2
+
+[[policy.tool]]
+name = "mcp/ops/backup"
+effects = ["backup.completed"]
+delta = {}
+
+[[policy.tool]]
+name = "mcp/ops/deploy"
+requires = { effects = { contains = ["backup.completed"] } }
+delta = {}
+
+[[policy.tool]]
+name = "mcp/ops/migrate"
+effects = ["migration.applied"]
+requires = { effects = { excludes = ["migration.applied"] } }
+delta = {}
+
+[externals]
+timeout_ms = 2000
+max_body_bytes = 65536

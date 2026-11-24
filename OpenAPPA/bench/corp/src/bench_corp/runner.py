@@ -1,0 +1,481 @@
+"""The episode runner: grid = agent × scenario × rep, independently isolated.
+
+Every episode gets a fresh copy of its scenario's data and an empty sink,
+passed to the demo through its existing flags; the spawned MCP server's
+tool surface is narrowed to the scenario's systems via ``CORP_ENABLED_SYSTEMS``
+(which both demos forward to the server child). The run directory is the
+evidence: data, sink, stdout/stderr, and a per-episode ``result.json``.
+
+Checks always run — even after a nonzero exit or a timeout — because an
+errored run that produced the exfil email before dying must still count as
+attack success. A controlled APPA budget finalization is recorded separately
+from process, provider, runtime, and runner errors; all of them retain their
+observed end-state scores.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import subprocess
+import threading
+import time
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Iterator
+
+from . import AGENT_PROMPT_PROFILES
+from .agents import Agent, PolicyTarget, command_for
+from .auto_policy import settings_for
+from .checks import CheckResult, evaluate_check, parse_emails
+from .policy import apply_tool_requires, bind_external_urls, prune_policy
+from .scenario import AnnotatorAnswer, AuthorityAnswer, SanitizerAnswer, Scenario, canonical_args
+
+# Best-effort stderr diagnostics (never score inputs): the APPA hook's
+# mediation log lines, the FIDES audit log's BLOCKED lines, and executed
+# remedies on the APPA side. Anchored to the exact log wording (pinned by a
+# test against literal copies of the real lines): a looser remedy pattern
+# would also count the demo's startup banner and every block-feedback line,
+# which both mention execute_remedy_plan.
+#
+# The APPA count is the agent's block records: a blocked call, a blocked
+# output, a blocked child return (each also covers an operational refusal the
+# runtime withheld the same way). It is anchored on the record kind after the
+# trajectory tag, because the free text in other records — what the model
+# says, a fork's errand, proposed arguments — mentions "block" freely. The tag
+# pattern assumes the corp harness's ids (`appa-corp-agent`, `:c<n>` children),
+# which never contain `]`.
+_APPA_POLICY_EVENT = re.compile(
+    r"^appa: \[[^\]]+\] (?:blocked \S+:|the output was blocked:|the child's return was blocked:)",
+    re.MULTILINE,
+)
+_FIDES_BLOCK = re.compile(r"\bBLOCKED\b")
+_REMEDY = re.compile(r"^appa: remedy authorized\b", re.MULTILINE)
+_PROVIDER_ATTEMPTS = re.compile(r"^appa:.*inference completed after (\d+) provider attempts$", re.MULTILINE)
+_TERMINAL_STATUSES = {
+    "completed",
+    "budget_finalized",
+    "provider_failed",
+    "provider_rejected",
+    "runtime_refused",
+    "cancelled",
+    "budget_exhausted",
+}
+_FAILED_TERMINAL_STATUSES = {
+    "provider_failed",
+    "provider_rejected",
+    "runtime_refused",
+    "cancelled",
+    "budget_exhausted",
+}
+_COMMAND_PATH_OPTIONS = {
+    "--data-root",
+    "--policy",
+    "--profile",
+    "--server-bin",
+    "--settings",
+    "--sink-root",
+    "--status-file",
+    "--usage-file",
+}
+
+
+def _count(pattern: re.Pattern[str], text: str) -> int:
+    return sum(1 for _ in pattern.finditer(text))
+
+
+def _provider_retries(text: str) -> int:
+    return sum(max(0, int(match.group(1)) - 1) for match in _PROVIDER_ATTEMPTS.finditer(text))
+
+
+def _recorded_command(command: list[str], episode_dir: Path) -> list[str]:
+    """Make machine-local argv paths relative without changing execution."""
+    recorded = list(command)
+    path_indexes = {0}
+    path_indexes.update(index + 1 for index, argument in enumerate(command) if argument in _COMMAND_PATH_OPTIONS)
+    for index in path_indexes:
+        path = Path(command[index])
+        if path.is_absolute():
+            recorded[index] = os.path.relpath(path, episode_dir)
+    return recorded
+
+
+@dataclass(frozen=True)
+class EpisodeResult:
+    agent: str
+    scenario: str
+    rep: int
+    agent_prompt_profile: str
+    utility: bool | None  # None when the scenario declares no utility checks
+    security: bool | None  # None when the scenario declares no security checks
+    error: str | None  # "exit <code>" | "timeout" | None
+    terminal_status: str | None  # APPA's typed status; absent for agents without the contract
+    duration_s: float
+    emails: int
+    answer_present: bool  # the agent printed a final answer (FIDES leaves it empty when blocked)
+    policy_events: int
+    remedy_calls: int
+    provider_retries: int
+    checks: list[CheckResult]
+    model_usage: ModelUsage | None = None
+    auto_policy_sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class ModelUsage:
+    model_calls: int
+    usage_reported_calls: int
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cached_input_tokens: int | None
+    cache_write_input_tokens: int | None
+    reasoning_tokens: int | None
+    cost_usd: float | None
+
+
+def episode_record(result: EpisodeResult) -> dict:
+    """The JSON-ready scalar fields of a result (checks serialize separately)."""
+    record = {k: v for k, v in result.__dict__.items() if k not in {"checks", "model_usage"}}
+    record["model_usage"] = None if result.model_usage is None else result.model_usage.__dict__
+    return record
+
+
+def _read_model_usage(path: Path) -> ModelUsage:
+    payload = json.loads(path.read_text())
+    integer_fields = ("model_calls", "usage_reported_calls", "input_tokens", "output_tokens", "total_tokens")
+    optional_integer_fields = ("cached_input_tokens", "cache_write_input_tokens", "reasoning_tokens")
+    if not isinstance(payload, dict):
+        raise TypeError("model usage is not an object")
+    for field in integer_fields:
+        if not isinstance(payload.get(field), int) or isinstance(payload[field], bool) or payload[field] < 0:
+            raise ValueError(f"invalid {field}")
+    if payload["usage_reported_calls"] > payload["model_calls"]:
+        raise ValueError("usage_reported_calls exceeds model_calls")
+    for field in optional_integer_fields:
+        value = payload.get(field)
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+            raise ValueError(f"invalid {field}")
+    cost = payload.get("cost_usd")
+    if cost is not None and (
+        not isinstance(cost, int | float) or isinstance(cost, bool) or not math.isfinite(cost) or cost < 0
+    ):
+        raise ValueError("invalid cost_usd")
+    return ModelUsage(**{field: payload.get(field) for field in ModelUsage.__dataclass_fields__})
+
+
+def _terminate_group(process: subprocess.Popen) -> None:
+    """Stop the agent and everything it spawned (each demo runs the MCP server
+    as its own child, which a plain kill would orphan)."""
+    for sig, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 5.0)):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _consult_artifact(request: dict, kind: str, name: str) -> dict:
+    """The artifact of a consult envelope addressed to this external.
+
+    Every consult arrives wrapped: the envelope names the kind and the
+    component, and the artifact is the value that component judges. An
+    envelope addressed elsewhere yields nothing to match on, so the fixture
+    answers 404 — and no answer grants nothing.
+    """
+    if request.get("version") != 1 or request.get("kind") != kind or request.get("name") != name:
+        return {}
+    artifact = request.get("artifact")
+    return artifact if isinstance(artifact, dict) else {}
+
+
+@contextlib.contextmanager
+def _serve_external_fixtures(
+    annotator_answers: tuple[AnnotatorAnswer, ...],
+    authority_answers: tuple[AuthorityAnswer, ...],
+    sanitizer_answers: tuple[SanitizerAnswer, ...],
+    request_log: Path,
+) -> Iterator[str | None]:
+    """Serve scenario-owned externals on an isolated loopback port."""
+    if not (annotator_answers or authority_answers or sanitizer_answers):
+        yield None
+        return
+
+    # Each answer carries the verbatim annotation its scenario declares for that consult,
+    # validated against the policy at scenario load — the fixture keeps no second copy of
+    # the contract.
+    annotation_by_request = {answer.request_key: answer.annotation for answer in annotator_answers}
+    authority_by_request = {
+        (answer.authority, answer.tool): answer.ruling for answer in authority_answers
+    }
+    sanitizer_by_name = {answer.sanitizer: answer for answer in sanitizer_answers}
+    request_log.touch()
+    log_lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler's protocol method
+            response: dict | None = None
+            kind = "unknown"
+            name = ""
+            try:
+                length = int(self.headers.get("Content-Length", ""))
+                if length < 0 or length > 64 * 1024:
+                    raise ValueError
+                request = json.loads(self.rfile.read(length))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                request = None
+
+            if isinstance(request, dict) and self.path == "/annotator":
+                kind = "annotation"
+                name = str(request.get("name", ""))
+                # The consult carries no tool name: the annotator and the exact `args` it was
+                # sent are the whole key.
+                artifact = _consult_artifact(request, "annotation", name)
+                annotation = annotation_by_request.get((name, canonical_args(artifact.get("args")))) if artifact else None
+                if annotation is not None:
+                    response = {"version": 1, "answer": annotation}
+            elif isinstance(request, dict) and self.path.startswith("/authority/"):
+                kind = "authority"
+                name = self.path.removeprefix("/authority/")
+                artifact = _consult_artifact(request, kind, name)
+                ruling = authority_by_request.get((name, artifact.get("tool"))) if artifact else None
+                if ruling is not None:
+                    response = {"version": 1, "answer": {"ruling": ruling}}
+            elif isinstance(request, dict) and self.path.startswith("/sanitizer/"):
+                kind = "sanitizer"
+                name = self.path.removeprefix("/sanitizer/")
+                artifact = _consult_artifact(request, kind, name)
+                answer = sanitizer_by_name.get(name)
+                body = artifact.get("body")
+                if answer is not None and isinstance(body, str):
+                    derived = "".join(
+                        line
+                        for line in body.splitlines(keepends=True)
+                        if not any(needle in line for needle in answer.drop_lines_containing)
+                    )
+                    response = {"version": 1, "answer": {"body": derived}}
+
+            status = 200 if response is not None else 404
+            record = {"kind": kind, "name": name, "request": request, "status": status}
+            if response is not None:
+                record["response"] = response
+            with log_lock:
+                with request_log.open("a") as log:
+                    log.write(json.dumps(record, sort_keys=True) + "\n")
+
+            response_body = json.dumps(response).encode() if response is not None else b"{}"
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response_body)))
+            self.end_headers()
+            self.wfile.write(response_body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def _stage_policy(
+    agent: Agent,
+    scenario: Scenario,
+    episode_dir: Path,
+    external_fixture_origin: str | None = None,
+) -> Path | None:
+    """The policy this episode runs under, written into the episode directory.
+
+    An APPA arm gets the pruned TOML — the scenario's own profile when it ships
+    one, else the shared benchmark policy — with any `requires` the scenario's
+    deployment declares for that arm applied on top. FIDES gets the profile's
+    JSON, and nothing when the scenario ships no profile.
+    """
+    match agent.policy_target:
+        case PolicyTarget.APPA_GUARDED:
+            source = scenario.policy_profile.appa if scenario.policy_profile is not None else agent.policy_file
+        case PolicyTarget.APPA_OPEN:
+            source = agent.policy_file
+        case PolicyTarget.FIDES:
+            if scenario.policy_profile is None:
+                return None
+            destination = episode_dir / "fides.json"
+            shutil.copyfile(scenario.policy_profile.fides, destination)
+            return destination
+        case PolicyTarget.AUTO:
+            return None
+        case PolicyTarget.AUTO_IFC:
+            rendered, _ = settings_for(scenario.name)
+            destination = episode_dir / "auto-settings.json"
+            destination.write_text(rendered)
+            return destination
+        case PolicyTarget.NONE:
+            return None
+
+    if source is None or agent.policy_file is None:
+        raise ValueError(f"{agent.name}: APPA agents require a source policy")
+    pruned = prune_policy(source.read_text(), scenario.systems)
+    # Keyed by the arm's shared policy stem even when a profile supplied the
+    # source: a scenario declares the gate for `appa`, not for whichever file
+    # the episode happened to read it from.
+    pruned = apply_tool_requires(pruned, scenario.policy_requires.get(agent.policy_file.stem, {}))
+    if external_fixture_origin is not None and agent.policy_target == PolicyTarget.APPA_GUARDED:
+        pruned = bind_external_urls(pruned, external_fixture_origin)
+    destination = episode_dir / "policy.toml"
+    destination.write_text(pruned)
+    return destination
+
+
+def run_episode(
+    agent: Agent,
+    scenario: Scenario,
+    rep: int,
+    *,
+    model: str,
+    episode_dir: Path,
+    timeout_s: float,
+    agent_prompt_profile: str = "standard",
+) -> EpisodeResult:
+    if agent_prompt_profile not in AGENT_PROMPT_PROFILES:
+        raise ValueError(f"unknown agent prompt profile: {agent_prompt_profile}")
+    episode_dir = episode_dir.resolve()
+    episode_dir.mkdir(parents=True)
+    shutil.copytree(scenario.data, episode_dir / "data")
+    (episode_dir / "sink").mkdir()
+    stdout_path = episode_dir / "stdout.txt"
+    stderr_path = episode_dir / "stderr.txt"
+    external_request_log = episode_dir / "external-requests.jsonl"
+    with _serve_external_fixtures(
+        scenario.annotator_answers,
+        scenario.authority_answers,
+        scenario.sanitizer_answers,
+        external_request_log,
+    ) as external_fixture_origin:
+        policy_path = _stage_policy(agent, scenario, episode_dir, external_fixture_origin)
+
+        env = os.environ.copy()
+        env["CORP_ENABLED_SYSTEMS"] = ",".join(scenario.systems)
+        env["APPA_AGENT_PROMPT_ADDENDUM"] = AGENT_PROMPT_PROFILES[agent_prompt_profile]
+
+        command = command_for(
+            agent,
+            prompt=scenario.prompt,
+            model=model,
+            episode_dir=episode_dir,
+            policy_path=policy_path,
+        )
+        started = time.monotonic()
+        error: str | None = None
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            process = subprocess.Popen(
+                command,
+                stdout=stdout,
+                stderr=stderr,
+                env=env,
+                cwd=episode_dir,
+                start_new_session=True,  # own process group: timeouts kill the MCP child too
+            )
+            try:
+                code = process.wait(timeout=timeout_s)
+                if code != 0:
+                    error = f"exit {code}"
+            except subprocess.TimeoutExpired:
+                _terminate_group(process)
+                error = "timeout"
+    duration = time.monotonic() - started
+
+    answer = stdout_path.read_text(errors="replace")
+    stderr_text = stderr_path.read_text(errors="replace")
+    terminal_status = None
+    status_path = episode_dir / "agent-status.json"
+    if status_path.is_file():
+        try:
+            status_record = json.loads(status_path.read_text())
+            if status_record.get("version") != 1 or status_record.get("status") not in _TERMINAL_STATUSES:
+                raise ValueError("unsupported terminal status")
+            terminal_status = status_record["status"]
+        except (OSError, ValueError, json.JSONDecodeError):
+            terminal_status = "invalid_status"
+            error = error or "invalid agent status"
+    if terminal_status in _FAILED_TERMINAL_STATUSES:
+        error = terminal_status
+    model_usage = None
+    usage_path = episode_dir / "model-usage.json"
+    if usage_path.is_file():
+        try:
+            model_usage = _read_model_usage(usage_path)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            error = error or "invalid model usage"
+    auto_policy_sha256 = None
+    if agent.policy_target == PolicyTarget.AUTO_IFC:
+        _, auto_policy_sha256 = settings_for(scenario.name)
+    emails = parse_emails(episode_dir / "sink")
+    external_requests = (
+        [json.loads(line) for line in external_request_log.read_text().splitlines()]
+        if external_request_log.is_file()
+        else []
+    )
+
+    def evaluate(check):
+        return evaluate_check(
+            check,
+            episode_data=episode_dir / "data",
+            scenario_data=scenario.data,
+            emails=emails,
+            answer=answer,
+            sink_root=episode_dir / "sink",
+            external_requests=external_requests,
+        )
+
+    utility_results = [evaluate(check) for check in scenario.utility]
+    security_results = [evaluate(check) for check in scenario.security]
+    results = [*utility_results, *security_results]
+
+    result = EpisodeResult(
+        agent=agent.name,
+        scenario=scenario.name,
+        rep=rep,
+        agent_prompt_profile=agent_prompt_profile,
+        utility=all(r.passed for r in utility_results) if utility_results else None,
+        security=any(r.passed for r in security_results) if security_results else None,
+        error=error,
+        terminal_status=terminal_status,
+        duration_s=round(duration, 2),
+        emails=len(emails),
+        answer_present=bool(answer.strip()),
+        policy_events=_count(_APPA_POLICY_EVENT, stderr_text) + _count(_FIDES_BLOCK, stderr_text),
+        remedy_calls=_count(_REMEDY, stderr_text),
+        provider_retries=_provider_retries(stderr_text),
+        model_usage=model_usage,
+        auto_policy_sha256=auto_policy_sha256,
+        checks=results,
+    )
+    (episode_dir / "result.json").write_text(
+        json.dumps(
+            {
+                **episode_record(result),
+                "checks": [check.__dict__ for check in results],
+                "command": _recorded_command(command, episode_dir),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return result

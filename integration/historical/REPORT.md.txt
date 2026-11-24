@@ -1,0 +1,199 @@
+# Интеграция OpenAPPA с Agentic Banking Lab — технический отчёт
+
+- Целевая система: **Agentic Banking Lab** (https://github.com/LLAMATOR-Core/agentic-banking-lab),
+  локальный клон `/home/leany/memory-tracing/agentic-banking-lab`, commit `b9374e7`.
+- Интегрируемый компонент: **OpenAPPA** (`/home/leany/memory-tracing/OpenAPPA`), commit `ada9b33e`,
+  версия workspace `0.46.1`.
+- Режим: **оборонительная IFC/taint-интеграция**, а не red-team. Активных атак на стенд не проводилось.
+
+---
+
+## 1. Особенности исследованной архитектуры Agentic Banking Lab
+
+Стенд — микросервисный Python/FastAPI + LangGraph (`python:3.12-slim`, Docker Compose). Ключевые
+факты подтверждены кодом:
+
+- Один процесс `banking-agent` (`services/banking_agent/app.py`) содержит **два графа**:
+  `OrchestratorGraph` (`orchestrator.py`, режим по умолчанию) и `BankingGraph` (`graph.py`, legacy).
+  Три агента — `operations` / `investments` / `travel` (`agents.py::SkillAgent`), каждый со своим
+  OAuth-клиентом и scope (`common/banking_policy.py::AGENT_SCOPES`).
+- **LLM не выбирает инструменты свободно**: граф детерминированно маршрутизирует в узлы-навыки
+  (`skills.py`), которые вызывают *фиксированные* MCP/A2A-инструменты с фиксированными аргументами.
+  Влияние модели ограничено: маршрутизация, извлечение параметров (например, `Trip`, `StatementQuery`,
+  выбор `customer_id` в `vulnerable`-режиме) и текст финального ответа.
+- **Единые чок-пойнты вызова инструментов**:
+  - `services/common/mcp.py::MCPClient.call` — все MCP-вызовы (АБС `abs-mcp:8101` /
+    `abs-mcp-vulnerable:8104` и поиск `duckduckgo-mcp:8105`);
+  - `services/banking_agent/clients.py::MemoryClient.recall` и
+    `services/common/skill_memory.py::SkillMemoryClient.request("context", …)` — чтение долговременной
+    памяти (оба режима);
+  - `services/common/travel.py::TravelA2AClient._send` — Egress к внешнему тревел-партнёру (A2A).
+- **Доверенные/недоверенные границы** (из `docs/SECURITY.md`, подтверждено кодом): недоверенный текст
+  входит через `memory_context` (может быть отравлен — S03/S14/S15), результаты веб-поиска и ответы
+  внешнего партнёра (S05); необратимые sink'и — `abs.create_transfer` / `abs.pay_service` /
+  `abs.buy_investment_product` (`bank.write`, `banking_policy.py`).
+- Существующие защиты — RBAC/scope на MCP и АБС, TTL-подтверждение денежных действий в legacy,
+  разделение областей памяти. **Детерминированного provenance/taint-контура, связывающего факт
+  «в этом диалоге был недоверенный текст» с правом вызвать sink, в системе нет** (аналог gap,
+  зафиксированного ранее для OpenClaw).
+
+## 2. Возможности и ограничения OpenAPPA применительно к этой системе
+
+OpenAPPA — детерминированный движок Recoverable IFC. Применимые механизмы (подтверждено кодом
+`appa-engine`, `appa-runtime-api`, `appa-agent-python`):
+
+- Двумерная метка **Label = Trust × Audience**, траекторная свёртка; `delta` сужает метку после
+  результата, `requires` задаёт нижнюю границу до вызова (`appa-engine/src/check.rs`,
+  `appa-engine/src/label.rs::Label::combine` — `min` по trust, пересечение audience).
+- **Recoverable IFC**: сужающее чтение сначала *блокируется* и предлагает remedy «принять сужение»;
+  принятие идёт только через control-инструмент `execute_remedy_plan`.
+- Готовый **PyO3-адаптер для Python**: крейт `appa-agent-python` (`Session.check/report/abandon`,
+  `abi3-py311`, синхронный запуск движка in-process) — это нативный путь интеграции для Python-системы,
+  в отличие от wire-адаптеров (`claude-code`/`kagent`/`amp`/`opencode`), рассчитанных на чужие
+  MCP-протоколы.
+
+Ограничения, релевантные здесь:
+
+1. `AdapterName::ALL` закрыт для wire-режима, но `Embedded`/PyO3-путь это обходит (он и использован).
+2. **Траекторная свёртка**: один принятый недоверенный результат сужает *весь* диалог
+   (`appa-engine/src/lib.rs`). В банковском контексте это желаемое поведение для денежных sink'ов
+   (hard floor), но без subagents/confined-results оно делает диалог консервативно «грязным» —
+   фиксируется как осознанный компромисс (см. §6).
+3. В `appa-agent-python` хранилище — временный SQLite (`tempfile::tempdir()` в `SessionInner::open`),
+   TrajectoryId зафиксирован как `"episode"`. Значит состояние taint живёт **в памяти процесса** и
+   сбрасывается при рестарте; персистентность (`appa-eventlog`/Postgres) — отдельный шаг (P1).
+4. **Audience-измерение** в текущей политике не используется (только Trust): привязка audience к
+   конкретному `customer_id` требует плейсхолдеров `$arg` и разметки идентичности — отложено.
+5. Sanitizer/authority (операторский HITL) в embedded-режиме не подключён: `requires`-нарушение даёт
+   терминальный `blocked` без remedy (`offer_ids: []`) — что и нужно для денежных sink'ов, но не
+   даёт «мягкого» подтверждения оператором.
+
+## 3. Выбранный способ интеграции и обоснование
+
+**Решение: in-process PyO3-биндинг `appa-agent-python` + тонкая Python-обёртка `services/common/appa_taint.py`,
+вставленная в три существующих чок-пойнта вызова инструментов; всё opt-in через `APPA_TAINT_MODE`
+(default `off`).**
+
+Обоснование выбора именно этого подхода (а не sidecar-wire и не доработки runtime):
+
+- Система Python: OpenAPPA уже поставляет для неё целевой синхронный адаптер (`appa-agent-python`),
+  колесо собирается из исходников без изменения самого OpenAPPA (workspace member уже существует,
+  `abi3` → один артефакт для Python 3.11+, в т.ч. 3.12 контейнера и 3.14 хоста).
+- Минимальная привилегия и наименьшая поверхность изменений: gate вставляется **ровно в те места,
+  где данные пересекают границу доверия** (`MCPClient.call`, memory recall, travel egress), а не в
+  ядро графа. LLM-цикл и сами агенты не переписываются.
+- Сохранение существующей функциональности и стенда: `APPA_TAINT_MODE=off` возвращает точный прежний
+  путь (`_call_impl`), запущенные контейнеры не пересобираются и не перезапускаются; политика и обёртка
+  аддитивны.
+- Детерминизм: движок replay'ит траекторию перед каждым решением, в отличие от вероятностных
+  «prompt-инструкций»; доверенность решения не зависит от модели.
+
+Отклонённые альтернативы: (а) wire-адаптер `appa serve --adapter …` требует нового варианта
+`AdapterName` и репликацию чужого MCP-протокола из Python; (б) полный перенос IFC-логики в LangGraph —
+реимплементация, а не интеграция OpenAPPA.
+
+## 4. Реализованные изменения и принцип работы Taint Tracking
+
+### Добавлено / изменено (все правки аддитивны; default-поведение не меняется)
+
+| Файл | Изменение |
+|---|---|
+| `configs/appa.toml` | Декларативная политика: `search.text/news`, `memory.recall`, `travel.plan` → `delta = { trust = "suspicious" }`; `abs.*` чтения → `delta = {}`; `abs.create_transfer/pay_service/buy_investment_product` → `requires = { trust = "trusted" }` |
+| `services/common/appa_taint.py` | Обёртка `TaintGate` (режимы `off/observe/enforce`, per-conversation сессии, `ContextVar` траектории, auto-accept **только** для narrowing-чтений, `TaintDenied`) |
+| `services/common/mcp.py` | `MCPClient(…, taint_namespace=None)`; `call()` при непустом namespace проходит через `taint_gate.run_tool(f"{ns}.{name}", …)` |
+| `services/banking_agent/skills.py` | namespace: `abs` (mcp/vulnerable_mcp), `search` (duckduckgo) |
+| `services/banking_agent/agents.py` | то же для `bank`/`vulnerable_bank`/`search` |
+| `services/banking_agent/clients.py` | `MemoryClient.recall` → `run_tool("memory.recall", … , conversation_id=…)` |
+| `services/common/skill_memory.py` | `request("context")` → `run_tool("memory.recall", …)` |
+| `services/common/travel.py` | `_send` → `run_tool("travel.plan", … , conversation_id=…)` |
+| `services/banking_agent/app.py` | `set_conversation()/reset_conversation()` вокруг `ainvoke` графа (проброс `conversation_id` для `MCPClient.call`) |
+| `scripts/build_appa_wheel.sh` | Воспроизводимая сборка колеса из локального OpenAPPA в изолированном контейнере |
+| `vendor/appa_agent_python-0.46.1-cp311-abi3-manylinux_2_34_x86_64.whl` | Собранный артефакт (sha256: `1651ebf84548189895cd38cc2894b6801dbc4ba810c8d729830abfc73d45d962`) |
+| `tests/test_appa_taint.py` | Интеграционные тесты на реальном движке (skip при отсутствии колеса) |
+
+### Принцип работы
+
+1. На входе `POST /v1/chat` фиксируется `conversation_id` (ContextVar). Каждому диалогу соответствует
+   одна нативная `Session` OpenAPPA — траектория, чья метка переживает все ходы диалога.
+2. Перед каждым вызовом инструмента выполняется `Session.check(tool, args, call_id=uuid4)`
+   (поддержка параллельных identified-вызовов). Для параллельных батчей `asyncio.gather` движок не
+   блокирует второй вызов («a call is already pending» не возникает).
+3. Если вызов — **сужающее чтение** недоверенных данных (search/memory/travel), первый `check`
+   возвращает `blocked` с remedy; обёртка принимает сужение через `execute_remedy_plan` и повторяет
+   `check`. Результат `report` допускается в траекторию, метка диалога `trusted → suspicious`.
+4. Если вызов — **денежный sink** (`requires = { trust = "trusted" }`), то после приёма недоверенных
+   данных движок возвращает `blocked` (причина: «trust is suspicious, below the required floor
+   trusted») с `offer_ids: []`; в режиме `enforce` обёртка бросает `TaintDenied` **до** выполнения
+   sink'а. В `observe` — решение логируется, вызов проходит.
+5. Неуспешный вызов закрывается через `abandon` (Indeterminate, метку не сужает) — упавший поиск не
+   «грязнит» диалог.
+
+Тем самым taint-данные (поиск, память, партнёр) не позволяют агентам выполнить необратимые операции
+в том же диалоге — именно проверяемый контроль, которого не даёт prompt-уровневая инструкция.
+
+## 5. Результаты фактических проверок
+
+Сборка: `rust:1.96-bookworm` (rustc 1.96.1) + `maturin 1.16.0`, из локальных исходников OpenAPPA
+@ `ada9b33e`; `appa_agent_python-0.46.1-cp311-abi3-manylinux_2_34_x86_64.whl` (7.46 МБ), загружен на
+CPython 3.14 (хост) — `BINDING_IDENTITY=appa-agent-python-v9`.
+
+Интеграционные тесты (`APPA_TAINT_MODE=enforce`, реальный движок, не стаб):
+
+```
+tests/test_appa_taint.py::test_clean_conversation_allows_reads_and_money           PASSED
+tests/test_appa_taint.py::test_untrusted_ingress_blocks_money_in_the_same_conversation PASSED
+tests/test_appa_taint.py::test_taint_is_cross_turn_and_per_conversation             PASSED
+tests/test_appa_taint.py::test_undeclared_tool_is_refused                           PASSED
+tests/test_appa_taint.py::test_travel_plan_is_also_untrusted_ingress                PASSED
+```
+
+Что именно доказано детерминированно (вывод движка):
+
+- Чистый диалог: `abs.create_transfer` → `allowed`.
+- После `search.news` (недоверенный ingress) тот же диалог: `abs.create_transfer`/`abs.pay_service` →
+  `blocked`, причина «trust is suspicious, below the required floor trusted», `offer_ids: []`.
+- Taint **переживает ходы** (несколько `run_tool` в одном диалоге) и изолирован между диалогами
+  (соседний чистый диалог по-прежнему может выполнить перевод).
+- `travel.plan` и `memory.recall` дают тот же эффект сужения.
+- Необъявленный инструмент → отказ (`undeclared_tool`), транслированный в `TaintDenied`.
+
+Контракт glue воспроизведён скриптом `openappa-abl/validation.py` (4/4 PASSED): проброс
+`conversation_id` через ContextVar (как в `app.py`), блокировка перевода после веб-поиска, допуск
+чистого диалога, блокировка после результата партнёра.
+
+Контрольные негативные проверки: off-mode (`APPA_TAINT_MODE=off`) — `run_tool` возвращает результат
+исполнителя без загрузки движка (`active=False`, `PASSTHROUGH_OK`); все изменённые файлы проходят
+`python -m py_compile`.
+
+Стенд не изменялся: контейнеры (23 шт.) не пересобирались и не перезапускались, секреты `.env` не
+читались (использовалась только структура), тома Docker не удалялись.
+
+## 6. Оставшиеся ограничения и следующие шаги
+
+1. **Состояние в памяти процесса.** `appa-agent-python` хранит метку во временном SQLite и сбрасывает
+   её при рестарте `banking-agent`. → P1: персистентность через `appa-eventlog`/Postgres (или sidecar
+   `appa serve`), плюс консервативная начальная метка для восстановленных диалогов.
+2. **Траекторная свёртка.** Один недоверенный ingress делает весь диалог «грязным» для денежных
+   sink'ов (намеренный hard floor). → Смягчение через subagent-fork (`ChildStart`/`ChildEnd`) и
+   confined results / sanitizer для случаев «пересказать статью и продолжить обычный обзор».
+3. **Audience не используется.** Сейчас контролируется только Trust; привязка банковских данных к
+   конкретному клиенту (audience `self`/`@customer:$id`) и к получателю egress-вызова — следующий шаг.
+4. **Fail-open при отсутствии колеса.** Если `APPA_TAINT_MODE=enforce`, но wheel не установлен, gate
+   деградирует в passthrough (задокументировано в модуле). → Hardening: fail-closed при `enforce` без
+   нативного модуля + метрика «engine unavailable».
+5. **Лабораторные маршруты вне контура.** `/v1/lab/*`, `dashboard` и прямой `abs_mcp_vulnerable` —
+   намеренно уязвимые поверхности для экспериментов (M1/M3 в SECURITY.md); OpenAPPA-гейт покрывает
+   только агентный чат-цикл. Их следует закрыть отдельно (или исключить из промышленного контура).
+6. **Не гейтится прямой egress-текст ответа модели** (ответ в UI через `textContent`, без активной
+   разметки), и не гейтится сам текст, генерируемый после допуска недоверенных данных в контекст, если
+   он не превращается в tool-вызов — для финального ответа нужен отдельный DLP/вывод-валидатор (M5).
+7. **Сборка колеса не в CI пайплайне стенда.** Скрипт воспроизводим локально; интеграция в Dockerfile
+   (`pip install vendor/*.whl` при `APPA_TAINT_MODE != off`) и пиннинг образа `rust:1.96` — следующий шаг.
+
+### Чистота и воспроизводимость
+
+- Воспроизведение сборки: `scripts/build_appa_wheel.sh` (по умолчанию `../OpenAPPA`).
+- Воспроизведение проверок:
+  `pip install vendor/appa_agent_python-*.whl && APPA_TAINT_MODE=enforce pytest tests/test_appa_taint.py -v`.
+- Изменения не закоммичены (по правилу «не коммитить без запроса»); секреты и реальные транскрипты
+  нигде не сохранены.

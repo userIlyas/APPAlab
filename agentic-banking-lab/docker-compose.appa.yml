@@ -1,0 +1,72 @@
+# Isolated OpenAPPA-enabled banking-agent for taint-tracking validation.
+#
+# Does NOT touch the main `agentic-banking` stack: it builds its own image,
+# runs as a separate container (`agentic-banking-appa-1`, host port 8009) and
+# only *joins* the existing `agentic-banking_banking` network to reach the same
+# ABS MCP / DuckDuckGo MCP / memory-api / travel-api / Keycloak as the real
+# agent.  Shares the same .env for secrets (never printed or rewritten).
+#
+# Usage:
+#   scripts/build_appa_wheel.sh          # once, if vendor/*.whl is missing
+#   docker compose -f docker-compose.appa.yml build
+#   docker compose -f docker-compose.appa.yml up -d
+#   docker compose -f docker-compose.appa.yml down   # removes only this container
+
+services:
+  banking-agent-appa:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_MODULE: services.banking_agent.app
+        SERVICE_PACKAGE: banking_agent
+        APPA_TAINT_INSTALL: "1"
+    image: agentic-banking-banking-agent-appa
+    container_name: agentic-banking-appa-1
+    restart: "no"
+    dns: ["${DOCKER_DNS_SERVER:-1.1.1.1}"]
+    environment:
+      AUTH_DISABLED: ${AUTH_DISABLED:-false}
+      KEYCLOAK_ISSUER: http://localhost:8080/realms/agentic-banking
+      KEYCLOAK_INTERNAL_URL: http://keycloak:8080
+      KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/agentic-banking/protocol/openid-connect/certs
+      LANGFUSE_TRACING_ENVIRONMENT: local
+      AGENT_SYSTEM_ID: banking
+      LANGFUSE_PROJECT_NAME: Banking
+      LANGFUSE_PROJECT_ID: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+      LANGFUSE_BASE_URL: http://langfuse-web:3000
+      LANGFUSE_PUBLIC_KEY: ${BANKING_LANGFUSE_PUBLIC_KEY:-pk-lf-banking}
+      LANGFUSE_SECRET_KEY: ${BANKING_LANGFUSE_SECRET_KEY:-sk-lf-local-banking}
+      PORT: 8009
+      BANKING_AGENT_MODE: legacy
+      APPA_TAINT_MODE: ${APPA_TAINT_MODE:-enforce}
+      APPA_TAINT_E2E_HARNESS: "1"
+      ALLOWED_AZP: bank-ui
+      EXPECTED_AUDIENCE: banking-agent
+      ABS_MCP_URL: http://abs-mcp:8101/mcp
+      ABS_MCP_MODE: ${ABS_MCP_MODE:-secure}
+      ABS_MCP_VULNERABLE_URL: http://abs-mcp-vulnerable:8104/mcp
+      DUCKDUCKGO_MCP_URL: http://duckduckgo-mcp:8105/mcp
+      MEMORY_URL: http://memory-api:8002
+      TRAVEL_AGENT_URL: http://travel-api:8003
+      KEYCLOAK_OPERATIONS_SKILL_SECRET: ${KEYCLOAK_OPERATIONS_SKILL_SECRET:-operations-skill-secret}
+      KEYCLOAK_INVESTMENT_SKILL_SECRET: ${KEYCLOAK_INVESTMENT_SKILL_SECRET:-investment-skill-secret}
+      KEYCLOAK_TRAVEL_SKILL_SECRET: ${KEYCLOAK_TRAVEL_SKILL_SECRET:-travel-skill-secret}
+      SERVICE_CLIENT_ID: banking-agent
+      SERVICE_CLIENT_SECRET: ${KEYCLOAK_BANKING_AGENT_SECRET:-banking-agent-secret}
+      OPENROUTER_API_KEY: ${BANKING_OPENROUTER_API_KEY:-${OPENROUTER_API_KEY:-}}
+      OPENROUTER_BASE_URL: ${BANKING_OPENROUTER_BASE_URL:-${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}}
+      OPENROUTER_MODEL: ${BANKING_OPENROUTER_MODEL:-${OPENROUTER_MODEL:-deepseek/deepseek-v4-flash-0731}}
+      OPENROUTER_JSON_MODE: ${OPENROUTER_JSON_MODE:-true}
+      OPENROUTER_TIMEOUT_SECONDS: ${OPENROUTER_TIMEOUT_SECONDS:-45}
+      MEMORY_HTTP_TIMEOUT_SECONDS: ${MEMORY_HTTP_TIMEOUT_SECONDS:-60}
+      TRAVEL_HTTP_TIMEOUT_SECONDS: ${TRAVEL_HTTP_TIMEOUT_SECONDS:-180}
+      BANK_TIMEZONE: ${BANK_TIMEZONE:-Europe/Moscow}
+    ports: ["127.0.0.1:8009:8009"]
+    networks:
+      - banking
+
+networks:
+  banking:
+    external: true
+    name: agentic-banking_banking

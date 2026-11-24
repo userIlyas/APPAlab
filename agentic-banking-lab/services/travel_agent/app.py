@@ -1,0 +1,278 @@
+from __future__ import annotations
+
+import os
+import uuid
+from datetime import date
+from typing import Annotated, Any, Literal
+
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from services.common.auth import Principal, require_principal, require_scope
+from services.common.llm import install_llm_error_handlers
+from services.common.schemas import MockFlightSearch
+from services.common.tracing import (
+    install_experiment_middleware,
+    observation,
+    public_trace_config,
+    traced,
+)
+from services.travel_agent.graph import travel_graph
+
+
+class TripRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    user_id: str = Field(min_length=1, max_length=128)
+    request_type: Literal["destination_info", "trip_search", "budget_plan"] = "trip_search"
+    user_query: str = Field(default="", max_length=1000)
+    origin: str | None = Field(default=None, min_length=3, max_length=3)
+    destination: str = Field(min_length=2, max_length=120)
+    destination_airport: str | None = Field(default=None, min_length=3, max_length=3)
+    departure_date: date | None = None
+    return_date: date | None = None
+    stay_end_date: date | None = None
+    one_way: bool = False
+    travel_period: str | None = Field(default=None, max_length=120)
+    duration_days: int | None = Field(default=None, ge=1, le=365)
+    adults: int = Field(default=1, ge=1, le=9)
+    budget: float | None = Field(default=None, gt=0)
+    currency: str = Field(default="RUB", min_length=3, max_length=3)
+    interests: list[str] = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def validate_dates(self):
+        if self.request_type == "destination_info":
+            return self
+        if self.one_way and self.return_date:
+            raise ValueError("one_way cannot include a return flight")
+        if self.request_type == "budget_plan":
+            if self.departure_date and self.departure_date < date.today():
+                raise ValueError("departure_date cannot be in the past")
+            if (
+                self.departure_date
+                and self.stay_end_date
+                and self.stay_end_date <= self.departure_date
+            ):
+                raise ValueError("stay_end_date must be after departure_date")
+            if self.return_date and (
+                not self.departure_date or self.return_date <= self.departure_date
+            ):
+                raise ValueError("return_date must be after departure_date")
+            return self
+        required = {
+            "origin": self.origin,
+            "destination_airport": self.destination_airport,
+            "departure_date": self.departure_date,
+        }
+        if not self.one_way:
+            required["return_date"] = self.return_date
+        missing = [key for key, value in required.items() if value is None]
+        if missing:
+            raise ValueError(f"trip_search requires: {', '.join(missing)}")
+        if self.departure_date < date.today():
+            raise ValueError("departure_date cannot be in the past")
+        if self.return_date and self.return_date <= self.departure_date:
+            raise ValueError("return_date must be after departure_date")
+        return self
+
+
+class MockBookingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    flight_result_id: str | None = Field(default=None, min_length=1, max_length=120)
+    accommodation_result_id: str | None = Field(default=None, min_length=1, max_length=120)
+
+    @model_validator(mode="after")
+    def require_selection(self):
+        if not self.flight_result_id and not self.accommodation_result_id:
+            raise ValueError("select at least one flight or accommodation result")
+        return self
+
+
+class LabFlightSourceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_type: Literal["lab_flight_source"]
+    search: MockFlightSearch
+
+
+class A2AMockBookingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_type: Literal["mock_booking"]
+    booking: MockBookingRequest
+
+
+app = FastAPI(title="Partner Travel Agent", version="0.1.0")
+install_experiment_middleware(
+    app, agent_routes={("POST", "/a2a/v1/message:send"): "travel-agent.request"}
+)
+install_llm_error_handlers(app)
+
+
+async def travel_caller(principal: Principal = Depends(require_principal)):
+    if principal.authorized_party == "travel-skill":
+        require_scope(principal, "travel.plan")
+    return principal
+
+
+Caller = Annotated[Principal, Depends(travel_caller)]
+
+
+@app.get("/health")
+async def health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "service": "travel-agent",
+        "flight_provider": travel_graph.flight_provider,
+        "observability": public_trace_config(),
+        "llm": travel_graph.llm.public_config(),
+    }
+
+
+@app.get("/.well-known/agent-card.json")
+async def agent_card() -> dict[str, Any]:
+    base_url = os.getenv("PUBLIC_BASE_URL", "http://localhost:8003")
+    return {
+        "name": "Bank Partner Travel Agent",
+        "description": (
+            "LLM agent combining Tutu or mock flight searches, local mock booking, "
+            "web search for destination information and travel costs, and recommendations."
+        ),
+        "supportedInterfaces": [
+            {
+                "url": f"{base_url}/a2a/v1",
+                "protocolBinding": "HTTP+JSON",
+                "protocolVersion": "1.0",
+            }
+        ],
+        "provider": {"organization": "Bank partner", "url": base_url},
+        "version": "0.1.0",
+        "capabilities": {"streaming": False, "pushNotifications": False},
+        "securitySchemes": {
+            "keycloakOAuth": {
+                "type": "oauth2",
+                "description": "Keycloak client credentials",
+                "flows": {
+                    "clientCredentials": {
+                        "tokenUrl": "http://localhost:8080/realms/agentic-banking/protocol/openid-connect/token",
+                        "scopes": {},
+                    }
+                },
+            }
+        },
+        "security": [{"keycloakOAuth": []}],
+        "defaultInputModes": ["application/json"],
+        "defaultOutputModes": ["application/json"],
+        "skills": [
+            {
+                "id": "lab-flight-source",
+                "name": "Read a laboratory flight source",
+                "description": (
+                    "Returns the controlled mock MCP response over A2A for memory experiments."
+                ),
+                "tags": ["lab", "flights"],
+                "inputModes": ["application/json"],
+                "outputModes": ["application/json"],
+            },
+            {
+                "id": "plan-trip",
+                "name": "Plan a trip",
+                "description": (
+                    "Combines Tutu flights with web search for destinations, travel costs and "
+                    "activities, returning source links; lab mock optional."
+                ),
+                "tags": ["travel", "flights", "destinations"],
+                "inputModes": ["application/json"],
+                "outputModes": ["application/json"],
+            },
+            {
+                "id": "mock-booking",
+                "name": "Create a mock booking",
+                "description": "Creates a local simulation only, with no provider side effect.",
+                "tags": ["travel", "booking", "mock"],
+                "inputModes": ["application/json"],
+                "outputModes": ["application/json"],
+            },
+        ],
+    }
+
+
+@app.post("/v1/bookings/mock")
+@traced("travel.api.create_mock_booking", agent_id="travel-agent")
+async def create_mock_booking(payload: MockBookingRequest, caller: Caller) -> dict[str, Any]:
+    booking_id = f"mock-{uuid.uuid4()}"
+    result = {
+        "booking_id": booking_id,
+        "mode": "mock-local",
+        "status": "mock-confirmed",
+        "flight_result_id": payload.flight_result_id,
+        "accommodation_result_id": payload.accommodation_result_id,
+        "external_side_effect": False,
+        "message": "Учебная бронь создана только внутри Travel Agent.",
+    }
+    with observation(
+        "travel.mock-booking",
+        input=payload.model_dump(),
+        metadata={"caller": caller.authorized_party, "mock": True},
+        user_id=caller.customer_id,
+        agent_id="travel-agent",
+    ) as span:
+        span.update(output=result)
+    return result
+
+
+@app.post("/a2a/v1/message:send")
+async def send_message(
+    payload: dict[str, Any],
+    caller: Caller,
+    a2a_version: str = Header(default="1.0", alias="A2A-Version"),
+) -> JSONResponse:
+    if not a2a_version.startswith("1."):
+        raise HTTPException(400, "Only A2A 1.x is supported")
+    try:
+        message = payload["message"]
+        if message.get("role") not in {"ROLE_USER", "user"}:
+            raise ValueError("message role must be ROLE_USER")
+        data_parts = [
+            part["data"] for part in message["parts"] if isinstance(part.get("data"), dict)
+        ]
+        request = data_parts[0]
+        kind = request.get("request_type")
+        schema = {
+            "lab_flight_source": LabFlightSourceRequest,
+            "mock_booking": A2AMockBookingRequest,
+        }.get(kind, TripRequest)
+        trip = schema.model_validate(request)
+    except (KeyError, IndexError, ValueError) as exc:
+        raise HTTPException(422, f"Invalid A2A SendMessage request: {exc}") from exc
+
+    safe_input = trip.model_dump(mode="json")
+    # The strict schema does not accept bank profile or account data.
+    with observation(
+        "a2a.travel.send-message",
+        input=safe_input,
+        metadata={"protocol": "A2A", "version": a2a_version, "caller": caller.authorized_party},
+        user_id=getattr(trip, "user_id", None),
+        session_id=message.get("contextId"),
+        agent_id="travel-agent",
+    ) as span:
+        if kind == "lab_flight_source":
+            result = await travel_graph.mock_flights.call("search_flights", safe_input["search"])
+            result["tool_calls"] = ["flights.search_flights"]
+        elif kind == "mock_booking":
+            result = await create_mock_booking(trip.booking, caller)
+            result["tool_calls"] = ["travel.mock-booking"]
+        else:
+            state = await travel_graph.graph.ainvoke({"request": safe_input})
+            result = state["result"]
+            result["tool_calls"] = state["tool_calls"]
+        span.update(output=result)
+
+    response = {
+        "message": {
+            "role": "ROLE_AGENT",
+            "parts": [{"data": result, "mediaType": "application/json"}],
+            "messageId": str(uuid.uuid4()),
+            "contextId": message.get("contextId"),
+        }
+    }
+    return JSONResponse(response, media_type="application/a2a+json")

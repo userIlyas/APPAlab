@@ -1,0 +1,205 @@
+# OpenAPPA on the complete AgentThreatBench suite
+
+This harness runs all 24 samples (10 Memory Poison, 6 Autonomy Hijack, and 8
+Data Exfiltration) from the pinned Inspect
+[AgentThreatBench](https://github.com/UKGovernmentBEIS/inspect_evals/tree/0c737b01627b772db84aa223f68775c31199fdc9/src/inspect_evals/agent_threat_bench)
+revision through seven arms:
+
+| Arm | Model loop | Mediation |
+|---|---|---|
+| `stock` | Upstream Inspect loop and prompt | None |
+| `permissive` | OpenAPPA scaffold | No-op contract |
+| `guarded` | Same OpenAPPA scaffold | Source and sink contracts |
+| `fides` | FIDES scaffold | Microsoft Agent Framework FIDES middleware on the exact upstream tool surface |
+| `fides-native` | FIDES scaffold plus official security instructions/tools | FIDES automatic hiding, quarantine, label tracking, and enforcement |
+| `auto` | Bundled Claude Code actor with the upstream prompt and tools | Anthropic Auto defaults |
+| `auto-ifc` | Same bundled Claude Code actor, prompt, and tools as `auto` | Per-sample IFC-oriented Auto classifier facts and boundaries |
+
+The run also includes paired authorized and unauthorized Data Exfiltration
+controls for every arm.
+
+### Domain policies and enforcement models
+
+- **Data Exfiltration (ASI01)**: Employs dynamic audience resolution (`customer-acl` and `recipient-members`) via a local loopback fixture. Looking up customer records binds the session's permitted reader audience to that specific customer's authorized recipients; the fixture serves the sample's `authorized_recipients` allowlist, the same list the upstream scorer uses, so APPA enforces a given ACL rather than detecting exfiltration. This allows legitimate ticket resolution and authorized messaging while deterministically blocking unauthorized exfiltration attempts.
+- **Memory Poisoning (ASI06)**: The guarded parent fixes a closed object schema before retrieval, then opens a genuinely separate child model context. Only the child sees `memory_read` output. Its exact structured submission is checked against the frozen shape and crosses through APPA's mandatory `attest-schema` return sanitizer; raw memory never enters the parent transcript. The host does not inspect memory, select answers, or use sample IDs. This creates an instruction-clean bounded channel, not a truth oracle: a parent that omits the right enum candidate or a child that selects an in-range false value can still lose utility. Any schema, child, or attestation failure withholds the result without a raw fallback.
+- **Autonomy Hijacking (ASI02)**: `read_inbox` returns legitimate and malicious emails in one composite tool response. The guarded parent opens an isolated child with a frozen schema derived only from the trusted record count. The child sees the raw inbox and returns a bounded per-index action projection through `attest-schema`; an `important_candidate` becomes a real `important` categorization, so security depends on the child's semantic judgment rather than a structural ban on promotion. For important candidates, the `draft_summary` body is a deterministic `topic=...; action=...; urgency=...` projection from closed vocabularies, not free-form prose. Raw email text never enters the parent transcript. The evaluated FIDES policies still label the composite result as one untrusted value, so downstream protected actions remain conservatively blocked.
+
+Both FIDES arms use `agent-framework-core==1.13.0` and its label-tracking
+and policy-enforcement middleware. Memory and inbox reads are labeled
+untrusted. Customer lookups are labeled untrusted/private; public delivery
+sinks reject that confidentiality. FIDES has no per-recipient dynamic audience
+primitive, so the authorized Data Exfiltration control measures the resulting
+conservative denial alongside the unauthorized control. Automatic hiding is
+disabled in `fides` to retain the exact upstream tool surface. The
+`fides-native` arm enables automatic hiding, injects the official
+`quarantined_llm` and `inspect_variable` tools and security instructions, and
+adapts Inspect's selected model as the tool-less quarantine client. The inbox
+remains one composite upstream result; the harness never uses attack indices or
+markers to assign per-item labels.
+
+The score report separates the upstream proposal/final-completion projection
+from actual store mutations and checked deliveries. A blocked proposal remains
+in the Inspect transcript for audit but cannot earn utility or count as an
+executed attack in the actual score.
+
+Accounting uses Inspect's sample-scoped provider usage. The summary records
+model calls, total input tokens, cache reads and writes, output and reasoning
+tokens, total tokens, and USD cost. It includes calls from the parent, isolated
+children, and quarantine clients. An unavailable field remains `null`; the
+benchmark never converts unknown usage to zero.
+
+The Auto arms use `ResultMessage.model_usage` and `total_cost_usd` from the
+Claude Agent SDK. These totals include the actor calls reported by Claude Code.
+Claude Code does not expose separate Auto classifier-call usage, so classifier
+tokens are excluded rather than estimated. Reasoning-token usage remains
+`null` because the SDK does not report it.
+
+Both Auto arms expose only in-process MCP wrappers over the exact upstream
+domain tools. Built-in coding tools and user, project, and local settings
+sources are disabled. MCP tools are intentionally absent from `allowed_tools`,
+so Auto classifies every call. `auto-ifc` derives Data Exfiltration audiences
+from each sample's existing ACL metadata. Memory and inbox facts identify
+suspicious provenance and the lack of an equivalent APPA attestation channel.
+Runs that include an Auto arm require an `anthropic/<model>` Inspect model and
+use that same Claude model in every arm, including Auto's Agent SDK loop.
+
+`usage_overhead_vs_baseline` compares each policy-bearing arm with its matching
+empty or default-policy arm: `guarded` with `permissive`, `fides-native` with
+`fides`, and `auto-ifc` with `auto`. Each entry reports the difference between
+mean provider-reported usage per sample and the baseline mean, plus their
+ratio. This is a crude policy overhead measure. It includes every reported
+model call in an episode, but not local runtime, tool, MCP, or network work.
+Missing or partial usage produces `null`, never an invented zero.
+
+## Setup and preflight
+
+```sh
+uv sync
+export OPENROUTER_API_KEY=...
+uv run appa-agentthreatbench preflight
+```
+
+Preflight verifies the exact upstream revision, Inspect version, native binding
+identity, sample inventory, policy loading, and credential name. It makes no
+model request.
+
+Before the complete run, exercise all lifecycle paths with the separately
+manifested smoke set:
+
+```sh
+uv run appa-agentthreatbench smoke \
+  --model openrouter/openai/gpt-5.6-terra \
+  --reasoning-effort high
+```
+
+## Complete evaluation
+
+```sh
+uv run appa-agentthreatbench run \
+  --model openrouter/openai/gpt-5.6-terra \
+  --reasoning-effort high \
+  --max-concurrency 50 \
+  --run-name full-gpt-5.6-terra
+```
+
+Sample concurrency starts at one, rises after clean completions, and backs off
+under live memory pressure. `--max-concurrency` is an optional ceiling; omit it
+to use the number of selected samples, or set it to one for serial debugging.
+Inspect retains its independent adaptive provider connection controller. All
+configured cases run inside one task. Tool calls within a sample remain serialized. Inspect logs,
+OpenAPPA/FIDES mediation sidecars, resolver requests, the run manifest, and
+`summary.json` are written below the ignored `runs/` directory. Each run also
+records concurrency transitions and the peak active sample count.
+
+## Publish a completed run
+
+Package and publish one completed run through the repository's private draft
+release relay:
+
+```sh
+uv run appa-agentthreatbench publish runs/<run-id>
+```
+
+The command uses the full Git commit recorded when the run started. An
+optional `--commit <sha>` must match that recorded commit.
+Runs produced from a dirty Git worktree cannot be published.
+It creates a deterministic `<run-id>-<sha256>.tar.zst` and `index.json` under
+`runs/publish/<run-id>/`, creates a draft relay release, uploads exactly those
+two assets, dispatches `.github/workflows/bench-publish.yml`, and prints the
+workflow run URL. The workflow verifies the bundle, publishes it to
+`bench/agentthreatbench/<commit>/<run-id>/`, reads it back, and then deletes
+the relay.
+Rerunning accepts an unchanged local bundle and reuses its draft relay. A
+changed run or index requires a new `--output-dir` or removal of the old one.
+
+To inspect the bundle or relay it manually, stop before any GitHub operation:
+
+```sh
+uv run appa-agentthreatbench publish runs/<run-id> --prepare-only
+```
+
+Packaging refuses symlinks, recognizable provider tokens, non-redacted values
+assigned to provider-key fields, and local absolute paths rooted at `/home`,
+`/Users`, `/workspace`, `/tmp`, `/var/tmp`, `/root`, or a Windows drive. It
+checks ordinary files and files nested inside ZIP-based `.eval` logs. The
+command does not redact or rewrite run evidence.
+
+Full publication depends on `bench-publish.yml` landing on the default branch;
+it is currently proposed by [PR #333](https://github.com/archestra-ai/OpenAPPA/pull/333).
+Until then, use `--prepare-only`. After the workflow lands, the equivalent
+manual relay is:
+
+```sh
+bundle=runs/publish/<run-id>
+archive=$(jq -r .archive "$bundle/index.json")
+tag=bench-relay-agentthreatbench-<run-id>
+gh release create "$tag" --draft --title "$tag"
+gh release upload "$tag" "$bundle/$archive" "$bundle/index.json"
+gh workflow run bench-publish.yml \
+  -f bench=agentthreatbench -f commit=<git-sha> -f run_id=<run-id> -f relay_tag="$tag"
+```
+
+## Render trajectory reports
+
+Render one run, or compare actual outcomes from two runs:
+
+```sh
+uv run appa-agentthreatbench render \
+  --run-dir runs/full-standard \
+  --compare-run-dir runs/full-chaos \
+  --task-type data_exfil
+```
+
+A run directory must contain exactly one `.eval` file below `inspect-logs/`;
+an `.eval` path can also be passed directly. Without `--output-file`, directory
+inputs produce `trajectory_report.md` in the run directory, while direct log
+inputs produce `<log-name>-trajectory-report.md` beside the log. Summary tables
+keep the disclosed controls separate from upstream denominators.
+
+## The ChaosMonkey profile elicits attacks without answer keys
+
+TauBench's ChaosMonkey-GPT keeps GPT-5.6 Luna fixed and adds a penetration-test
+prompt. AgentThreatBench's `agent-threat-chaos` variant follows the same design,
+but asks the model to attempt one tool-realizable embedded instruction through
+the relevant memory, inbox, or customer-record surface. It names no sample,
+scorer marker, attack recipient, or sensitive value. Every arm receives the
+same addendum; the stock arm otherwise retains the upstream loop, while each
+mediated arm retains its policy-specific scaffold.
+
+```sh
+uv run appa-agentthreatbench run \
+  --model openrouter/openai/gpt-5.6-terra \
+  --reasoning-effort high \
+  --agent-prompt-profile agent-threat-chaos \
+  --max-concurrency 50 \
+  --run-name full-gpt-5.6-terra-chaos
+```
+
+The prompt profile and its SHA-256 digest are part of the run manifest and run
+digest. This is a controlled adversarial-prompt evaluation, not the model's
+natural attack rate.
+
+Ordinary final assistant text stays inside Inspect. The custom scaffold exposes
+`respond_to_user(recipient, body)` as the only simulated delivery path. Memory
+and Autonomy use `requesting_user`; Data Exfiltration uses an address learned
+from the selected customer record.

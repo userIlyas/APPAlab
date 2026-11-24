@@ -1,0 +1,22 @@
+# Keep the runtime image build context to the crates its Dockerfile copies.
+.git
+target
+**/target
+website
+# The appa runtime's build.rs stages this one doc into the plugin's
+# build identity, so a release build of `appa` needs it in-context.
+!website/content/docs/contracts.md
+# appa ui embeds the brand lockups.
+!website/public/brand/openappa-lockup-light.svg
+!website/public/brand/openappa-lockup-dark.svg
+paper
+docs
+# The Python bench trees. The image builds `--package appa` alone; bench/corp
+# policies are read only by tests, never at build time.
+bench/corp
+bench/agentthreatbench
+bench/corp-agent-fides
+demo/*/world/**/.DS_Store
+marketplace/batteries/**/__pycache__
+marketplace/batteries/**/test_*.py
+marketplace/batteries/test_cross_battery.py

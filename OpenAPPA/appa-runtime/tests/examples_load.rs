@@ -1,0 +1,1027 @@
+use crate::common;
+use common::repo_root;
+#[cfg(unix)]
+use common::{
+    actor, including_coding_on_native_claude_code_tools, last_offer, propose, ran, raw, root, unsanitized_offer_of,
+    with_a_local_file_tracker,
+};
+
+use std::path::Path;
+
+use appa_package::BatteryTarget;
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::sync::Arc;
+
+#[cfg(unix)]
+use appa_runtime::api::{RemedyOutcome, Runtime};
+#[cfg(unix)]
+use appa_runtime::config::Config;
+#[cfg(unix)]
+use appa_runtime::hooks;
+#[cfg(unix)]
+use appa_runtime_api::{HookDecision, HookEvent, OutcomeBody, ProposedCall, ToolOutcome};
+
+/// The policies a package directory ships, by the suffix every one of them
+/// carries. The package's own `appa-package.toml` manifest is not a policy.
+#[cfg(unix)]
+fn policy_files(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+        let path = entry.expect("the directory entry is readable").path();
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with(".appa.toml"))
+        {
+            found.push(path);
+        }
+    }
+    found.sort();
+    found
+}
+
+fn opens(path: &Path, target: BatteryTarget) {
+    let battery_dirs = [repo_root().join("marketplace/batteries")];
+    let config = Config::load_for_target(path, &battery_dirs, target)
+        .unwrap_or_else(|error| panic!("{} does not load: {error}", path.display()));
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    Runtime::open(config, dir.path().join("appa.db"), None)
+        .unwrap_or_else(|error| panic!("{} does not open: {error}", path.display()));
+}
+
+#[cfg(unix)]
+#[test]
+fn every_shipped_example_opens() {
+    let examples = policy_files(&repo_root().join("marketplace/plugins/claude-code"));
+    assert!(
+        !examples.is_empty(),
+        "the shipped examples were found and checked, not {examples:?}"
+    );
+    // `appa plugin install claude-code` includes the plugin's batteries, which declare the
+    // Annotator the default binds.
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    for path in &examples {
+        let text = std::fs::read_to_string(path).expect("the example is readable");
+        let root = dir.path().join(path.file_name().expect("the example has a name"));
+        std::fs::write(
+            &root,
+            format!("include = [\"batteries/coding/appa.toml\", \"batteries/claude-code/appa.toml\"]\n{text}"),
+        )
+        .expect("the composed example writes");
+        opens(&root, BatteryTarget::SingleUser);
+    }
+}
+
+#[test]
+fn the_kagent_policies_open() {
+    opens(
+        &repo_root().join("marketplace/plugins/kagent/default.appa.toml"),
+        BatteryTarget::MultiUser,
+    );
+    opens(
+        &repo_root().join("integrations/kagent/demo/chart/files/demo.appa.toml"),
+        BatteryTarget::MultiUser,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_live_replay_roots_open() {
+    opens(
+        &repo_root().join("examples/live-replays/github/appa.toml"),
+        BatteryTarget::SingleUser,
+    );
+    opens(
+        &repo_root().join("examples/live-replays/linear/appa.toml"),
+        BatteryTarget::SingleUser,
+    );
+}
+
+/// The `coding` battery, whose canonical web tools the Claude Code battery binds, beside it in `dir`.
+#[cfg(unix)]
+fn with_the_coding_battery(dir: &Path) {
+    let battery_dir = dir.join("batteries/coding");
+    std::fs::create_dir_all(&battery_dir).expect("the battery directory is created");
+    std::fs::copy(
+        repo_root().join("marketplace/batteries/coding/appa.toml"),
+        battery_dir.join("appa.toml"),
+    )
+    .expect("the battery file is copied");
+}
+
+/// The initialized default with the plugin's batteries included, as `appa plugin install
+/// claude-code` composes them: the default's rules run before the batteries', and the
+/// file-tracker's before the coding battery's.
+#[cfg(unix)]
+fn composed_with_the_battery(dir: &tempfile::TempDir) -> Config {
+    with_the_coding_battery(dir.path());
+    for battery in ["file-tracker", "claude-code"] {
+        let battery_dir = dir.path().join("batteries").join(battery);
+        std::fs::create_dir_all(&battery_dir).expect("the battery directory is created");
+        std::fs::copy(
+            repo_root()
+                .join("marketplace/batteries")
+                .join(battery)
+                .join("appa.toml"),
+            battery_dir.join("appa.toml"),
+        )
+        .expect("the battery file is copied");
+    }
+    composed(
+        dir,
+        "include = [\"batteries/file-tracker/appa.toml\", \"batteries/coding/appa.toml\", \"batteries/claude-code/appa.toml\"]\n",
+        "",
+    )
+}
+
+/// The initialized default over the coding battery bound to Claude Code's native tools,
+/// with the fetch Annotator replaced by a script that labels every fetch as a public sink
+/// returning `suspicious` data.
+#[cfg(unix)]
+fn coding_on_native_tools_with_a_suspicious_fetch(dir: &tempfile::TempDir) -> Config {
+    std::fs::write(
+        dir.path().join("fetch-annotator.sh"),
+        "cat > /dev/null\nprintf '%s' '{\"version\":1,\"answer\":{\"delta\":{\"trust\":\"suspicious\"},\"requires\":{\"audience\":{\"contains\":\"public\"},\"history\":[],\"attention\":[]},\"emits\":[]}}'",
+    )
+    .expect("the annotator script writes");
+    composed(
+        dir,
+        including_coding_on_native_claude_code_tools(dir.path()),
+        r#"
+[[policy.annotator]]
+name = "claude-code.fetch-requirements"
+
+[externals.annotators."claude-code.fetch-requirements"]
+command = ["/bin/sh", "fetch-annotator.sh"]
+"#,
+    )
+}
+
+/// The initialized default under `include`, followed by `root_tail`.
+#[cfg(unix)]
+fn composed(dir: &tempfile::TempDir, include: &str, root_tail: &str) -> Config {
+    let default = std::fs::read_to_string(repo_root().join("marketplace/plugins/claude-code/default.appa.toml"))
+        .expect("the initialized default is readable");
+    let root = dir.path().join("appa.toml");
+    std::fs::write(&root, format!("{include}\n{default}{root_tail}")).expect("the initialized config writes");
+    Config::load(&root).expect("the initialized config and batteries compose")
+}
+
+/// Clappa, the Claude Code deployment, is where battery sanitizers run by default: its root
+/// binds every sanitizer a shipped battery declares, except the OpenCode battery's, whose
+/// tools never appear in a Claude Code session. Every other shipped
+/// root binds none, so in those deployments a battery sanitizer runs only once someone binds it.
+#[test]
+fn only_the_claude_code_default_binds_battery_sanitizers() {
+    let repository = repo_root();
+    let read = |path: &Path| -> toml::Value {
+        toml::from_str(&std::fs::read_to_string(path).expect("the policy is readable")).expect("the policy parses")
+    };
+    let mut declared = std::collections::BTreeSet::new();
+    for battery in std::fs::read_dir(repository.join("marketplace/batteries")).expect("the batteries are listed") {
+        let battery = battery.expect("a battery entry").path();
+        if !battery.is_dir() {
+            continue;
+        }
+        for file in std::fs::read_dir(&battery).expect("a battery directory is listed") {
+            let file = file.expect("a battery file").path();
+            if file.extension().is_none_or(|extension| extension != "toml") {
+                continue;
+            }
+            let policy = read(&file);
+            let names = policy
+                .get("policy")
+                .and_then(|policy| policy.get("sanitizer"))
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|sanitizer| sanitizer["name"].as_str())
+                .map(str::to_owned);
+            declared.extend(names);
+        }
+    }
+    assert!(declared.contains("pagerduty.redact-for-public"), "{declared:?}");
+
+    let bound = |root: &toml::Value| -> std::collections::BTreeSet<String> {
+        root.get("externals")
+            .and_then(|externals| externals.get("sanitizers"))
+            .and_then(toml::Value::as_table)
+            .map(|table| table.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let clappa = bound(&read(
+        &repository.join("marketplace/plugins/claude-code/default.appa.toml"),
+    ));
+    let unbound: Vec<&String> = declared.iter().filter(|name| !clappa.contains(*name)).collect();
+    assert_eq!(
+        unbound,
+        ["opencode.strip-instructions"],
+        "the Claude Code default binds every other battery sanitizer"
+    );
+
+    for plugin in std::fs::read_dir(repository.join("marketplace/plugins")).expect("the plugins are listed") {
+        let root = plugin.expect("a plugin entry").path().join("default.appa.toml");
+        if !root.exists() || root.starts_with(repository.join("marketplace/plugins/claude-code")) {
+            continue;
+        }
+        let other = bound(&read(&root));
+        let battery_bindings: Vec<&String> = other.iter().filter(|name| declared.contains(*name)).collect();
+        assert!(
+            battery_bindings.is_empty(),
+            "{} binds {battery_bindings:?}",
+            root.display()
+        );
+    }
+}
+
+/// A root that binds `coding.strip-secrets`, over a client map that confines the shell, gets
+/// the masked output in place of the raw result. The binding here is a stand-in that masks
+/// every value after `=`, so the delivery runs without a model; the output enters at
+/// `internal`, never `self`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bound_secret_masker_delivers_the_masked_shell_output() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    std::fs::write(
+        dir.path().join("mask.py"),
+        "import json, re, sys\n\
+         body = json.load(sys.stdin)['artifact']['body']\n\
+         print(json.dumps({'version': 1, 'answer': {'body': re.sub(r'=.*', '=[redacted-secret]', body)}}))\n",
+    )
+    .expect("the stand-in is writable");
+    let include = including_coding_on_native_claude_code_tools(dir.path());
+    let default = std::fs::read_to_string(repo_root().join("marketplace/plugins/claude-code/default.appa.toml"))
+        .expect("the initialized default is readable");
+    let bound = "[externals.sanitizers.\"coding.strip-secrets\"]\nbuiltin = \"claude-code\"\n";
+    assert!(
+        default.contains(bound),
+        "the default binds the masker to the Claude Code model"
+    );
+    let path = dir.path().join("appa.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "{include}\n{}",
+            default.replace(
+                bound,
+                "[externals.sanitizers.\"coding.strip-secrets\"]\ncommand = [\"python3\", \"mask.py\"]\n"
+            )
+        ),
+    )
+    .expect("the initialized config writes");
+    let config = Config::load(&path).expect("the initialized config and batteries compose");
+    let runtime =
+        Arc::new(Runtime::open(config, dir.path().join("appa.db"), None).expect("the composed deployment opens"));
+    assert_eq!(
+        hooks::handle(
+            &runtime,
+            HookEvent::SessionStart {
+                root: root(),
+                principal: None,
+                address: None,
+                title: None,
+                start: None,
+                launch: None,
+            }
+        )
+        .await,
+        HookDecision::Ack
+    );
+
+    let read = call("host/claude-code/Bash", "command", "cat .env");
+    let blocked = propose(&runtime, read.clone()).await;
+    let HookDecision::DenyCall { feedback, .. } = &blocked else {
+        panic!("a credential read is blocked with the masker offered, got {blocked:?}");
+    };
+    let masker = feedback
+        .lines()
+        .skip_while(|line| !line.contains("sanitizer coding.strip-secrets"))
+        .nth(1)
+        .map(last_offer)
+        .unwrap_or_else(|| panic!("the masker is offered: {feedback}"));
+    assert!(matches!(
+        runtime.execute_remedy(&actor(), masker).await,
+        RemedyOutcome::Authorized { .. }
+    ));
+    assert_eq!(
+        propose(&runtime, read.clone()).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    let delivered = hooks::handle(
+        &runtime,
+        HookEvent::ToolResult {
+            actor: actor(),
+            call: read,
+            call_id: None,
+            outcome: ToolOutcome::Success {
+                body: OutcomeBody::Available("GITHUB_TOKEN=ghp_live\nREGION=eu-west-1\n".to_string()),
+            },
+        },
+    )
+    .await;
+    let HookDecision::ReplaceOutput { output } = delivered else {
+        panic!("the masked output carries `internal`, a residual on a public session, got {delivered:?}");
+    };
+    assert!(output.contains("public -> internal"), "never `self`: {output}");
+    let RemedyOutcome::Returned { value } = runtime.execute_remedy(&actor(), last_offer(&output)).await else {
+        panic!("accepting the residual returns the masked output");
+    };
+    assert_eq!(value, "GITHUB_TOKEN=[redacted-secret]\nREGION=[redacted-secret]\n");
+}
+
+/// Composed with the default and the coding battery, the Claude Code battery hands Read,
+/// Write, Edit, Bash and SafeBash to the file-tracker as their Annotator and recorder, blocks
+/// the tools that run commands or touch file content out of its sight, and keeps its web
+/// and fallback Annotators.
+#[cfg(unix)]
+#[test]
+fn the_initialized_default_composes_with_the_claude_code_battery() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let config = composed_with_the_battery(&dir);
+    let tools = config.policy_file().value()["tool"]
+        .as_array()
+        .expect("the composed tools are an array");
+    // The first rule with a name decides the calls it matches: the coding battery's rules for
+    // the same tools come after the file-tracker's.
+    let rule = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("{name} has a composed rule"))
+            .clone()
+    };
+    for name in [
+        "host/claude-code/Read",
+        "host/claude-code/Write",
+        "host/claude-code/Edit",
+        "host/claude-code/Bash",
+        "mcp/file-tracker/SafeBash",
+    ] {
+        let rule = rule(name);
+        assert_eq!(rule["annotator"].as_str(), Some("file-tracker"), "{name}");
+        assert_eq!(rule["recorder"].as_str(), Some("file-tracker"), "{name}");
+    }
+    // A networked call matches its own rule first: the first matching rule wins.
+    let position = |name: &str| tools.iter().position(|tool| tool["name"].as_str() == Some(name));
+    for shell in ["host/claude-code/Bash", "mcp/file-tracker/SafeBash"] {
+        let networked = format!("{shell}(network_hosts:*)");
+        let rule = rule(&networked);
+        assert_eq!(rule["annotator"].as_str(), Some("file-tracker"), "{networked}");
+        assert_eq!(rule["recorder"].as_str(), Some("file-tracker"), "{networked}");
+        assert_eq!(
+            rule["requires"]["audience"]["contains"],
+            toml::Value::Array(vec!["public".into()]),
+            "{networked}"
+        );
+        assert_eq!(rule["delta"]["trust"].as_str(), Some("suspicious"), "{networked}");
+        assert!(position(&networked) < position(shell), "{networked} precedes {shell}");
+    }
+    for name in [
+        "host/claude-code/PowerShell",
+        "host/claude-code/Monitor",
+        "host/claude-code/Grep",
+        "host/claude-code/NotebookEdit",
+    ] {
+        let attention = rule(name)["requires"]["attention"].clone();
+        assert_eq!(
+            attention,
+            toml::Value::Array(vec!["blocked".into()]),
+            "{name} is blocked"
+        );
+    }
+    for (name, annotator) in [
+        ("host/claude-code/WebFetch", "claude-code.fetch-requirements"),
+        ("*", "claude-code.undeclared-tool"),
+    ] {
+        assert_eq!(rule(name)["annotator"].as_str(), Some(annotator), "{name}");
+    }
+
+    let database = dir.path().join("appa.db");
+    Runtime::open(config, database, None).expect("the composed deployment opens");
+}
+
+/// The battery's rules for Claude Code's host tools other than the seven the coding
+/// battery's shell and file rules were written for.
+#[cfg(unix)]
+fn session_tool(rule: &toml::Value) -> bool {
+    let name = rule["name"].as_str().expect("every rule is named");
+    let tool = name.split('(').next().expect("split yields a first part");
+    tool.strip_prefix("host/claude-code/")
+        .is_some_and(|tool| !["Bash", "Monitor", "PowerShell", "Read", "Grep", "Write", "Edit"].contains(&tool))
+}
+
+#[cfg(unix)]
+fn compiled(dir: &Path, root: &str, battery: &str) -> appa_policy::Config {
+    with_the_coding_battery(dir);
+    let battery_dir = dir.join("batteries/claude-code");
+    std::fs::create_dir_all(&battery_dir).expect("the battery directory is created");
+    std::fs::write(battery_dir.join("appa.toml"), battery).expect("the battery writes");
+    let path = dir.join("appa.toml");
+    std::fs::write(&path, root).expect("the root writes");
+    let config = Config::load(&path).expect("the layout composes");
+    appa_policy::Config::from_toml_str(&toml::to_string(config.policy_file().value()).unwrap())
+        .expect("the composed policy compiles")
+}
+
+/// The Claude Code battery carries the rules for the harness's session and web tools
+/// that the default once declared at the root. Composed with the default, each of
+/// those tools, the root's remaining SendMessage exceptions included, resolves every
+/// call to the same declaration as when the root declared them all.
+#[cfg(unix)]
+#[test]
+fn the_batterys_session_tool_rules_route_as_they_did_from_the_root() {
+    let repository = repo_root();
+    let default = std::fs::read_to_string(repository.join("marketplace/plugins/claude-code/default.appa.toml"))
+        .expect("the initialized default is readable");
+    let shipped = std::fs::read_to_string(repository.join("marketplace/batteries/claude-code/appa.toml"))
+        .expect("the battery is readable");
+    let include = "include = [\"batteries/coding/appa.toml\", \"batteries/claude-code/appa.toml\"]\n\n";
+
+    let mut battery: toml::Value = toml::from_str(&shipped).unwrap();
+    let (moved, kept): (Vec<_>, Vec<_>) = battery["policy"]["tool"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .cloned()
+        .partition(session_tool);
+    assert!(!moved.is_empty(), "the battery carries the session tool rules");
+    let mut root: toml::Value = toml::from_str(&default).unwrap();
+    let root_rules = root["policy"]["tool"].as_array().unwrap().clone();
+    assert!(
+        !root_rules.iter().any(|rule| moved.contains(rule)),
+        "the default no longer declares them"
+    );
+    battery["policy"]["tool"] = toml::Value::Array(kept);
+    root["policy"]["tool"] = toml::Value::Array(root_rules.iter().cloned().chain(moved.iter().cloned()).collect());
+
+    let before_dir = tempfile::tempdir().unwrap();
+    let after_dir = tempfile::tempdir().unwrap();
+    let before = compiled(
+        before_dir.path(),
+        &format!("{include}{}", toml::to_string(&root).unwrap()),
+        &toml::to_string(&battery).unwrap(),
+    );
+    let after = compiled(after_dir.path(), &format!("{include}{default}"), &shipped);
+
+    let tool_of = |rule: &toml::Value| {
+        let name = rule["name"].as_str().unwrap().to_owned();
+        let tool = name.split('(').next().unwrap().to_owned();
+        (name, tool)
+    };
+    let moved_tools: Vec<String> = moved.iter().map(|rule| tool_of(rule).1).collect();
+    let mut probes = Vec::new();
+    for (name, _) in moved
+        .iter()
+        .chain(&root_rules)
+        .map(tool_of)
+        .filter(|(_, tool)| moved_tools.contains(tool))
+    {
+        let (tool, selector) = name.split_once('(').unwrap_or((&name, ""));
+        probes.push((tool.to_owned(), serde_json::json!({})));
+        if let Some((key, pattern)) = selector.trim_end_matches(')').split_once(':') {
+            probes.push((
+                tool.to_owned(),
+                serde_json::json!({ key: pattern.replace('*', "probe") }),
+            ));
+            probes.push((tool.to_owned(), serde_json::json!({ key: "elsewhere" })));
+        }
+    }
+    let route = |policy: &appa_policy::Config, tool: &str, arguments: &serde_json::Value| {
+        let engine = policy.engine();
+        engine
+            .resolve_call(
+                appa_engine::value::ToolName::new(tool),
+                arguments.to_string().as_bytes(),
+            )
+            .map(|call| engine.registry().declaration(&call).cloned())
+            .map_err(|error| error.to_string())
+    };
+    for (tool, arguments) in &probes {
+        let routed = route(&after, tool, arguments);
+        assert!(matches!(routed, Ok(Some(_))), "{tool} {arguments}: {routed:?}");
+        assert_eq!(routed, route(&before, tool, arguments), "{tool} {arguments}");
+    }
+}
+
+/// The shipped default and battery leave `audiences` omitted, so each Annotator's mandate
+/// is the policy's whole audience vocabulary: the chain words and every reader a
+/// declaration names — a reader the deployer adds included.
+#[cfg(unix)]
+#[test]
+fn the_shipped_annotators_admit_every_audience_the_policy_writes() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    composed_with_the_battery(&dir);
+    let root = dir.path().join("appa.toml");
+    let mut composed = std::fs::read_to_string(&root).expect("the composed root is readable");
+    composed.push_str("\n[[policy.tool]]\nname = \"ReadPayroll\"\ndelta = { audience = [\"payroll@corp.example\"] }\n");
+    std::fs::write(&root, composed).expect("the root gains a reader-bearing declaration");
+    let config = Config::load(&root).expect("the extended config composes");
+    let policy = appa_policy::Config::from_toml_str(
+        &toml::to_string(config.policy_file().value()).expect("the composed policy renders"),
+    )
+    .expect("the composed policy loads");
+
+    for annotator in ["claude-code.bash-requirements", "claude-code.undeclared-tool"] {
+        let entries: Vec<String> = policy
+            .engine()
+            .registry()
+            .annotator_mandate(&appa_engine::names::AnnotatorName::new(annotator))
+            .unwrap_or_else(|| panic!("{annotator} registers"))
+            .audiences()
+            .entries()
+            .collect();
+        for expected in ["self", "internal", "payroll@corp.example"] {
+            assert!(
+                entries.iter().any(|entry| entry == expected),
+                "{annotator} admits {expected}: {entries:?}"
+            );
+        }
+        assert!(
+            !entries.iter().any(|entry| entry == "public"),
+            "{annotator}: `public` is always admissible and never listed: {entries:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn call(tool: &str, argument: &str, value: &str) -> ProposedCall {
+    ProposedCall {
+        tool: tool.to_string(),
+        arguments: raw(serde_json::json!({ argument: value })),
+        cwd: None,
+    }
+}
+
+/// Bound to Claude Code's Bash and Read, the coding battery judges a credential named
+/// relatively — `.env`, `cat .netrc` — like its absolute spelling. A Bash call naming one
+/// is blocked with the narrowing to `self` offered beside `coding.strip-secrets`, which the
+/// default root binds. A Read narrows the trajectory to `self`, after which
+/// a public sink requires an exact-call human review.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_coding_battery_judges_relative_credentials_and_offers_review_for_public_release() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let config = coding_on_native_tools_with_a_suspicious_fetch(&dir);
+    let runtime =
+        Arc::new(Runtime::open(config, dir.path().join("appa.db"), None).expect("the composed deployment opens"));
+    assert_eq!(
+        hooks::handle(
+            &runtime,
+            HookEvent::SessionStart {
+                root: root(),
+                principal: None,
+                address: None,
+                title: None,
+                start: None,
+                launch: None,
+            }
+        )
+        .await,
+        HookDecision::Ack
+    );
+
+    // A credential read is `self` data: the block offers the narrowing to `self` and,
+    // since the result is confined, the secret masker, and consults no person.
+    for command in [
+        "cat .env",
+        "cat .netrc",
+        "cat ~/.ssh/id_ed25519",
+        "cat /home/me/.aws/credentials",
+    ] {
+        let blocked = propose(&runtime, call("host/claude-code/Bash", "command", command)).await;
+        let HookDecision::DenyCall {
+            feedback,
+            offers,
+            review,
+        } = blocked
+        else {
+            panic!("`{command}` is blocked with the narrowing offered, got {blocked:?}");
+        };
+        assert_eq!(
+            offers.len(),
+            2,
+            "`{command}` offers the narrowing and the masker: {feedback}"
+        );
+        assert!(review.is_empty(), "`{command}` consults no person");
+        assert!(
+            feedback.contains("sanitizer coding.strip-secrets"),
+            "`{command}` offers the masker: {feedback}"
+        );
+    }
+
+    for path in [
+        "./README.md",
+        "../src/main.rs",
+        "src/.gitignore/../main.rs",
+        "platform/.env.example",
+        ".env.local.sample",
+        "src/clients/bedrock-credentials.ts",
+        "schemas/secrets.schema.json",
+    ] {
+        let ordinary = call("host/claude-code/Read", "file_path", path);
+        assert_eq!(
+            propose(&runtime, ordinary.clone()).await,
+            HookDecision::AllowCall { spawn: None },
+            "`{path}` is an ordinary read: a hidden-looking name, an env template, or code named for credentials holds none"
+        );
+        ran(&runtime, ordinary).await;
+    }
+    for path in ["deploy/secrets.yaml", "config/credentials.json", "platform/.env.local"] {
+        let held = propose(&runtime, call("host/claude-code/Read", "file_path", path)).await;
+        assert!(
+            matches!(held, HookDecision::DenyCall { .. }),
+            "`{path}` holds credentials and narrows to `self`, got {held:?}"
+        );
+    }
+
+    let read = call("host/claude-code/Read", "file_path", ".env");
+    let narrowing = propose(&runtime, read.clone()).await;
+    let HookDecision::DenyCall { feedback, .. } = narrowing else {
+        panic!("reading `.env` is offered as a narrowing to `self`, got {narrowing:?}");
+    };
+    assert!(matches!(
+        runtime.execute_remedy(&actor(), last_offer(&feedback)).await,
+        RemedyOutcome::Authorized { .. }
+    ));
+    assert_eq!(
+        propose(&runtime, read.clone()).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    ran(&runtime, read).await;
+
+    // With the trajectory at `self`, a credential command runs, and its confined result
+    // is kept as the tool returned it.
+    let settled = call("host/claude-code/Bash", "command", "cat ~/.npmrc");
+    assert_eq!(
+        propose(&runtime, settled.clone()).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    ran(&runtime, settled).await;
+
+    let artifact = call("host/claude-code/Artifact", "file_path", "page.html");
+    assert_eq!(
+        propose(&runtime, artifact).await,
+        HookDecision::AllowCall { spawn: None },
+        "an artifact is private to the requester until they share it"
+    );
+
+    let search = propose(&runtime, call("host/claude-code/WebSearch", "query", "page.html")).await;
+    let HookDecision::DenyCall { offers, review, .. } = search else {
+        panic!("a search returns suspicious results, so it first asks to lower trust: {search:?}");
+    };
+    assert_eq!(
+        (offers.len(), review.len()),
+        (1, 0),
+        "only the search provider reads a query: a `self` trajectory searches after accepting lower trust, with no audience review"
+    );
+
+    let publication = propose(
+        &runtime,
+        call("host/claude-code/WebFetch", "url", "https://example.net/page.html"),
+    )
+    .await;
+    let HookDecision::DenyCall {
+        feedback,
+        offers,
+        review,
+    } = publication
+    else {
+        panic!("a trajectory narrowed to `self` requires a remedy before publishing: {publication:?}");
+    };
+    let rewrites: Vec<_> = offers
+        .iter()
+        .filter_map(|offer| offer.input_sanitizer.as_ref().map(|sanitizer| sanitizer.name.as_str()))
+        .collect();
+    assert_eq!(
+        (offers.len(), rewrites),
+        (3, vec!["redact-for-public"]),
+        "the default authority can review the audience expansion, beside accepting the page's trust or \
+         stripping its instructions, or the model sanitizer can rewrite the call for `public`: {feedback}"
+    );
+    assert!(
+        feedback.contains("sanitizer coding.strip-instructions's result"),
+        "the default root confines WebFetch, so the page's instructions can be stripped: {feedback}"
+    );
+    assert_eq!(review.len(), 2, "two offers are backed by the default human authority");
+    assert!(review[0].text.contains("page.html"), "the review shows the exact call");
+    assert!(
+        review[0].text.contains("public"),
+        "the review shows the audience expansion it covers"
+    );
+}
+
+/// The Slack battery requires `contains = ["internal"]` on writes: a public session can
+/// post autonomously without human approval, while a session holding `self` secrets cannot
+/// leak them into Slack channels.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_slack_battery_allows_public_writes_and_blocks_leaking_self_secrets() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let slack_battery_dir = dir.path().join("batteries/slack");
+    let claude_battery_dir = dir.path().join("batteries/claude-code");
+    std::fs::create_dir_all(&slack_battery_dir).expect("slack battery directory is created");
+    std::fs::create_dir_all(&claude_battery_dir).expect("claude battery directory is created");
+
+    let repository = repo_root();
+    let default = std::fs::read_to_string(repository.join("marketplace/plugins/claude-code/default.appa.toml"))
+        .expect("the initialized default is readable");
+    std::fs::copy(
+        repository.join("marketplace/batteries/slack/appa.toml"),
+        slack_battery_dir.join("appa.toml"),
+    )
+    .expect("slack battery file is copied");
+    std::fs::copy(
+        repository.join("marketplace/batteries/claude-code/appa.toml"),
+        claude_battery_dir.join("appa.toml"),
+    )
+    .expect("claude battery file is copied");
+    with_the_coding_battery(dir.path());
+
+    let root_path = dir.path().join("appa.toml");
+    std::fs::write(
+        &root_path,
+        format!(
+            "include = [\"batteries/coding/appa.toml\", \"batteries/claude-code/appa.toml\", \"batteries/slack/appa.toml\"]\n\n{}",
+            with_a_local_file_tracker(dir.path(), &default)
+        ),
+    )
+    .expect("the config includes both batteries");
+
+    let config = Config::load(&root_path).expect("the config loads");
+    let runtime = Arc::new(Runtime::open(config, dir.path().join("appa.db"), None).expect("opens"));
+    assert_eq!(
+        hooks::handle(
+            &runtime,
+            HookEvent::SessionStart {
+                root: root(),
+                principal: None,
+                address: None,
+                title: None,
+                start: None,
+                launch: None,
+            }
+        )
+        .await,
+        HookDecision::Ack
+    );
+
+    let slack_send = ProposedCall {
+        tool: "mcp/claude_ai_Slack/slack_send_message".to_string(),
+        arguments: raw(serde_json::json!({ "channel_id": "C123", "text": "hello" })),
+        cwd: None,
+    };
+
+    // 1. Fresh public session: slack write is allowed autonomously
+    assert_eq!(
+        propose(&runtime, slack_send.clone()).await,
+        HookDecision::AllowCall { spawn: None },
+        "a public session can post to slack without hitl"
+    );
+    ran(&runtime, slack_send.clone()).await;
+
+    // 2. Read .env, which the file-tracker labels `self`, and accept narrowing to self
+    let env = dir.path().join(".env").display().to_string();
+    let read_env = call("host/claude-code/Read", "file_path", &env);
+    let narrowing = propose(&runtime, read_env.clone()).await;
+    let HookDecision::DenyCall { feedback, .. } = narrowing else {
+        panic!("reading .env narrows to self");
+    };
+    assert!(matches!(
+        runtime.execute_remedy(&actor(), last_offer(&feedback)).await,
+        RemedyOutcome::Authorized { .. }
+    ));
+    assert_eq!(
+        propose(&runtime, read_env.clone()).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    ran(&runtime, read_env).await;
+
+    // 3. Narrowed to self: slack write is BLOCKED from leaking secrets
+    let blocked_slack = propose(&runtime, slack_send).await;
+    let HookDecision::DenyCall { offers, .. } = blocked_slack else {
+        panic!("slack write must be blocked when session holds self secrets, got {blocked_slack:?}");
+    };
+    assert!(
+        offers.is_empty(),
+        "slack write cannot leak self secrets: no remedy plan"
+    );
+}
+
+/// A Bash command the coding battery's shell Annotator narrows to `self` is blocked with only
+/// the narrowing offered, like a static credential rule: this deployment binds no sanitizer for it.
+/// Once accepted, the command runs and its confined result is kept as the tool returned it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_the_annotator_narrows_to_self_offers_only_the_narrowing() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let include = including_coding_on_native_claude_code_tools(dir.path());
+    std::fs::write(
+        dir.path().join("annotator.sh"),
+        "cat > /dev/null\nprintf '%s' '{\"version\":1,\"answer\":{\"delta\":{\"audience\":[\"self\"]},\"requires\":{\"history\":[],\"attention\":[]},\"emits\":[]}}'",
+    )
+    .expect("the annotator script writes");
+    let root_path = dir.path().join("appa.toml");
+    // The root declares the coding battery's built-in shell Annotator anew and binds it to a
+    // script. The Claude Code battery's file-tracker is bound as the plugin binds it; no call
+    // here reaches it.
+    std::fs::write(
+        &root_path,
+        format!(
+            r#"{include}
+[policy]
+version = 2
+
+[[policy.annotator]]
+name = "claude-code.bash-requirements"
+
+[externals]
+timeout_ms = 5000
+max_body_bytes = 65536
+
+[externals.annotators."claude-code.bash-requirements"]
+command = ["/bin/sh", "annotator.sh"]
+
+[externals.annotators.file-tracker]
+command = ["appa", "file-tracker", "annotate"]
+
+[externals.recorders.file-tracker]
+command = ["appa", "file-tracker", "record"]
+"#
+        ),
+    )
+    .expect("the root binds the coding battery's shell Annotator to a script");
+    let config = Config::load(&root_path).expect("the root and battery compose");
+    let runtime =
+        Arc::new(Runtime::open(config, dir.path().join("appa.db"), None).expect("the composed deployment opens"));
+    assert_eq!(
+        hooks::handle(
+            &runtime,
+            HookEvent::SessionStart {
+                root: root(),
+                principal: None,
+                address: None,
+                title: None,
+                start: None,
+                launch: None,
+            }
+        )
+        .await,
+        HookDecision::Ack
+    );
+
+    let read = call("host/claude-code/Bash", "command", "cat ~/.bashrc");
+    let blocked = propose(&runtime, read.clone()).await;
+    let HookDecision::DenyCall { feedback, offers, .. } = blocked else {
+        panic!("an annotated `self` command is blocked with the narrowing offered, got {blocked:?}");
+    };
+    assert_eq!(offers.len(), 1, "only the narrowing is offered: {feedback}");
+    assert!(!feedback.contains("redact-secrets"), "no masker is offered: {feedback}");
+    assert!(matches!(
+        runtime.execute_remedy(&actor(), last_offer(&feedback)).await,
+        RemedyOutcome::Authorized { .. }
+    ));
+    assert_eq!(
+        propose(&runtime, read.clone()).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    ran(&runtime, read).await;
+}
+
+/// Bound to Claude Code's Grep, Write and Edit, the coding battery treats a search inside a
+/// credential path as a read of it, which narrows the session like its read rules do. Writing into one needs a `trusted` session, so it runs before untrusted
+/// content arrives and is refused after, and so is writing a file a later process reads
+/// as instructions or runs as code. The files that can turn the protection off ask the
+/// person for each exact call.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_coding_battery_covers_grep_write_and_edit_of_the_requesters_secrets() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let config = coding_on_native_tools_with_a_suspicious_fetch(&dir);
+    let runtime =
+        Arc::new(Runtime::open(config, dir.path().join("appa.db"), None).expect("the composed deployment opens"));
+    assert_eq!(
+        hooks::handle(
+            &runtime,
+            HookEvent::SessionStart {
+                root: root(),
+                principal: None,
+                address: None,
+                title: None,
+                start: None,
+                launch: None,
+            }
+        )
+        .await,
+        HookDecision::Ack
+    );
+
+    let ordinary = call("host/claude-code/Grep", "path", "src");
+    assert_eq!(
+        propose(&runtime, ordinary.clone()).await,
+        HookDecision::AllowCall { spawn: None },
+        "a search over ordinary paths keeps the session's label"
+    );
+    ran(&runtime, ordinary).await;
+    let code = call("host/claude-code/Grep", "path", "backend/src/secrets-manager.ts");
+    assert_eq!(
+        propose(&runtime, code.clone()).await,
+        HookDecision::AllowCall { spawn: None },
+        "a search inside source named for secrets keeps the session's label"
+    );
+    ran(&runtime, code).await;
+    let inside = call("host/claude-code/Grep", "path", "/home/me/.aws/credentials");
+    let narrowing = propose(&runtime, inside).await;
+    let HookDecision::DenyCall { offers, review, .. } = narrowing else {
+        panic!("a search inside a credential path is offered as a narrowing to `self`, got {narrowing:?}");
+    };
+    assert_eq!(offers.len(), 1, "the narrowing is the one offer");
+    assert!(review.is_empty(), "no person is consulted");
+
+    let credential = call("host/claude-code/Write", "file_path", ".env");
+    assert_eq!(
+        propose(&runtime, credential.clone()).await,
+        HookDecision::AllowCall { spawn: None },
+        "a trusted session writes a credential path"
+    );
+    ran(&runtime, credential.clone()).await;
+
+    let settings = call("host/claude-code/Edit", "file_path", "/home/me/.claude/settings.json");
+    let asked = propose(&runtime, settings).await;
+    let HookDecision::DenyCall { review, .. } = asked else {
+        panic!("editing the harness's settings asks the person, got {asked:?}");
+    };
+    assert_eq!(review.len(), 1, "the exact call is shown to the person");
+    assert!(review[0].text.contains("settings.json"));
+    for (tool, path) in [
+        ("host/claude-code/Write", ".mcp.json"),
+        ("host/claude-code/Edit", "/home/me/.claude/hooks/guard.sh"),
+    ] {
+        let asked = propose(&runtime, call(tool, "file_path", path)).await;
+        let HookDecision::DenyCall { review, .. } = asked else {
+            panic!("{path}: a file that can turn the protection off asks the person, got {asked:?}");
+        };
+        assert_eq!(review.len(), 1, "{path}");
+    }
+    let instructions = call("host/claude-code/Edit", "file_path", "/repo/CLAUDE.md");
+    assert_eq!(
+        propose(&runtime, instructions.clone()).await,
+        HookDecision::AllowCall { spawn: None },
+        "a trusted session edits the agent's instructions"
+    );
+    ran(&runtime, instructions).await;
+
+    // Reading a web page is offered as the drop to `suspicious`, or as the battery's
+    // instruction-stripping sanitizer over the confined page; the session accepts the drop.
+    let page = call("host/claude-code/WebFetch", "url", "https://docs.example/page");
+    let drop = propose(&runtime, page.clone()).await;
+    let HookDecision::DenyCall { feedback, .. } = &drop else {
+        panic!("a web page is offered as a narrowing, got {drop:?}");
+    };
+    assert!(
+        feedback.contains("sanitizer coding.strip-instructions's result"),
+        "{feedback}"
+    );
+    assert!(matches!(
+        runtime.execute_remedy(&actor(), unsanitized_offer_of(&drop)).await,
+        RemedyOutcome::Authorized { .. }
+    ));
+    assert_eq!(
+        propose(&runtime, page.clone()).await,
+        HookDecision::AllowCall { spawn: None }
+    );
+    ran(&runtime, page).await;
+    let refused = propose(&runtime, credential).await;
+    let HookDecision::DenyCall {
+        feedback,
+        offers,
+        review,
+    } = refused
+    else {
+        panic!("a session that read untrusted content does not write a credential path, got {refused:?}");
+    };
+    assert_eq!(offers.len(), 1, "the person can approve the exact call: {feedback}");
+    assert_eq!(review.len(), 1);
+    assert!(review[0].text.contains(".env"), "the review shows the exact call");
+    for (tool, path) in [
+        ("host/claude-code/Edit", "/repo/CLAUDE.md"),
+        ("host/claude-code/Write", ".claude/skills/review/SKILL.md"),
+        ("host/claude-code/Write", "/repo/.git/hooks/pre-commit"),
+        ("host/claude-code/Edit", "/home/me/.zshrc"),
+        ("host/claude-code/Write", "/home/me/Library/LaunchAgents/agent.plist"),
+    ] {
+        let refused = propose(&runtime, call(tool, "file_path", path)).await;
+        let HookDecision::DenyCall { offers, .. } = refused else {
+            panic!(
+                "{path}: a session that read untrusted content does not write what a later process runs, got {refused:?}"
+            );
+        };
+        assert_eq!(offers.len(), 1, "{path}: the person can approve the exact call");
+    }
+    let note = call("host/claude-code/Write", "file_path", "notes.md");
+    assert_eq!(
+        propose(&runtime, note).await,
+        HookDecision::AllowCall { spawn: None },
+        "an ordinary path takes the session's label as it is"
+    );
+}

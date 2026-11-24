@@ -1,0 +1,569 @@
+name: Publish OCI images
+
+# Builds the five OpenAPPA images into ghcr.io/archestra-ai/ci staging,
+# merges the four multi-arch indexes, and attaches the caller's tags. Release
+# callers pass one immutable v* tag; release.yml then has
+# archestra-ai/release-publisher publish the staged digests to ghcr.io/archestra-ai.
+# CI callers pass rolling sha-/pr-/main/latest tags. Charts stay in
+# release.yml. Nothing here writes the public ghcr.io/archestra-ai names.
+#
+# Repository variable APPA_YELL_ENDPOINT, the receiver `appa yell` reports to,
+# is exported into the appa-runtime image so a runtime in a cluster can send.
+
+on:
+  workflow_call:
+    inputs:
+      tags:
+        description: Newline-separated image tags to attach
+        required: true
+        type: string
+      source_commit:
+        description: Commit stamped into the image revision label
+        required: true
+        type: string
+      version_label:
+        description: Value for org.opencontainers.image.version
+        required: true
+        type: string
+      checkout_ref:
+        description: Git ref the trusted workflow YAML was loaded from
+        required: true
+        type: string
+      verify_release:
+        description: Verify and detach onto the release tag before building
+        required: false
+        type: boolean
+        default: false
+      release_ref:
+        description: Immutable release tag; required when verify_release is true
+        required: false
+        type: string
+        default: ""
+      immutable:
+        description: Refuse to attach an existing v* release tag
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      appa_runtime_digest:
+        description: Staged appa-runtime index digest
+        value: ${{ jobs.publish-shared-images.outputs.appa_runtime_digest }}
+      appa_kagent_adk_digest:
+        description: Staged appa-kagent-adk index digest
+        value: ${{ jobs.publish-shared-images.outputs.appa_kagent_adk_digest }}
+      appa_demo_tools_digest:
+        description: Staged appa-demo-tools index digest
+        value: ${{ jobs.publish-shared-images.outputs.appa_demo_tools_digest }}
+      appa_demo_mocks_digest:
+        description: Staged appa-demo-mocks index digest
+        value: ${{ jobs.publish-shared-images.outputs.appa_demo_mocks_digest }}
+      appa_kagent_adk_go_digest:
+        description: Staged appa-kagent-adk-go (and golang-adk) digest
+        value: ${{ jobs.publish-images.outputs.go_digest }}
+
+permissions: {}
+
+env:
+  REGISTRY: ghcr.io/archestra-ai/ci
+
+jobs:
+  publish-shared-image-legs:
+    name: Build ${{ matrix.image }} (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: appa-runtime
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - image: appa-runtime
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          - image: appa-kagent-adk
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - image: appa-kagent-adk
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          - image: appa-demo-tools
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - image: appa-demo-tools
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          - image: appa-demo-mocks
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - image: appa-demo-mocks
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read # Required to check out the source that is published.
+      packages: write # Required to push to the ghcr.io/archestra-ai/ci staging packages.
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Verify and checkout release source
+        if: ${{ inputs.verify_release }}
+        uses: $/.github/actions/verify-release-source
+        with:
+          release_ref: ${{ inputs.release_ref }}
+          source_commit: ${{ inputs.source_commit }}
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4.4.0
+
+      - name: Build and push appa-runtime leg
+        if: ${{ matrix.image == 'appa-runtime' }}
+        id: build-runtime
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: appa-runtime/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            APPA_YELL_ENDPOINT=${{ vars.APPA_YELL_ENDPOINT }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          provenance: true
+          sbom: true
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=min,scope=${{ matrix.image }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ inputs.source_commit }}
+            org.opencontainers.image.version=${{ inputs.version_label }}
+
+      - name: Build and push appa-kagent-adk leg
+        if: ${{ matrix.image == 'appa-kagent-adk' }}
+        id: build-adk
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: integrations/kagent/appa-kagent-adk
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          provenance: true
+          sbom: true
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=min,scope=${{ matrix.image }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ inputs.source_commit }}
+            org.opencontainers.image.version=${{ inputs.version_label }}
+
+      - name: Build and push appa-demo-tools leg
+        if: ${{ matrix.image == 'appa-demo-tools' }}
+        id: build-tools
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: integrations/kagent/demo
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          provenance: true
+          sbom: true
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=min,scope=${{ matrix.image }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ inputs.source_commit }}
+            org.opencontainers.image.version=${{ inputs.version_label }}
+
+      - name: Build and push appa-demo-mocks leg
+        if: ${{ matrix.image == 'appa-demo-mocks' }}
+        id: build-mocks
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: integrations/kagent/demo/mocks
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          provenance: true
+          sbom: true
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=min,scope=${{ matrix.image }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ inputs.source_commit }}
+            org.opencontainers.image.version=${{ inputs.version_label }}
+
+      - name: Record image digest
+        env:
+          RUNTIME_DIGEST: ${{ steps.build-runtime.outputs.digest }}
+          ADK_DIGEST: ${{ steps.build-adk.outputs.digest }}
+          TOOLS_DIGEST: ${{ steps.build-tools.outputs.digest }}
+          MOCKS_DIGEST: ${{ steps.build-mocks.outputs.digest }}
+        run: |
+          DIGEST=${RUNTIME_DIGEST:-${ADK_DIGEST:-${TOOLS_DIGEST:-$MOCKS_DIGEST}}}
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::image build did not report a digest"
+            exit 1
+          fi
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: digests-${{ matrix.image }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-shared-images:
+    name: Publish shared multi-platform images
+    needs: publish-shared-image-legs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read # Required to download image digest artifacts.
+      attestations: write # Required to record build provenance for the published images.
+      contents: read # Required to check out the source that is published.
+      id-token: write # Required to sign the build provenance.
+      packages: write # Required to push to staging and store its provenance there.
+    outputs:
+      appa_runtime_digest: ${{ steps.merge.outputs.appa_runtime_digest }}
+      appa_kagent_adk_digest: ${{ steps.merge.outputs.appa_kagent_adk_digest }}
+      appa_demo_tools_digest: ${{ steps.merge.outputs.appa_demo_tools_digest }}
+      appa_demo_mocks_digest: ${{ steps.merge.outputs.appa_demo_mocks_digest }}
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download appa-runtime digests
+        uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: digests-appa-runtime-*
+          path: /tmp/digests/appa-runtime
+          merge-multiple: true
+
+      - name: Download appa-kagent-adk digests
+        uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: digests-appa-kagent-adk-*
+          path: /tmp/digests/appa-kagent-adk
+          merge-multiple: true
+
+      - name: Download appa-demo-tools digests
+        uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: digests-appa-demo-tools-*
+          path: /tmp/digests/appa-demo-tools
+          merge-multiple: true
+
+      - name: Download appa-demo-mocks digests
+        uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: digests-appa-demo-mocks-*
+          path: /tmp/digests/appa-demo-mocks
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4.4.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Merge and tag image manifests
+        id: merge
+        env:
+          IMMUTABLE: ${{ inputs.immutable }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          TAGS: ${{ inputs.tags }}
+        run: |
+          test "$(python3 scripts/appa-oci-tags.py staging)" = "$REGISTRY"
+          mapfile -t tags < <(printf '%s\n' "$TAGS" | awk 'NF')
+          if [ "${#tags[@]}" -eq 0 ]; then
+            echo "::error::no image tags to publish"
+            exit 1
+          fi
+          for image in appa-runtime appa-kagent-adk appa-demo-tools appa-demo-mocks; do
+            sources=()
+            for digest in "/tmp/digests/${image}"/*; do
+              sources+=("${REGISTRY}/${image}@sha256:${digest##*/}")
+            done
+            if [ "${#sources[@]}" -ne 2 ]; then
+              echo "::error::${image} has ${#sources[@]} platform digests, expected 2"
+              exit 1
+            fi
+            tag_args=()
+            for tag in "${tags[@]}"; do
+              ref="${REGISTRY}/${image}:${tag}"
+              if [ "$IMMUTABLE" = "true" ] && [[ "$tag" == v* ]] && docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+                # A release tag never moves. A retried release keeps the image it
+                # names when that image was built from this release's commit.
+                revision=$(docker buildx imagetools inspect \
+                  --format '{{ index (index .Image "linux/amd64").Config.Labels "org.opencontainers.image.revision" }}' "$ref")
+                if [ "$revision" != "$SOURCE_COMMIT" ]; then
+                  echo "::error::${ref} already exists from ${revision:-an unlabelled build}, not ${SOURCE_COMMIT}"
+                  exit 1
+                fi
+                echo "::notice::${ref} already exists from ${SOURCE_COMMIT}; keeping it"
+                sources=("$ref")
+                continue
+              fi
+              tag_args+=(--tag "$ref")
+            done
+            if [ "${#tag_args[@]}" -gt 0 ]; then
+              docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+            fi
+            docker buildx imagetools inspect "${REGISTRY}/${image}:${tags[0]}"
+            docker buildx imagetools inspect --raw \
+              "${REGISTRY}/${image}:${tags[0]}" \
+              | jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | sort == ["amd64", "arm64"]'
+            # Record the root plus platform manifests from this exact digest.
+            # The release descriptor is assembled only after every build ends.
+            digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${REGISTRY}/${image}:${tags[0]}")
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::${image} did not resolve to a manifest digest"
+              exit 1
+            fi
+            echo "${image//-/_}_digest=${digest}" >> "$GITHUB_OUTPUT"
+            case "$image" in
+              appa-runtime) role=runtime ;;
+              appa-kagent-adk) role=python ;;
+              *) continue ;;
+            esac
+            mkdir -p /tmp/appa-generation-images
+            docker buildx imagetools inspect --raw "${REGISTRY}/${image}@${digest}" \
+              | python3 scripts/appa-image-descriptor.py "$digest" \
+              > "/tmp/appa-generation-images/${role}.json"
+          done
+
+      - name: Attest appa-runtime provenance
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/appa-runtime
+          subject-digest: ${{ steps.merge.outputs.appa_runtime_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest appa-kagent-adk provenance
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/appa-kagent-adk
+          subject-digest: ${{ steps.merge.outputs.appa_kagent_adk_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest appa-demo-tools provenance
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/appa-demo-tools
+          subject-digest: ${{ steps.merge.outputs.appa_demo_tools_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest appa-demo-mocks provenance
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/appa-demo-mocks
+          subject-digest: ${{ steps.merge.outputs.appa_demo_mocks_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Upload shared image identities
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: generation-images-shared
+          path: /tmp/appa-generation-images/*.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-images:
+    name: Publish container images
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      attestations: write # Required to record build provenance for the published image.
+      contents: read # Required to check out the source that is published.
+      id-token: write # Required to sign the build provenance.
+      packages: write # Required to push to staging and store its provenance there.
+    outputs:
+      go_digest: ${{ steps.go-image.outputs.digest }}
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Verify and checkout release source
+        if: ${{ inputs.verify_release }}
+        uses: $/.github/actions/verify-release-source
+        with:
+          release_ref: ${{ inputs.release_ref }}
+          source_commit: ${{ inputs.source_commit }}
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4.4.0
+
+      - name: Resolve image tags
+        id: tags
+        env:
+          IMMUTABLE: ${{ inputs.immutable }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          TAGS: ${{ inputs.tags }}
+        run: |
+          mapfile -t tags < <(printf '%s\n' "$TAGS" | awk 'NF')
+          if [ "${#tags[@]}" -eq 0 ]; then
+            echo "::error::no image tags to publish"
+            exit 1
+          fi
+          # A release tag never moves. A retried release keeps the Go image it
+          # names when that image was built from this release's commit.
+          published=""
+          if [ "$IMMUTABLE" = "true" ]; then
+            for tag in "${tags[@]}"; do
+              [[ "$tag" == v* ]] || continue
+              ref="${REGISTRY}/appa-kagent-adk-go:${tag}"
+              if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+                revision=$(docker buildx imagetools inspect \
+                  --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}' "$ref")
+                if [ "$revision" != "$SOURCE_COMMIT" ]; then
+                  echo "::error::${ref} already exists from ${revision:-an unlabelled build}, not ${SOURCE_COMMIT}"
+                  exit 1
+                fi
+                echo "::notice::${ref} already exists from ${SOURCE_COMMIT}; keeping it"
+                published=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$ref" | jq -r .digest)
+              fi
+              alias_ref="${REGISTRY}/golang-adk:${tag}"
+              if docker buildx imagetools inspect "$alias_ref" >/dev/null 2>&1; then
+                alias_digest=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$alias_ref" | jq -r .digest)
+                if [ -z "$published" ] || [ "$alias_digest" != "$published" ]; then
+                  echo "::error::${alias_ref} already exists and names ${alias_digest}, not ${published:-a published Go image}"
+                  exit 1
+                fi
+              fi
+            done
+          fi
+          echo "published_digest=${published}" >> "$GITHUB_OUTPUT"
+          {
+            echo "adk_go<<EOF"
+            for tag in "${tags[@]}"; do printf '%s\n' "${REGISTRY}/appa-kagent-adk-go:${tag}"; done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push appa-kagent-adk-go
+        id: adk-go
+        if: steps.tags.outputs.published_digest == ''
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: integrations/kagent/appa-kagent-adk-go
+          platforms: linux/amd64
+          push: true
+          provenance: true
+          sbom: true
+          tags: ${{ steps.tags.outputs.adk_go }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ inputs.source_commit }}
+            org.opencontainers.image.version=${{ inputs.version_label }}
+
+      - name: Alias the Go image to the name kagent derives
+        id: go-image
+        env:
+          GO_DIGEST: ${{ steps.tags.outputs.published_digest || steps.adk-go.outputs.digest }}
+          PUBLISHED: ${{ steps.tags.outputs.published_digest }}
+          TAGS: ${{ inputs.tags }}
+        run: |
+          if [[ ! "$GO_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::the Go image build did not report a digest"
+            exit 1
+          fi
+          mapfile -t tags < <(printf '%s\n' "$TAGS" | awk 'NF')
+          extra_alias=()
+          for tag in "${tags[@]}"; do
+            extra_alias+=(--tag "${REGISTRY}/golang-adk:${tag}")
+            # A kept image skipped the build, which would have set its other tags.
+            if [ -n "$PUBLISHED" ]; then
+              extra_alias+=(--tag "${REGISTRY}/appa-kagent-adk-go:${tag}")
+            fi
+          done
+          docker buildx imagetools create \
+            "${extra_alias[@]}" \
+            "${REGISTRY}/appa-kagent-adk-go@${GO_DIGEST}"
+          alias_digest=$(docker buildx imagetools inspect \
+            --format '{{.Manifest.Digest}}' \
+            "${REGISTRY}/golang-adk:${tags[0]}")
+          if [ "$alias_digest" != "$GO_DIGEST" ]; then
+            echo "::error::golang-adk resolves to ${alias_digest}, not ${GO_DIGEST}"
+            exit 1
+          fi
+          echo "digest=${GO_DIGEST}" >> "$GITHUB_OUTPUT"
+          mkdir -p /tmp/appa-generation-images
+          docker buildx imagetools inspect --raw "${REGISTRY}/golang-adk@${GO_DIGEST}" \
+            | python3 scripts/appa-image-descriptor.py "$GO_DIGEST" --single-platform linux/amd64 \
+            > /tmp/appa-generation-images/go.json
+
+      - name: Attest appa-kagent-adk-go provenance
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/appa-kagent-adk-go
+          subject-digest: ${{ steps.go-image.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest golang-adk provenance
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/golang-adk
+          subject-digest: ${{ steps.go-image.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Upload Go image identity
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: generation-images-go
+          path: /tmp/appa-generation-images/go.json
+          if-no-files-found: error
+          retention-days: 7

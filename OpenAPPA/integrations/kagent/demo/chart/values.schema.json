@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "appa-kagent-demo values",
+  "description": "Constrains the shared runtime reference, ModelConfig, and agent names rendered by the fixture-only demo chart.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "modelConfig": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$",
+          "description": "An existing kagent ModelConfig used by every demo Agent."
+        }
+      },
+      "required": ["name"],
+      "additionalProperties": false
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string",
+          "pattern": "^https?://\\S+$",
+          "description": "The existing appa-runtime Service URL used by every demo Agent."
+        },
+        "reasoningEffort": {
+          "type": "string"
+        }
+      },
+      "required": ["url"],
+      "additionalProperties": false
+    },
+    "mocks": {
+      "type": "object",
+      "properties": {
+        "approvalWindowSeconds": { "type": "integer", "minimum": 1, "maximum": 280 }
+      },
+      "required": ["approvalWindowSeconds"]
+    },
+    "tools": { "type": "object" },
+    "seed": { "type": "object" },
+    "agents": {
+      "type": "object",
+      "properties": {
+        "childName": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$",
+          "description": "The python child cluster-ops delegates to. The policy names it agent/<namespace>/<childName>."
+        },
+        "go": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$",
+              "description": "The go twin of cluster-ops."
+            },
+            "childName": {
+              "type": "string",
+              "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$",
+              "description": "The go child the go twin delegates to. The policy names it agent/<namespace>/<childName>."
+            },
+            "undeclaredName": {
+              "type": "string",
+              "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$",
+              "description": "The go agent the policy never names. Every delegation to it is denied."
+            }
+          }
+        }
+      }
+    }
+  },
+  "required": ["modelConfig", "runtime", "mocks", "tools", "agents", "seed"]
+}

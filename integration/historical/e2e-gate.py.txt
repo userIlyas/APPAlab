@@ -1,0 +1,133 @@
+"""Deployed-container E2E of the OpenAPPA gate (deterministic).
+
+Targets the isolated banking-agent (host 8009): real OpenAPPA engine + real
+gated ABS MCP client + real ABS backend.  The untrusted ingress is a synthetic
+value admitted through the *real* gate (the `/v1/appa/e2e/transfer` ingress
+step), keeping the run deterministic and offline; the money sink is the real
+`create_transfer` ABS call.
+
+Proves, in the deployed image:
+  1. engine + policy loaded in enforce mode (via /health);
+  2. a clean conversation can still execute a transfer (not a blanket blocker)
+     -- synthetic self-transfer on the canary user's own RUB accounts;
+  3. the same transfer is refused with 409 policy_denied once the conversation
+     ingested untrusted data, BEFORE the ABS side effect occurs;
+  4. the refused transfer leaves no operation in the ABS ledger.
+"""
+
+import asyncio
+import base64
+import json
+import sys
+import uuid
+
+import httpx
+
+AGENT = "http://127.0.0.1:8009"
+KEYCLOAK = "http://127.0.0.1:8080/realms/agentic-banking"
+USERNAME = "ivan.petrov"
+PASSWORD = "banking-demo"
+
+results = {"checks": []}
+
+
+def check(name: str, ok: bool, detail: str) -> None:
+    results["checks"].append({"name": name, "ok": ok, "detail": detail})
+    print(f"[{'PASS' if ok else 'FAIL'}] {name}: {detail}")
+
+
+def decode_payload(token: str) -> dict:
+    p = token.split(".")[1]
+    p += "=" * (-len(p) % 4)
+    return json.loads(base64.urlsafe_b64decode(p))
+
+
+async def token() -> str:
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            f"{KEYCLOAK}/protocol/openid-connect/token",
+            data={"grant_type": "password", "client_id": "bank-ui",
+                  "username": USERNAME, "password": PASSWORD},
+        )
+        r.raise_for_status()
+        return r.json()["access_token"]
+
+
+async def transfer(tok: str, conversation_id: str, ingest: bool, key: str):
+    async with httpx.AsyncClient(timeout=120) as client:
+        return await client.post(
+            f"{AGENT}/v1/appa/e2e/transfer",
+            json={
+                "conversation_id": conversation_id,
+                "ingest": ingest,
+                "from_account": "account-001",
+                "to_account": "RU10000000000000000002",
+                "amount": "1.00",
+                "idempotency_key": key,
+            },
+            headers={"Authorization": f"Bearer {tok}"},
+        )
+
+
+async def dashboard(tok: str):
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.get(f"{AGENT}/v1/dashboard", headers={"Authorization": f"Bearer {tok}"})
+        r.raise_for_status()
+        return r.json()
+
+
+def transfers(ops: list) -> int:
+    return sum(1 for op in ops if op.get("category") == "transfer")
+
+
+async def main() -> None:
+    tok = await token()
+    claims = decode_payload(tok)
+    check("authenticated bank-ui token", claims.get("azp") == "bank-ui", f"azp={claims.get('azp')}")
+
+    ap = httpx.get(f"{AGENT}/health", timeout=15).json()["appa_taint"]
+    check("deployed engine loaded + enforce + policy",
+          ap["mode"] == "enforce" and ap["engine_available"] and ap["policy_loaded"] and ap["fail_closed"],
+          f"mode={ap['mode']} engine={ap['engine_available']} policy_tools={ap['policy_tools']}")
+
+    baseline = transfers((await dashboard(tok))["operations"])
+
+    # --- clean conversation: transfer must be ALLOWED and really execute ---
+    clean = f"e2e-clean-{uuid.uuid4()}"
+    r = await transfer(tok, clean, ingest=False, key=f"e2e-clean-{uuid.uuid4()}")
+    check("clean conversation: transfer allowed", r.status_code == 200 and r.json().get("status") == "allowed",
+          f"status={r.status_code} body={r.text[:120]}")
+    after_clean = transfers((await dashboard(tok))["operations"])
+    check("clean transfer executed in ABS", after_clean == baseline + 1,
+          f"transfer ops {baseline} -> {after_clean}")
+
+    # --- tainted conversation: ingest untrusted, then the same transfer ---
+    tainted = f"e2e-taint-{uuid.uuid4()}"
+    r = await transfer(tok, tainted, ingest=True, key="x")
+    check("taint ingress admitted through the real gate", r.status_code == 200 and r.json().get("status") == "ingested",
+          f"status={r.status_code} body={r.text[:120]}")
+
+    r = await transfer(tok, tainted, ingest=False, key=f"e2e-taint-{uuid.uuid4()}")
+    blocked = r.status_code == 409 and r.json().get("code") == "policy_denied"
+    check("tainted conversation: transfer blocked BEFORE execution", blocked,
+          f"status={r.status_code} code={r.json().get('code')}")
+    reason = (r.json().get("reason") or "") if r.status_code == 409 else r.text
+    check("denial is the trust floor", "suspicious" in reason.lower() and "trust" in reason.lower(),
+          f"summary={r.json().get('summary') if r.status_code == 409 else reason[:100]}")
+
+    after_taint = transfers((await dashboard(tok))["operations"])
+    check("blocked transfer left NO ABS side effect", after_taint == after_clean,
+          f"transfer ops {after_clean} -> {after_taint}")
+
+    results["conversations"] = [{"clean": clean}, {"tainted": tainted}]
+    results["exit_ok"] = all(c["ok"] for c in results["checks"])
+    print(f"\n{'ALL CHECKS PASSED' if results['exit_ok'] else 'SOME CHECKS FAILED'}: "
+          f"{sum(c['ok'] for c in results['checks'])}/{len(results['checks'])}")
+    return 0 if results["exit_ok"] else 1
+
+
+if __name__ == "__main__":
+    code = asyncio.run(main())
+    with open("/home/leany/memory-tracing/openappa-abl/e2e-gate-results.json", "w") as fh:
+        fh.write(json.dumps(results, ensure_ascii=False, indent=2))
+    sys.exit(code)

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: appa-kagent-demo-policy
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "appa-demo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: policy-template
+data:
+  appa.toml: |
+{{ include "appa-demo.policy" . | indent 4 }}

@@ -1,0 +1,3693 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "./ui-utilities.css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ————————————————————————————————————————————————
+   Design tokens — warm monochrome, pale chartreuse accent
+   ———————————————————————————————————————————————— */
+:root {
+  color-scheme: light;
+
+  /* Height of the sticky header. Everything that must clear it — anchor
+     landings, the sticky rails, the drawer — reads this. Header.tsx
+     republishes the measured value, so this is only the pre-hydration
+     estimate. */
+  --header-h: 73px;
+
+  /* The site's one reading column: sidebar + main + toc at their designed
+     widths (16rem + 52rem + 15rem) with a hair of slack. The shell, the
+     header's contents, and the footer all align to it, so on a wide monitor
+     the whole page centers as one block instead of hugging the left edge.
+     The chat playground is an app screen and deliberately ignores it. */
+  --site-max: 84rem;
+
+  /* neutrals — warm-tinted, never pure gray */
+  --bg: hsl(40, 25%, 99%);
+  --bg-weak: hsl(42, 18%, 96%);
+  --bg-weak-hover: hsl(42, 15%, 93%);
+  --bg-strong: hsl(30, 8%, 12%);
+
+  --text: hsl(30, 6%, 14%);
+  --text-weak: hsl(32, 4%, 40%);
+  --text-strong: hsl(30, 8%, 11%);
+  --text-inverted: hsl(40, 25%, 99%);
+
+  /* type — sans for prose, mono for code/headings/chrome */
+  --font-mono: var(--font-plex-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-sans: var(--font-plex-sans), system-ui, sans-serif;
+
+  --border: hsl(36, 8%, 79%);
+  --border-weak: hsl(38, 8%, 86%);
+  --icon: hsl(32, 4%, 44%);
+
+  /* accent — one interactive hue: links, active nav, focus (AA on --bg) */
+  --accent: hsl(151, 55%, 28%);
+  --accent-hover: hsl(152, 62%, 21%);
+  --accent-bg: hsl(148, 42%, 93%);
+  --accent-border: hsl(150, 28%, 68%);
+
+  /* semantics — reserved for meaning, not decoration */
+  --warn: hsl(36, 80%, 33%);
+  --warn-bg: hsl(42, 75%, 93%);
+  --danger: hsl(4, 60%, 42%);
+  --danger-bg: hsl(6, 70%, 95%);
+  --info: hsl(215, 60%, 40%);
+  --info-bg: hsl(215, 55%, 93%);
+
+  --appa-throat: var(--text-strong);
+  --appa-teeth: var(--bg);
+  --spark: #fcc405;
+
+  /* syntax — neutrals carry structure, hue only where it informs */
+  --syn-comment: hsl(32, 4%, 44%);
+  --syn-keyword: hsl(30, 8%, 11%);
+  --syn-string: hsl(151, 45%, 30%);
+  --syn-number: hsl(36, 75%, 34%);
+  --syn-fn: hsl(30, 8%, 24%);
+  /* shadcn / AI Elements tokens, derived from the site palette above so the
+     components render native to the site (and flip with it in dark mode).
+     `--accent` and `--border` belong to the site; the shadcn utilities that
+     want them are remapped in the @theme block at the end of this file. */
+  --background: var(--bg);
+  --foreground: var(--text);
+  --card: var(--bg);
+  --card-foreground: var(--text);
+  --popover: var(--bg);
+  --popover-foreground: var(--text);
+  --primary: var(--accent);
+  --primary-foreground: var(--text-inverted);
+  --secondary: var(--bg-weak);
+  --secondary-foreground: var(--text-strong);
+  --muted: var(--bg-weak);
+  --muted-foreground: var(--text-weak);
+  --ui-accent: var(--bg-weak-hover);
+  --accent-foreground: var(--text-strong);
+  --destructive: var(--danger);
+  --input: var(--border);
+  --ring: var(--accent);
+  --chart-1: var(--accent);
+  --chart-2: var(--info);
+  --chart-3: var(--warn);
+  --chart-4: var(--danger);
+  --chart-5: var(--icon);
+  --radius: 0.625rem;
+  --sidebar: var(--bg-weak);
+  --sidebar-foreground: var(--text);
+  --sidebar-primary: var(--accent);
+  --sidebar-primary-foreground: var(--text-inverted);
+  --sidebar-accent: var(--bg-weak-hover);
+  --sidebar-accent-foreground: var(--text-strong);
+  --sidebar-border: var(--border-weak);
+  --sidebar-ring: var(--accent);
+}
+
+/* Dark palette. The theme is a class on <html> rather than a media query so a
+   reader can override the system preference; the inline script in the root
+   layout sets it before first paint, and the toggle flips it afterwards. */
+.dark {
+  color-scheme: dark;
+  --bg: hsl(30, 6%, 8%);
+  --bg-weak: hsl(30, 5%, 11%);
+  --bg-weak-hover: hsl(30, 5%, 15%);
+  --bg-strong: hsl(40, 12%, 92%);
+
+  --text: hsl(35, 8%, 88%);
+  --text-weak: hsl(33, 5%, 62%);
+  --text-strong: hsl(40, 12%, 93%);
+  --text-inverted: hsl(30, 6%, 8%);
+
+  --border: hsl(30, 4%, 30%);
+  --border-weak: hsl(30, 4%, 21%);
+  --icon: hsl(32, 4%, 56%);
+
+  --accent: hsl(146, 45%, 62%);
+  --accent-hover: hsl(146, 52%, 72%);
+  --accent-bg: hsl(150, 28%, 13%);
+  --accent-border: hsl(150, 22%, 32%);
+
+  --warn: hsl(40, 70%, 62%);
+  --warn-bg: hsl(40, 40%, 12%);
+  --danger: hsl(5, 70%, 68%);
+  --danger-bg: hsl(6, 40%, 14%);
+  --info: hsl(212, 55%, 65%);
+  --info-bg: hsl(215, 30%, 14%);
+
+  --appa-throat: var(--bg);
+  --appa-teeth: var(--text-strong);
+  --spark: #fcc405;
+
+  --syn-comment: hsl(33, 5%, 60%);
+  --syn-keyword: hsl(40, 12%, 93%);
+  --syn-string: hsl(146, 42%, 63%);
+  --syn-number: hsl(40, 68%, 63%);
+  --syn-fn: hsl(38, 10%, 84%);
+}
+
+html {
+  background: var(--bg);
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  /* Room for the fixed header; see .site-header. */
+  padding-top: var(--header-h);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+/* code is always mono, whatever the surrounding face */
+code,
+pre,
+kbd,
+samp {
+  font-family: var(--font-mono);
+}
+
+/* chrome and navigation use sans font for consistency */
+.site-header,
+.toc {
+  font-family: var(--font-sans);
+}
+
+::selection {
+  background: var(--accent-bg);
+  color: var(--text-strong);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ————————————————————————————————————————————————
+   Brand mark (mascot) — float + blink
+   ———————————————————————————————————————————————— */
+@keyframes appa-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-2%);
+  }
+}
+
+@keyframes appa-blink {
+  0%,
+  91%,
+  97%,
+  100% {
+    transform: scaleY(1);
+  }
+  94% {
+    transform: scaleY(0.08);
+  }
+}
+
+/* The drift is 2% of the mascot itself, so it has to measure against the
+   mascot's own box — the default (the viewBox) would scale the drift with
+   whatever the mark is nested inside, and the lockup's mascot would swim. */
+.appa-mark-float {
+  transform-box: fill-box;
+  animation: appa-float 5.5s ease-in-out infinite;
+  animation-delay: var(--appa-float-delay, 0s);
+}
+
+.appa-mark-eyes {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: appa-blink 5s ease-in-out infinite;
+  animation-delay: var(--appa-blink-delay, 0s);
+}
+
+/* Dancing (the header mark while the song plays): the pose is set inline
+   every frame from the audio clock, and a running CSS animation would win
+   over that inline transform, so the float goes off for the duration. The
+   feet stay planted: the landing squash scales from the bottom edge. */
+.logo-mark.is-dancing .appa-mark-float {
+  animation: none;
+  transform-origin: 50% 100%;
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .appa-mark-float,
+  .appa-mark-eyes {
+    animation: none;
+  }
+}
+
+/* ————————————————————————————————————————————————
+   Header
+   ———————————————————————————————————————————————— */
+/* Fixed rather than sticky: iOS Safari repaints a sticky bar late while the
+   toolbar collapses and the page coasts, and the content shows above it for a
+   frame at a time. A fixed bar never moves, so it never lags. The body pads
+   by the bar's height, which every other offset already reads. */
+.site-header-shell {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 10;
+}
+
+.site-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  /* Full-bleed bar, contents aligned to the centered reading column: the
+     inline padding grows into the same gutters the shell leaves. */
+  padding: 20px max(24px, calc((100% - var(--site-max)) / 2));
+  background: var(--bg);
+  border-bottom: 1px solid var(--border-weak);
+}
+
+/* The KubeCon trinket demo strip (TrinketDemoBanner), above the header. */
+.trinket-banner {
+  position: relative;
+  padding: 7px 44px;
+  background: var(--accent-bg);
+  border-bottom: 1px solid var(--accent-border);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.4;
+  text-align: center;
+}
+
+.trinket-banner a {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.trinket-banner a:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+
+.trinket-banner-close {
+  position: absolute;
+  top: 50%;
+  right: 12px;
+  transform: translateY(-50%);
+  padding: 0 6px;
+  border: 0;
+  background: none;
+  color: var(--text-weak, var(--text));
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+/* An app screen (the chat) spans the viewport; its header contents keep edge
+   padding to match instead of indenting to the reading column. */
+.site-header-full {
+  padding-inline: 24px;
+}
+
+.wordmark {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  color: var(--text-strong);
+  text-decoration: none;
+}
+
+/* ————————————————————————————————————————————————
+   Logo lockup — every measurement is a proportion of --logo-h, the wordmark's
+   cap height, so a caller scales the whole mark by setting that one value
+   ———————————————————————————————————————————————— */
+.logo-lockup {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--logo-h) * 0.7);
+}
+
+/* The wordmark's box is 9 rows tall but its caps occupy the top 7, so
+   centering the mascot on that box drops it a row below the letters. Lifting
+   it by one row (--logo-h / 7) centers it on the caps instead. */
+.logo-mark {
+  width: calc(var(--logo-h) * 26 / 15);
+  height: auto;
+  transform: translateY(calc(var(--logo-h) / -7));
+}
+
+.logo-word-group {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: calc(var(--logo-h) * 0.45);
+}
+
+.logo-word {
+  height: calc(var(--logo-h) * 9 / 7);
+  width: auto;
+}
+
+.logo-tagline {
+  margin-top: calc(var(--logo-h) * 0.45);
+  font-family: var(--font-mono);
+  font-size: calc(var(--logo-h) * 0.55);
+  line-height: 1;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-weak);
+  white-space: nowrap;
+}
+
+/* ————————————————————————————————————————————————
+   Theme toggle
+   ———————————————————————————————————————————————— */
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  background: none;
+  border: none;
+  color: var(--icon);
+  cursor: pointer;
+}
+
+.theme-toggle:hover {
+  color: var(--text-strong);
+}
+
+/* Both glyphs are in the DOM; the active theme picks one, so the
+   server-rendered frame already shows the right icon. */
+.theme-icon-moon {
+  display: none;
+}
+
+.dark .theme-icon-sun {
+  display: none;
+}
+
+.dark .theme-icon-moon {
+  display: inline;
+}
+
+.site-header nav {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+}
+
+.site-header nav a {
+  color: var(--icon);
+  text-decoration: none;
+}
+
+.site-header nav a:hover {
+  color: var(--text-strong);
+}
+
+/* Icon-only nav links (the Discord mark) center on the text baseline row and
+   inherit the same rest/hover colors as their text siblings. */
+.site-header nav a.discord-link {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Below the docked breakpoint the header keeps only the menu button and the
+   wordmark. Search, Paper, GitHub and the theme toggle move into the drawer —
+   the same place the page navigation already lives, so one tap reaches all of
+   it and the top bar stops competing with the page title. */
+@media (max-width: 1023px) {
+  :root {
+    --header-h: 53px;
+  }
+
+  /* With the nav gone, space-between would push the wordmark to the far
+     right; the two survivors belong together on the left. */
+  .site-header {
+    justify-content: flex-start;
+    padding: 14px 16px;
+  }
+
+  .site-header nav {
+    display: none;
+  }
+}
+
+@media (max-width: 380px) {
+  .site-header {
+    padding: 14px 12px;
+  }
+
+  .site-header .logo-tagline {
+    display: none;
+  }
+}
+
+/* ————————————————————————————————————————————————
+   Mobile nav trigger — the drawer's handle, in the sticky header because a
+   grid item cannot stay sticky outside its own row
+   ———————————————————————————————————————————————— */
+.nav-toggle {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  margin-right: 12px;
+  padding: 4px;
+  background: none;
+  border: none;
+  color: var(--icon);
+  cursor: pointer;
+}
+
+.nav-toggle:hover {
+  color: var(--text-strong);
+}
+
+@media (max-width: 1023px) {
+  .nav-toggle {
+    display: inline-flex;
+  }
+}
+
+/* ————————————————————————————————————————————————
+   Shell — sidebar | content | toc
+   ———————————————————————————————————————————————— */
+.shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-height: calc(100vh - var(--header-h));
+  /* One centered block on monitors wider than the reading column — the gap
+     splits into two gutters instead of pooling on the right. */
+  max-width: var(--site-max);
+  margin-inline: auto;
+}
+
+@media (min-width: 1024px) {
+  .shell {
+    grid-template-columns: 16rem minmax(0, 1fr);
+  }
+}
+
+@media (min-width: 1280px) {
+  .shell {
+    grid-template-columns: 16rem minmax(0, 1fr) 15rem;
+  }
+}
+
+/* Below 1024px the rail is a drawer: the aside itself collapses to nothing in
+   the grid, and its panel is fixed under the header until the trigger opens
+   it. Docked from 1024px up, it is the ordinary sticky left column. */
+.sidebar {
+  display: block;
+}
+
+.nav-scrim {
+  display: none;
+}
+
+@media (max-width: 1023px) {
+  /* The drawer and its scrim run past the bottom of the screen rather than
+     ending at it: iOS Safari resizes the viewport as its toolbar collapses
+     (the page behind still scrolls; iOS ignores overflow: hidden on body),
+     and a panel pinned to the bottom edge lags and shows the page under it.
+     A panel a full large-viewport tall is clipped by the screen instead.
+     The list pads its end by the part that can sit under the toolbar, so
+     the last link is reachable while the toolbar is shown. */
+  .sidebar-inner {
+    position: fixed;
+    top: var(--header-h);
+    left: 0;
+    bottom: 0;
+    height: 100lvh;
+    z-index: 30;
+    width: min(20rem, 84vw);
+    padding: 20px 0 32px;
+    padding-bottom: calc(100lvh - 100svh + var(--header-h) + 32px);
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+    background: var(--bg);
+    border-right: 1px solid var(--border);
+    transform: translateX(-100%);
+    visibility: hidden;
+    transition:
+      transform 160ms ease,
+      visibility 160ms;
+  }
+
+  .sidebar.open .sidebar-inner {
+    transform: none;
+    visibility: visible;
+  }
+
+  .sidebar.open .nav-scrim {
+    display: block;
+    position: fixed;
+    top: var(--header-h);
+    inset-inline: 0;
+    bottom: 0;
+    height: 100lvh;
+    z-index: 29;
+    background: rgba(0, 0, 0, 0.4);
+  }
+
+}
+
+@media (max-width: 1023px) and (prefers-reduced-motion: reduce) {
+  .sidebar-inner {
+    transition: none;
+  }
+}
+
+@media (min-width: 1024px) {
+  .sidebar {
+    display: block;
+    border-right: 1px solid var(--border-weak);
+  }
+
+  .sidebar-inner {
+    position: sticky;
+    top: var(--header-h);
+    max-height: calc(100vh - var(--header-h));
+    overflow-y: auto;
+    padding: 24px 0;
+  }
+
+  /* The docked rail sits beside the TOC column, which owns page sections. */
+  .sidebar-toc {
+    display: none;
+  }
+}
+
+.sidebar-toc a.depth-3 {
+  padding-left: 40px;
+}
+
+/* Drawer chrome — what the header sheds below 1024px */
+.sidebar-chrome {
+  padding: 0 24px 20px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--border-weak);
+}
+
+@media (min-width: 1024px) {
+  .sidebar-chrome {
+    display: none;
+  }
+}
+
+.sidebar-chrome-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--bg-weak);
+  border: 1px solid var(--border-weak);
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--text-weak);
+  text-align: left;
+  cursor: pointer;
+}
+
+.sidebar-chrome-search:hover {
+  border-color: var(--border);
+  color: var(--text-strong);
+}
+
+.sidebar-chrome-row {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  margin-top: 14px;
+}
+
+/* `.sidebar .sidebar-chrome-row` rather than the class alone: these links must
+   beat the later `.sidebar a` nav-link rule, which would otherwise make them
+   block-level with the nav rows' 24px padding and overflow the drawer. */
+.sidebar .sidebar-chrome-row a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border-left: 0;
+  color: var(--text-weak);
+  text-decoration: none;
+}
+
+.sidebar .sidebar-chrome-row a:hover {
+  background: none;
+  color: var(--text-strong);
+}
+
+.sidebar-chrome-row .theme-toggle {
+  margin-left: auto;
+}
+
+.sidebar-category {
+  padding: 0 24px 6px;
+  color: var(--text-strong);
+  font-weight: 500;
+}
+
+.sidebar-inner > div + div {
+  margin-top: 24px;
+}
+
+.sidebar a {
+  display: block;
+  padding: 4px 24px;
+  color: var(--text-weak);
+  text-decoration: none;
+  border-left: 2px solid transparent;
+}
+
+.sidebar a:hover {
+  background: var(--bg-weak);
+  color: var(--text-strong);
+}
+
+.sidebar a[aria-current="page"] {
+  border-left-color: var(--accent);
+  background: var(--accent-bg);
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+/* The mascot standing in for "OpenAPPA" in a rail link: sized to the text,
+   sat on the baseline like a glyph. */
+.sidebar-mark {
+  display: inline-flex;
+  vertical-align: -0.2em;
+  margin-right: 0.15em;
+}
+
+.sidebar-proposal {
+  margin-left: 0.45em;
+  font-size: 10px;
+  vertical-align: 0.05em;
+}
+
+/* ————————————————————————————————————————————————
+   Main column
+   ———————————————————————————————————————————————— */
+.doc-main {
+  padding: 2.5rem 3rem 5rem;
+  max-width: 46rem;
+  width: 100%;
+  /* Between the cap and the breakpoints the column has slack; the prose sits
+     centered in it rather than against the sidebar. */
+  margin-inline: auto;
+}
+
+@media (max-width: 768px) {
+  .doc-main {
+    padding: 1.5rem 1.5rem 4rem;
+  }
+}
+
+.doc-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+  font-size: 13px;
+  color: var(--text-weak);
+}
+
+.doc-breadcrumb a {
+  color: var(--text-weak);
+  text-decoration: none;
+}
+
+.doc-breadcrumb a:hover {
+  color: var(--accent);
+}
+
+.doc-breadcrumb [aria-current="page"] {
+  color: var(--text);
+}
+
+/* ————————————————————————————————————————————————
+   Table of contents
+   ———————————————————————————————————————————————— */
+.toc {
+  display: none;
+}
+
+@media (min-width: 1280px) {
+  .toc {
+    display: block;
+  }
+
+  .toc-inner {
+    position: sticky;
+    top: var(--header-h);
+    max-height: calc(100vh - var(--header-h));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 24px 0;
+  }
+}
+
+.toc-title {
+  padding: 0 24px 12px;
+  color: var(--text-strong);
+  font-size: 14px;
+}
+
+.toc-doc-tools {
+  padding-top: 4px;
+}
+
+.toc-doc-tools .mcp-panel-card {
+  margin-top: 12px;
+}
+
+.toc-doc-tools .mcp-panel-card:first-child {
+  margin-top: 0;
+}
+
+.toc-doc-tools + .toc-title {
+  margin-top: 24px;
+}
+
+.toc a {
+  display: block;
+  padding: 4px 24px;
+  color: var(--text-weak);
+  text-decoration: none;
+}
+
+.toc a.depth-3 {
+  padding-left: 40px;
+}
+
+.toc a:hover {
+  background: var(--bg-weak);
+  color: var(--text-strong);
+}
+
+.toc a.active {
+  color: var(--accent);
+}
+
+/* ————————————————————————————————————————————————
+   Prose (rendered markdown)
+   ———————————————————————————————————————————————— */
+.prose {
+  /* 16.5px in the 40rem column puts about 70 characters on a line; the
+     body's 14px is for UI chrome, not reading. */
+  font-size: 16.5px;
+  line-height: 1.65;
+}
+
+/* Anchor targets stop below the sticky header instead of underneath it. */
+.prose :is(h1, h2, h3, h4, h5)[id] {
+  scroll-margin-top: calc(var(--header-h) + 1.5rem);
+  text-wrap: balance;
+}
+
+.prose h1 {
+  font-family: var(--font-mono);
+  font-size: 28px;
+  font-weight: 600;
+  color: var(--text-strong);
+  line-height: 1.3;
+}
+
+.prose h2 {
+  font-size: 23px;
+  font-weight: 600;
+  color: var(--text-strong);
+  margin: 2.5rem 0 0.75rem;
+  padding-top: 2rem;
+  border-top: 1px solid var(--border-weak);
+  line-height: 1.35;
+}
+
+.prose h3 {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-strong);
+  margin: 2rem 0 0.5rem;
+}
+
+.prose h4,
+.prose h5 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-strong);
+  margin: 1.5rem 0 0.5rem;
+}
+
+.prose p {
+  margin: 0.75rem 0;
+  text-wrap: pretty;
+}
+
+.prose strong {
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.prose em {
+  color: var(--text-strong);
+}
+
+.prose a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--accent-border);
+}
+
+.prose a:hover {
+  color: var(--accent-hover);
+  text-decoration-color: var(--accent-hover);
+}
+
+.prose ul,
+.prose ol {
+  margin: 0.75rem 0;
+  padding: 0;
+  list-style: none;
+}
+
+.prose li {
+  position: relative;
+  padding-left: 1.4em;
+  margin: 0.4rem 0;
+  text-wrap: pretty;
+}
+
+.prose ul > li::before {
+  content: "–";
+  position: absolute;
+  left: 0;
+  color: var(--text-weak);
+}
+
+.prose ol {
+  counter-reset: item;
+}
+
+.prose ol > li::before {
+  counter-increment: item;
+  content: counter(item) ".";
+  position: absolute;
+  left: 0;
+  color: var(--text-weak);
+}
+
+/* landing page: [*] markers, opencode-style */
+.landing .prose ul > li::before {
+  content: "[*]";
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.landing .prose li {
+  padding-left: 2.2em;
+}
+
+/* Long identifiers in inline code have no break opportunity of their own and
+   would otherwise widen the page on a phone; block code scrolls in its <pre>. */
+.prose :not(pre) > code {
+  overflow-wrap: anywhere;
+}
+
+.prose code {
+  background: var(--bg-weak);
+  border: 1px solid var(--border-weak);
+  border-radius: 3px;
+  padding: 0.1em 0.35em;
+  font-size: 0.875em;
+  color: var(--text-strong);
+}
+
+.prose pre {
+  background: var(--bg-weak);
+  border: 1px solid var(--border-weak);
+  border-radius: 6px;
+  padding: 14px 16px;
+  margin: 0.75rem 0 2rem;
+  overflow-x: auto;
+  line-height: 1.6;
+}
+
+.prose pre code,
+.prose a code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: inherit;
+  color: inherit;
+}
+
+/* ```text blocks are box-drawing diagrams. The Plex Mono webfont ships
+   a latin subset with no U+2500 box-drawing glyphs, so their rails fall
+   back to a font with different metrics, and the default 1.6 leading
+   opens gaps between the │ glyphs. Diagrams get the system mono stack —
+   whose box glyphs span the full line box — and tighter leading;
+   command snippets keep the site font and the roomier default. */
+.prose pre code.language-text {
+  display: block;
+  font-family: ui-monospace, "Cascadia Mono", Menlo, Consolas,
+    "DejaVu Sans Mono", monospace;
+  line-height: 1.15;
+}
+
+.battery-figure {
+  width: 100%;
+  max-width: 45rem;
+  margin: 1rem 0 2rem;
+}
+
+.battery-order-figure {
+  max-width: 32.5rem;
+}
+
+.battery-figure svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.battery-catalog {
+  margin: 1.25rem 0 2.25rem;
+}
+
+.battery-catalog-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.prose .battery-card {
+  display: flex;
+  min-width: 0;
+  min-height: 8.25rem;
+  flex-direction: column;
+  padding: 16px;
+  border: 1px solid var(--border-weak);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text);
+  text-decoration: none;
+  transition:
+    border-color 120ms ease,
+    background 120ms ease,
+    transform 120ms ease;
+}
+
+.prose .battery-card:hover {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+  color: var(--text);
+  text-decoration: none;
+  transform: translateY(-1px);
+}
+
+.battery-card-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.battery-card-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.battery-card-logo {
+  width: 22px;
+  height: 22px;
+  flex: none;
+  object-fit: contain;
+}
+
+.dark .battery-card-logo-github {
+  filter: invert(1);
+}
+
+.battery-card-arrow {
+  flex: none;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--accent);
+}
+
+.prose .battery-card-name {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--text-strong);
+}
+
+.prose .battery-card-add {
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  background: var(--bg-weak);
+  text-align: center;
+}
+
+.battery-card-plus {
+  font-family: var(--font-mono);
+  font-size: 27px;
+  font-weight: 300;
+  line-height: 0.8;
+  color: var(--accent);
+}
+
+.battery-card-description {
+  margin-top: 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-weak);
+}
+
+@media (max-width: 640px) {
+  .battery-catalog-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .prose .battery-card {
+    min-height: 6.5rem;
+  }
+
+  .prose .battery-card-add {
+    min-height: 4.5rem;
+    flex-direction: row;
+  }
+}
+
+.prose blockquote {
+  border-left: 2px solid var(--border);
+  padding-left: 1rem;
+  margin: 1rem 0;
+  color: var(--text-weak);
+}
+
+.prose blockquote:has(> p:first-child > strong:only-child) {
+  border-left: 0;
+  padding-left: 0;
+}
+
+.prose hr {
+  border: none;
+  border-top: 1px solid var(--border-weak);
+  margin: 2rem 0;
+}
+
+/* Wide tables scroll inside this wrapper rather than widening the page. */
+.table-scroll {
+  margin: 1rem 0;
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 13px;
+}
+
+.table-scroll > table {
+  margin: 0;
+  min-width: 28rem;
+}
+
+.prose th,
+.prose td {
+  border: 1px solid var(--border-weak);
+  padding: 6px 12px;
+  text-align: left;
+  vertical-align: top;
+}
+
+/* Keep identifiers intact in tables. The table wrapper provides horizontal
+   scrolling when an identifier is wider than the available viewport. */
+.prose :is(th, td) code {
+  overflow-wrap: normal;
+  word-break: normal;
+  white-space: nowrap;
+}
+
+.prose th {
+  background: var(--bg-weak);
+  color: var(--text-strong);
+  font-weight: 500;
+}
+
+/* ————————————————————————————————————————————————
+   Proposals — material that is not true of the current model yet
+   ———————————————————————————————————————————————— */
+.proposal {
+  margin: 2.5rem 0;
+  margin-left: -1.25rem;
+  padding: 0.125rem 0 0.25rem calc(1.25rem - 2px);
+  border-left: 2px solid var(--warn);
+  scroll-margin-top: calc(var(--header-h) + 1.5rem);
+}
+
+/* Compact editorial header: one quiet rule instead of a card-within-a-page. */
+.proposal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  padding: 0 0 0.7rem;
+  border-bottom: 1px solid var(--border-weak);
+}
+
+.proposal-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--warn);
+}
+
+.proposal-badge::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  background: currentColor;
+  transform: rotate(45deg);
+}
+
+.prose .proposal-meta {
+  flex: none;
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--text-weak);
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.prose .proposal-body > :first-child {
+  margin-top: 1rem;
+}
+
+.prose .proposal-body > :last-child {
+  margin-bottom: 0;
+}
+
+/* Headings inside a proposal stay subordinate to its compact header and drop
+   the rule that separates top-level sections of the page. */
+.prose .proposal-body :is(h2, h3, h4) {
+  border-top: none;
+  padding-top: 0;
+  font-size: 15px;
+  margin: 1.5rem 0 0.5rem;
+}
+
+.prose .proposal-body :is(h2, h3, h4)[id] {
+  scroll-margin-top: calc(var(--header-h) + 5rem);
+}
+
+/* A proposal is marked in the rail too, so its entry is not read as another
+   section of the reference. */
+.toc-proposal::after {
+  content: "🚧";
+  margin-left: 0.45em;
+  font-size: 10px;
+  vertical-align: 0.05em;
+}
+
+@media (max-width: 640px) {
+  .proposal {
+    margin-left: -1rem;
+    padding-left: calc(1rem - 2px);
+  }
+
+  .proposal-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
+/* heading anchor links */
+.heading-anchor {
+  margin-left: 0.4em;
+  color: var(--text-weak);
+  opacity: 0;
+  text-decoration: none;
+}
+
+.prose h2:hover .heading-anchor,
+.prose h3:hover .heading-anchor,
+.prose h4:hover .heading-anchor,
+.prose h5:hover .heading-anchor {
+  opacity: 1;
+}
+
+/* ————————————————————————————————————————————————
+   Code block chrome (copy button)
+   ———————————————————————————————————————————————— */
+.codeblock {
+  position: relative;
+}
+
+.codeblock .copy {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  border: 1px solid var(--border-weak);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--icon);
+  font-size: 12px;
+  font-family: inherit;
+  padding: 2px 8px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.prose blockquote .codeblock .copy {
+  opacity: 1;
+}
+
+.codeblock:hover .copy {
+  opacity: 1;
+}
+
+.codeblock .copy:hover {
+  color: var(--text-strong);
+}
+
+.codeblock .copy.copied {
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+  color: var(--accent);
+  opacity: 1;
+}
+
+/* ————————————————————————————————————————————————
+   Syntax highlighting (highlight.js classes)
+   ———————————————————————————————————————————————— */
+.hljs-comment,
+.hljs-quote {
+  color: var(--syn-comment);
+  font-style: italic;
+}
+
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-meta,
+.hljs-name,
+.hljs-built_in,
+.hljs-tag {
+  color: var(--syn-keyword);
+  font-weight: 500;
+}
+
+.hljs-string,
+.hljs-attr,
+.hljs-symbol,
+.hljs-addition,
+.hljs-regexp {
+  color: var(--syn-string);
+}
+
+.hljs-number,
+.hljs-literal,
+.hljs-deletion {
+  color: var(--syn-number);
+}
+
+.hljs-title,
+.hljs-function,
+.hljs-section,
+.hljs-type,
+.hljs-class {
+  color: var(--syn-fn);
+}
+
+/* ————————————————————————————————————————————————
+   Landing hero
+   ———————————————————————————————————————————————— */
+.hero {
+  padding-bottom: 0.5rem;
+}
+
+.hero h1 {
+  font-size: 32px;
+  font-weight: 500;
+  color: var(--text-strong);
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+}
+
+/* ————————————————————————————————————————————————
+   "How to spell it" — hero pronunciation button
+   ———————————————————————————————————————————————— */
+
+.spell-it {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 0.6rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  /* No uppercasing here, unlike the rest of the mono chrome: the label is a
+     respelling, and "OPEN-AH-PA" is not one. */
+  letter-spacing: 0.01em;
+  color: var(--text-weak);
+  transition: color 0.12s ease;
+  cursor: pointer;
+}
+
+/* The glyph is the only colored thing, and only while it matters: idle it is
+   chrome, hovered or playing it is the accent. */
+.spell-it .spell-it-glyph {
+  color: var(--icon);
+  transition: color 0.12s ease;
+}
+
+.spell-it:hover .spell-it-glyph,
+.spell-it[data-confirming] .spell-it-glyph,
+.spell-it[data-speaking] .spell-it-glyph {
+  color: var(--accent);
+}
+
+.spell-it-say {
+  color: var(--text-weak);
+  transition: color 0.12s ease;
+}
+
+.spell-it:hover .spell-it-say,
+.spell-it[data-confirming] .spell-it-say,
+.spell-it[data-speaking] .spell-it-say {
+  color: var(--text);
+}
+
+.spell-it:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+/* Loading: the clip is being fetched, so the button takes no clicks and
+   the glyph dims until playback starts. */
+.spell-it:disabled {
+  cursor: progress;
+}
+
+.spell-it[data-loading] .spell-it-glyph {
+  color: var(--icon);
+  opacity: 0.5;
+}
+
+.spell-it-glyph {
+  flex: none;
+}
+
+/* Speaking: the glyph is a pause bar, and it breathes so the state reads
+   without a second label. */
+.spell-it[data-speaking] .spell-it-glyph {
+  animation: spell-it-pulse 1s ease-in-out infinite;
+}
+
+@keyframes spell-it-pulse {
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spell-it[data-speaking] .spell-it-glyph {
+    animation: none;
+  }
+}
+
+/* ————————————————————————————————————————————————
+   Interactive figures (tutorial)
+   ———————————————————————————————————————————————— */
+.flow-figure {
+  margin: 1.5rem 0 2rem;
+}
+
+.flow-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.flow-controls button {
+  border: 1px solid var(--border-weak);
+  border-radius: 4px;
+  background: var(--bg-weak);
+  color: var(--text-strong);
+  font-family: inherit;
+  font-size: 11px;
+  width: 34px;
+  height: 26px;
+  cursor: pointer;
+}
+
+.flow-controls button:hover {
+  border-color: var(--border);
+}
+
+.flow-controls input[type="range"] {
+  flex: 1;
+  accent-color: var(--accent);
+}
+
+/* ————————————————————————————————————————————————
+   Claude Code guide — policy setup, two commands
+   ———————————————————————————————————————————————— */
+.claude-policy-timing {
+  display: grid;
+  grid-template-columns: 8.5rem minmax(0, 1fr);
+  margin: 1.25rem 0 1.75rem;
+  border: 1px solid var(--accent-border);
+  border-radius: 8px;
+  background: var(--accent-bg);
+  overflow: hidden;
+}
+
+.claude-policy-duration {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 18px;
+  border-right: 1px solid var(--accent-border);
+  font-family: var(--font-mono);
+}
+
+.claude-policy-duration strong {
+  color: var(--accent);
+  font-size: 19px;
+  line-height: 1.2;
+}
+
+.claude-policy-duration span {
+  margin-top: 4px;
+  color: var(--text-weak);
+  font-size: 10px;
+}
+
+.claude-policy-timing-copy {
+  padding: 13px 18px;
+}
+
+.prose .claude-policy-timing-copy p {
+  margin: 0.35rem 0;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.claude-session-choice {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+  margin: 1.25rem 0 2rem;
+}
+
+.claude-session-choice > div {
+  display: flex;
+  flex-direction: column;
+  min-height: 132px;
+  padding: 16px;
+  border: 1px solid var(--border-weak);
+  border-radius: 7px;
+  background: var(--bg-weak);
+}
+
+.claude-session-choice code {
+  align-self: flex-start;
+  margin-bottom: 16px;
+  color: var(--text-weak);
+}
+
+.claude-session-choice strong {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.claude-session-choice span {
+  margin-top: 4px;
+  color: var(--text-weak);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.claude-session-choice .claude-session-protected {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+}
+
+.claude-session-protected code,
+.claude-session-protected strong {
+  color: var(--accent);
+}
+
+.prose img[alt*="Claude Code session"],
+.prose img[alt*="Archestra sidebar"] {
+  display: block;
+  width: 100%;
+  margin: 1.25rem 0 2rem;
+  border: 1px solid var(--border-weak);
+  border-radius: 9px;
+}
+
+@media (max-width: 600px) {
+  .claude-policy-timing {
+    grid-template-columns: 1fr;
+  }
+
+  .claude-policy-duration {
+    border-right: none;
+    border-bottom: 1px solid var(--accent-border);
+  }
+
+  .claude-session-choice {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ————————————————————————————————————————————————
+   Benchmark highlight panel (home) — emphasis bars, two small multiples
+   ———————————————————————————————————————————————— */
+.bench-panel {
+  margin: 2rem 0 2.5rem;
+}
+
+.bench-charts {
+  display: grid;
+  /* Two columns fit from 30rem + the 32px gap; the subject box below keys
+     its side-by-side form off the same threshold. */
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 22px 32px;
+  margin-top: 22px;
+  container-type: inline-size;
+}
+
+.bench-chart {
+  margin: 0;
+}
+
+.bench-chart-title {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-strong);
+}
+
+/* name | bar | value. Both columns are fixed so the two charts share a
+   baseline and the value tips never jitter between rows. */
+.bench-row {
+  display: grid;
+  /* The name column fits the longest arm label ("FIDES (Microsoft)", ~95px)
+     without wrapping; the track takes whatever is left. */
+  grid-template-columns: 7.25rem minmax(0, 1fr) 3rem;
+  align-items: center;
+  gap: 10px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+
+.bench-row-name {
+  color: var(--text-weak);
+  white-space: nowrap;
+}
+
+/* One faint accent band spans the subject row of every chart. A fill, not
+   an outline: a bordered box reads as keyboard focus. Each row paints its
+   own segment behind its content so the columns stay put; side by side, the
+   segments extend into the gap and meet at its midpoint, so the two charts
+   read as one highlighted line. Stacked, each row closes its own band. */
+.bench-row.subject {
+  position: relative;
+  isolation: isolate;
+}
+
+.bench-row.subject::before {
+  content: "";
+  position: absolute;
+  inset: -3px -7px;
+  z-index: -1;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-radius: 3px;
+  pointer-events: none;
+}
+
+@container (min-width: calc(30rem + 32px)) {
+  .bench-chart:first-child .bench-row.subject::before {
+    right: -16px;
+    border-radius: 3px 0 0 3px;
+  }
+
+  .bench-chart:last-child .bench-row.subject::before {
+    left: -16px;
+    border-radius: 0 3px 3px 0;
+  }
+}
+
+.bench-row.subject .bench-row-name {
+  color: var(--text-strong);
+  font-weight: 500;
+}
+
+.bench-track {
+  position: relative;
+  height: 10px;
+  border-radius: 2px;
+  background: var(--bg-weak-hover);
+  overflow: hidden;
+}
+
+.bench-bar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  display: block;
+  height: 100%;
+  border-radius: 0 2px 2px 0;
+  /* Context arms recede; the subject carries the one accent hue. */
+  background: var(--text-weak);
+}
+
+.bench-row.subject .bench-bar {
+  background: var(--accent);
+}
+
+.bench-row-value {
+  text-align: right;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-weak);
+}
+
+.bench-row.subject .bench-row-value {
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+.bench-panel-link {
+  display: inline-block;
+  margin-top: 16px;
+  width: 100%;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.bench-panel-link:hover {
+  color: var(--accent-hover);
+}
+
+/* Home-page animation (BenchmarkHighlightAnimated): the ceiling the subject
+   bar breaks through, the scene headline, and the replay control. */
+.bench-track-wrap {
+  position: relative;
+}
+
+.bench-track-wrap .bench-track {
+  display: block;
+}
+
+.bench-wall {
+  position: absolute;
+  top: -5px;
+  bottom: -5px;
+  width: 3px;
+  margin-left: -1.5px;
+  display: flex;
+  flex-direction: column;
+}
+
+.bench-wall i {
+  flex: 1;
+  background: color-mix(in srgb, var(--danger) var(--strain), var(--text-weak));
+}
+
+.bench-wall i:first-child {
+  transform: translate(calc(var(--split) * 4px), calc(var(--split) * -10px)) rotate(calc(var(--split) * 35deg));
+}
+
+.bench-wall i:last-child {
+  transform: translate(calc(var(--split) * 4px), calc(var(--split) * 10px)) rotate(calc(var(--split) * -35deg));
+}
+
+.bench-panel-animated {
+  margin-top: 1rem;
+}
+
+.bench-panel-animated .bench-charts {
+  margin-top: 0;
+}
+
+.bench-panel-animated .bench-row.subject::before {
+  content: none;
+}
+
+.bench-stage {
+  position: relative;
+  container-type: inline-size;
+}
+
+.bench-headline {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0 8px;
+  text-align: center;
+  text-wrap: balance;
+  font-size: clamp(18px, 4cqi, 26px);
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--text-strong);
+  pointer-events: none;
+}
+
+.bench-panel-footer {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.bench-panel-footer .bench-panel-link {
+  width: auto;
+}
+
+.bench-replay {
+  font-size: 12px;
+  color: var(--text-weak);
+  cursor: pointer;
+}
+
+.bench-replay:hover {
+  color: var(--text-strong);
+}
+
+/* ————————————————————————————————————————————————
+   Advisory Board signup
+   ———————————————————————————————————————————————— */
+.signup {
+  margin: 2rem 0 1rem;
+  padding: 20px 24px 22px;
+  border: 1px solid var(--border-weak);
+  border-radius: 10px;
+  background: var(--bg-weak);
+}
+
+.signup-title {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.signup-lede {
+  margin: 6px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-weak);
+}
+
+.signup-form {
+  margin-top: 16px;
+}
+
+/* Visible to screen readers only: the input's placeholder and the surrounding
+   copy already say what the field is, but a control still needs a real label. */
+.signup-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.signup-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.signup-input {
+  flex: 1 1 14rem;
+  min-width: 0;
+  padding: 9px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--text-strong);
+}
+
+.signup-input::placeholder {
+  color: var(--text-weak);
+}
+
+.signup-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+
+.signup-button {
+  flex: 0 0 auto;
+  padding: 9px 18px;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-inverted);
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.signup-button:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.signup-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Reserves its line so the panel does not jump when a result arrives. */
+.signup-status {
+  min-height: 1.4em;
+  margin: 10px 0 0;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-weak);
+}
+
+.signup-status.ok {
+  color: var(--accent);
+}
+
+.signup-status.error {
+  color: var(--danger);
+}
+
+/* ————————————————————————————————————————————————
+   Logo gallery (docs)
+   ———————————————————————————————————————————————— */
+.logo-gallery-item {
+  margin: 1.5rem 0 2rem;
+}
+
+.logo-gallery-label {
+  color: var(--text-strong);
+  font-weight: 500;
+}
+
+.logo-gallery-note {
+  color: var(--text-weak);
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.logo-gallery-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 32px;
+  padding: 20px 24px;
+  border: 1px solid var(--border-weak);
+  border-radius: 6px;
+  color: var(--text-strong);
+}
+
+/* ————————————————————————————————————————————————
+   Chat — the /chat route fills the viewport below the header; the chat pane
+   scrolls internally, the page itself never does. The playground brings its
+   own right sidebar, so the shell's third (toc) column is dropped.
+   ———————————————————————————————————————————————— */
+.chat-shell {
+  height: calc(100vh - var(--header-h));
+  min-height: 0;
+  /* Centred on the same column as the rest of the site, so the chat does
+     not sprawl to the window edges while every other page is contained. */
+  max-width: var(--site-max);
+  margin-inline: auto;
+  width: 100%;
+}
+
+@media (min-width: 1280px) {
+  .chat-shell {
+    grid-template-columns: 16rem minmax(0, 1fr);
+  }
+}
+
+.chat-main {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+}
+
+/* ————————————————————————————————————————————————
+   Policy editor — a transparent textarea over a highlighted <pre>
+   ———————————————————————————————————————————————— */
+
+/* The visible text lives in the layer *behind* the caret layer, so an opaque
+   selection paints over it and the selected words vanish. Keep the selection
+   translucent so the highlighted text reads through it. */
+.policy-editor textarea::selection {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: transparent;
+}
+
+/* The site's focus ring is meant for controls with edges. Around a full-pane
+   editor it reads as the panel itself lighting up. */
+.policy-editor textarea:focus,
+.policy-editor textarea:focus-visible {
+  outline: none;
+}
+
+/* ————————————————————————————————————————————————
+   Footer
+   ———————————————————————————————————————————————— */
+.site-footer {
+  display: flex;
+  justify-content: space-between;
+  /* Aligned to the centered reading column, like the header. */
+  padding: 20px max(24px, calc((100% - var(--site-max)) / 2));
+  border-top: 1px solid var(--border-weak);
+  color: var(--text-weak);
+  font-size: 13px;
+}
+
+.site-footer a {
+  color: var(--text-weak);
+  text-decoration: none;
+}
+
+.site-footer a:hover {
+  color: var(--text-strong);
+}
+
+.site-footer-links {
+  display: inline-flex;
+  gap: 20px;
+}
+
+/* ————————————————————————————————————————————————
+   Term popovers — hover/tap definitions on inline code
+   ———————————————————————————————————————————————— */
+.term {
+  position: relative;
+  display: inline-block;
+}
+
+.term-trigger {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  cursor: help;
+}
+
+.term-trigger code {
+  border-bottom: 1px dashed var(--text-weak);
+}
+
+.term-trigger:hover code,
+.term-trigger[aria-expanded="true"] code {
+  border-bottom-color: var(--accent);
+}
+
+.term-popover {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  transform: translateX(-50%);
+  display: block;
+  width: max-content;
+  max-width: min(320px, 78vw);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  line-height: 1.55;
+  color: var(--text);
+  text-align: left;
+  white-space: normal;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
+  z-index: 40;
+}
+
+/* ————————————————————————————————————————————————
+   Search modal & trigger
+   ———————————————————————————————————————————————— */
+.search-trigger-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-weak);
+  border: 1px solid var(--border-weak);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 13px;
+  color: var(--text-weak);
+  cursor: pointer;
+  transition: all 120ms ease;
+}
+
+.search-trigger-btn:hover {
+  border-color: var(--border);
+  color: var(--text-strong);
+  background: var(--bg-weak-hover);
+}
+
+.header-kbd {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border-weak);
+  border-radius: 3px;
+  padding: 1px 5px;
+  color: var(--text-weak);
+}
+
+.search-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 15vh;
+}
+
+.search-dialog {
+  width: 100%;
+  max-width: 560px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.2);
+  overflow: hidden;
+  margin: 0 16px;
+}
+
+.search-input-wrapper {
+  display: flex;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-weak);
+  gap: 12px;
+}
+
+.search-icon {
+  color: var(--text-weak);
+}
+
+.search-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  font-size: 15px;
+  color: var(--text-strong);
+  font-family: inherit;
+}
+
+.search-clear {
+  background: none;
+  border: none;
+  color: var(--text-weak);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 6px;
+}
+
+.search-clear:hover {
+  color: var(--text-strong);
+}
+
+.search-kbd {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  background: var(--bg-weak);
+  border: 1px solid var(--border-weak);
+  border-radius: 4px;
+  padding: 2px 6px;
+  color: var(--text-weak);
+}
+
+.search-results {
+  max-height: 380px;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+
+.search-empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-weak);
+  font-size: 14px;
+}
+
+.search-item {
+  display: block;
+  padding: 10px 16px;
+  text-decoration: none;
+  color: var(--text);
+  border-left: 2px solid transparent;
+  transition: background 100ms ease;
+}
+
+.search-item.active,
+.search-item:hover {
+  background: var(--bg-weak);
+  border-left-color: var(--accent);
+}
+
+.search-item-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.search-item-title {
+  font-weight: 500;
+  color: var(--text-strong);
+  font-size: 14px;
+}
+
+.search-badge {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-weight: 600;
+}
+
+.badge-doc {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.badge-section {
+  background: var(--bg-weak);
+  color: var(--text-weak);
+  border: 1px solid var(--border-weak);
+}
+
+.badge-rule {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+.badge-term {
+  background: var(--info-bg);
+  color: var(--info);
+}
+
+.search-item-subtitle {
+  font-size: 12px;
+  color: var(--text-weak);
+  margin-top: 2px;
+}
+
+.search-item-snippet {
+  font-size: 12px;
+  color: var(--text-weak);
+  margin-top: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ————————————————————————————————————————————————
+   Doc Pagination
+   ———————————————————————————————————————————————— */
+.doc-pagination {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 4rem;
+  padding-top: 2rem;
+  border-top: 1px solid var(--border-weak);
+}
+
+.pagination-card {
+  display: flex;
+  flex-direction: column;
+  padding: 16px 20px;
+  border: 1px solid var(--border-weak);
+  border-radius: 8px;
+  text-decoration: none;
+  background: var(--bg);
+  transition: all 120ms ease;
+}
+
+.pagination-card.next {
+  text-align: right;
+  align-items: flex-end;
+}
+
+.pagination-card:hover {
+  border-color: var(--accent-border);
+  background: var(--bg-weak);
+}
+
+.pagination-label {
+  font-size: 12px;
+  color: var(--text-weak);
+  font-family: var(--font-mono);
+}
+
+.pagination-title {
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text-strong);
+  margin-top: 4px;
+}
+
+/* ————————————————————————————————————————————————
+   MCP panel — card in the TOC column + install modal
+   ———————————————————————————————————————————————— */
+.mcp-panel-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 20px 24px 0;
+  padding: 10px 12px;
+  width: calc(100% - 48px);
+  background: var(--bg-weak);
+  border: 1px solid var(--border-weak);
+  border-radius: 8px;
+  color: var(--text-weak);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: left;
+  cursor: pointer;
+  transition: all 120ms ease;
+}
+
+.mcp-panel-card:hover {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+  color: var(--text-strong);
+}
+
+.mcp-dialog {
+  max-width: 640px;
+}
+
+.mcp-dialog-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px;
+  border-bottom: 1px solid var(--border-weak);
+}
+
+.mcp-dialog-title {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--text-strong);
+  font-size: 14px;
+}
+
+.mcp-dialog-subtitle {
+  margin-top: 6px;
+  color: var(--text-weak);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.mcp-dialog-subtitle code {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.mcp-agent-list {
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 8px 16px 16px;
+}
+
+.mcp-agent-row {
+  margin-top: 12px;
+}
+
+.mcp-agent-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-strong);
+  margin-bottom: 4px;
+}
+
+.mcp-agent-hint {
+  font-weight: 400;
+  color: var(--text-weak);
+}
+
+.mcp-command {
+  position: relative;
+  background: var(--bg-weak);
+  border: 1px solid var(--border-weak);
+  border-radius: 6px;
+}
+
+.mcp-command pre {
+  margin: 0;
+  padding: 8px 64px 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.mcp-copy-btn {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  right: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border-weak);
+  border-radius: 4px;
+  color: var(--text-weak);
+  cursor: pointer;
+}
+
+.mcp-copy-btn:hover {
+  color: var(--text-strong);
+  border-color: var(--border);
+}
+
+/* multi-line snippets keep the button pinned to the top corner */
+.mcp-command.multiline .mcp-copy-btn {
+  top: 6px;
+  transform: none;
+}
+
+/* ————————————————————————————————————————————————
+   Mascot theater — the Advisory Board audience
+   ———————————————————————————————————————————————— */
+.mascot-theater {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  margin: 1.5rem 0 3rem;
+}
+
+/* One arc, never wrapped: the seat width shrinks instead. `--seat` is a
+   percentage of this row, so the row needs a definite width to resolve it. */
+.mascot-theater-row {
+  display: flex;
+  flex-wrap: nowrap;
+  justify-content: center;
+  align-items: flex-start;
+  width: 100%;
+  column-gap: calc(var(--seat) * var(--seat-gap));
+}
+
+.mascot-seat {
+  display: inline-block;
+  flex: 0 0 var(--seat);
+  width: var(--seat);
+}
+
+.mascot-mark {
+  width: 100%;
+  height: auto;
+}
+
+/* ————————————————————————————————————————————————
+   Over-simplified — the one-sentence panel under a comparison title
+   ———————————————————————————————————————————————— */
+.oversimplified {
+  min-width: 0;
+  margin: 1.5rem 0 2rem;
+  padding: 12px 22px 16px;
+  border: 1px solid var(--warn);
+  border-radius: 10px;
+  background: var(--warn-bg);
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--text);
+}
+
+/* A figure inside the panel sits under the sentence without the page margins. */
+.oversimplified .bench-panel {
+  margin: 4px 0 0;
+}
+
+/* The legend sits across the top border and notches it. */
+.oversimplified-label {
+  margin-left: 6px;
+  padding: 0 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--warn);
+}
+
+/* ————————————————————————————————————————————————
+   Sponsor note — who pays for OpenAPPA
+   ———————————————————————————————————————————————— */
+.sponsor-note {
+  margin: 1.5rem 0 2rem;
+  padding: 18px 22px;
+  border: 1px solid var(--warn);
+  border-radius: 10px;
+  background: var(--warn-bg);
+}
+
+.sponsor-note-text {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--text);
+}
+
+.sponsor-note-text a {
+  color: var(--warn);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* ————————————————————————————————————————————————
+   Community note — integrations the community maintains
+   ———————————————————————————————————————————————— */
+.community-note {
+  margin: 1.5rem 0 2rem;
+  padding: 18px 22px;
+  border: 1px solid var(--accent-border);
+  border-left: 4px solid var(--accent);
+  border-radius: 10px;
+  background: var(--accent-bg);
+}
+
+.community-note-label {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.community-note-text {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--text);
+}
+
+.under-construction {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  padding: 3.5rem 0 2rem;
+  text-align: center;
+}
+
+.uc-stripes {
+  width: min(340px, 75%);
+  height: 8px;
+  border-radius: 2px;
+  background: repeating-linear-gradient(-45deg, var(--warn) 0 6px, transparent 6px 14px);
+  opacity: 0.45;
+}
+
+.uc-label {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: var(--warn);
+}
+
+.uc-text {
+  max-width: 30rem;
+  color: var(--text-weak);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.uc-text a {
+  color: var(--accent);
+}
+
+/* ————————————————————————————————————————————————
+   Error & Not Found pages — Appa sounding the alarm
+   ———————————————————————————————————————————————— */
+.error-page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(100vh - var(--header-h) - 120px);
+  padding: 4rem 1.5rem 5rem;
+  text-align: center;
+}
+
+.error-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  max-width: 32rem;
+  margin: 0 auto;
+}
+
+.error-mascot-wrap {
+  position: relative;
+  margin-bottom: 2rem;
+}
+
+.error-mascot-wrap img {
+  display: block;
+  width: 160px;
+  height: auto;
+  image-rendering: pixelated;
+  filter: drop-shadow(0 4px 20px rgba(253, 196, 6, 0.25));
+  animation: appa-yell-shake 4.5s ease-in-out infinite;
+}
+
+@keyframes appa-yell-shake {
+  0%, 86%, 100% {
+    transform: translateY(0) rotate(0deg);
+  }
+  88% {
+    transform: translateY(-2px) rotate(-1.5deg) scale(1.02);
+  }
+  90% {
+    transform: translateY(1px) rotate(1.5deg) scale(1.02);
+  }
+  92% {
+    transform: translateY(-2px) rotate(-1deg) scale(1.02);
+  }
+  94% {
+    transform: translateY(1px) rotate(1deg) scale(1.01);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .error-mascot-wrap img {
+    animation: none;
+  }
+}
+
+.error-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  margin-bottom: 1rem;
+  border-radius: 9999px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  background: var(--danger-bg);
+  color: var(--danger);
+  border: 1px solid var(--border-weak);
+}
+
+.error-title {
+  margin: 0 0 0.75rem;
+  font-size: clamp(1.75rem, 4vw, 2.25rem);
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--text-strong);
+  letter-spacing: -0.02em;
+}
+
+.error-desc {
+  margin: 0 0 2rem;
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--text-weak);
+  max-width: 28rem;
+}
+
+.error-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+
+.error-btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 18px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--text-inverted);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
+  transition: background 0.15s ease;
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+
+.error-btn-primary:hover {
+  background: var(--accent-hover);
+}
+
+.error-btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 18px;
+  border-radius: 8px;
+  background: var(--bg-weak);
+  color: var(--text-strong);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
+  border: 1px solid var(--border-weak);
+  transition: background 0.15s ease, border-color 0.15s ease;
+  cursor: pointer;
+}
+
+.error-btn-secondary:hover {
+  background: var(--bg-weak-hover);
+  border-color: var(--border);
+}
+
+.error-details {
+  margin-top: 2rem;
+  width: 100%;
+  max-width: 28rem;
+  text-align: left;
+}
+
+.error-details summary {
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-weak);
+}
+
+.error-details summary:hover {
+  color: var(--text-strong);
+}
+
+.error-details pre {
+  margin-top: 0.5rem;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--bg-weak);
+  border: 1px solid var(--border-weak);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-weak);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ————————————————————————————————————————————————
+   Policy stack figure — one policy, many enforcement points
+   ———————————————————————————————————————————————— */
+.policy-stack-figure {
+  position: relative;
+  margin: 1.5rem 0 2rem;
+}
+
+.policy-stack-figure svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+/* Runtime overview — hooks, decisions, and the MCP remedy call. */
+.runtime-overview-figure {
+  width: 100%;
+  margin: 1.5rem 0 2rem;
+}
+
+.runtime-overview-figure > svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  font-family: var(--font-mono);
+}
+
+.rof-panel {
+  fill: var(--bg-weak);
+  stroke: var(--accent-border);
+  stroke-width: 2;
+  shape-rendering: crispEdges;
+}
+
+.rof-title {
+  fill: var(--text-weak);
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.rof-block-label {
+  fill: var(--text-strong);
+  font-size: 23px;
+  font-weight: 600;
+}
+
+.rof-rail-label {
+  fill: var(--text);
+  font-size: 18px;
+}
+
+.rof-rail {
+  fill: none;
+  stroke: var(--icon);
+  stroke-width: 3;
+  shape-rendering: crispEdges;
+}
+
+.rof-rail-accent,
+.rof-spark {
+  stroke: var(--accent);
+}
+
+.rof-spark {
+  stroke-width: 4;
+  shape-rendering: crispEdges;
+}
+
+@media (max-width: 640px) {
+  .rof-title,
+  .rof-block-label,
+  .rof-rail-label {
+    font-size: 26px;
+  }
+}
+
+.psf-mascot {
+  position: absolute;
+  left: 24%;
+  top: 34%;
+  transform: translate(-50%, -100%);
+  line-height: 0;
+}
+
+/* ————————————————————————————————————————————————
+   Branding page — the marks and their exports
+   ———————————————————————————————————————————————— */
+.brand-assets {
+  margin: 1.5rem 0 2rem;
+}
+
+.brand-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+@media (max-width: 680px) {
+  .brand-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@keyframes appa-sparks-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.65;
+  }
+}
+
+.appa-alert-sparks {
+  animation: appa-sparks-pulse 1.8s ease-in-out infinite;
+}
+
+.appa-alert-shake {
+  animation: appa-yell-shake 4.5s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .appa-alert-sparks,
+  .appa-alert-shake {
+    animation: none;
+  }
+}
+
+.brand-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-bottom: 14px;
+}
+
+.brand-toolbar-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--icon);
+}
+
+.brand-toolbar-note {
+  flex: 1 1 14rem;
+  font-size: 12px;
+  color: var(--text-weak);
+}
+
+/* Two states of one control, so they share a border rather than each
+   carrying their own. */
+.brand-switch {
+  display: inline-flex;
+  border: 1px solid var(--border-weak);
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.brand-switch button {
+  cursor: pointer;
+  border: 0;
+  background: none;
+  padding: 4px 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-weak);
+}
+
+.brand-switch button + button {
+  border-left: 1px solid var(--border-weak);
+}
+
+.brand-switch button:hover {
+  color: var(--text-strong);
+}
+
+.brand-switch button.is-on {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.brand-panel {
+  margin: 0;
+  border: 1px solid var(--border-weak);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+/* The lockup is wider than it is tall by a long way, so it takes the row. */
+.brand-panel-wide {
+  grid-column: 1 / -1;
+}
+
+/* The stage is painted with the chosen theme's own background and overrides
+   the mark's tokens inline, so the preview is the export. */
+.brand-stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 9.5rem;
+  padding: 1.5rem;
+}
+
+.brand-panel-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border-weak);
+}
+
+.brand-panel-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-strong);
+}
+
+.brand-panel-note {
+  flex: 1 1 auto;
+  font-size: 12px;
+  color: var(--text-weak);
+}
+
+.brand-panel-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.brand-panel-actions button,
+.brand-panel-actions a {
+  cursor: pointer;
+  border: 0;
+  background: none;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-weak);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.brand-panel-actions button:hover:enabled,
+.brand-panel-actions a:hover {
+  color: var(--accent);
+}
+
+.brand-panel-actions button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.brand-prompt {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 14px;
+}
+
+.brand-prompt button {
+  cursor: pointer;
+  border: 1px solid var(--border-weak);
+  border-radius: 7px;
+  background: var(--bg-weak);
+  padding: 7px 14px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-strong);
+  transition:
+    color 0.15s,
+    background 0.15s,
+    border-color 0.15s;
+}
+
+.brand-prompt button:hover {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.brand-prompt-note {
+  flex: 1 1 12rem;
+  font-size: 12px;
+  color: var(--text-weak);
+}
+
+.brand-files {
+  margin-top: 1.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--border-weak);
+}
+
+/* An invitation rather than a category label, so it keeps the case it is
+   written in — the kicker's small caps and tracking would shout it. */
+.brand-files-label {
+  display: block;
+  margin-bottom: 10px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.brand-photo {
+  margin: 0 0 1rem;
+}
+
+.brand-photo img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 10px;
+  border: 1px solid var(--border-weak);
+}
+
+.brand-photo figcaption {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-weak);
+}
+
+.brand-photo figcaption a {
+  color: var(--accent);
+}
+
+.brand-viewer {
+  margin: 0 0 1.25rem;
+  border: 1px solid var(--border-weak);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--bg-weak);
+}
+
+.brand-viewer-stage {
+  position: relative;
+  height: min(58vh, 26rem);
+  /* The canvas is a drag surface, so the page must not pan under the pointer
+     on a touch screen while someone is turning the beast. */
+  touch-action: none;
+}
+
+.brand-viewer-stage canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+}
+
+.brand-viewer-stage canvas:active {
+  cursor: grabbing;
+}
+
+.brand-viewer-state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-weak);
+}
+
+.brand-viewer-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border-weak);
+  background: var(--bg);
+}
+
+.brand-viewer-switch {
+  display: inline-flex;
+  border: 1px solid var(--border-weak);
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.brand-viewer-switch button {
+  display: flex;
+  cursor: pointer;
+  align-items: baseline;
+  gap: 6px;
+  border: 0;
+  background: none;
+  padding: 5px 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-weak);
+}
+
+.brand-viewer-switch button + button {
+  border-left: 1px solid var(--border-weak);
+}
+
+.brand-viewer-switch button span {
+  font-size: 10px;
+  color: var(--icon);
+}
+
+.brand-viewer-switch button:hover {
+  color: var(--text-strong);
+}
+
+.brand-viewer-switch button.is-on {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.brand-viewer-switch button.is-on span {
+  color: var(--accent);
+}
+
+.brand-viewer-hint {
+  flex: 1 1 auto;
+  font-size: 12px;
+  color: var(--text-weak);
+}
+
+.brand-model + .brand-model {
+  margin-top: 1.25rem;
+}
+
+.brand-model-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 10px;
+  margin-bottom: 8px;
+}
+
+.brand-model-title {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--icon);
+}
+
+.brand-model-note {
+  font-size: 12px;
+  color: var(--text-weak);
+}
+
+/* Inside `.prose`, which hangs a dash off every list item. */
+.brand-files ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.prose .brand-files li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 10px;
+  margin: 0 0 4px;
+  padding-left: 0;
+}
+
+.prose .brand-files li::before {
+  content: none;
+}
+
+.brand-files a {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.brand-files li span {
+  font-size: 12px;
+  color: var(--text-weak);
+}
+
+
+/* ————————————————————————————————————————————————
+   Analytics consent notice
+   ———————————————————————————————————————————————— */
+
+/* A bar rather than a dialog: unanswered, it must still leave the docs
+   readable. It sits below the search overlay (50) so a search the reader
+   opened deliberately is never covered by a notice that arrived on a timer. */
+.cookie-notice {
+  position: fixed;
+  z-index: 45;
+  left: 50%;
+  bottom: 20px;
+  transform: translateX(-50%);
+  width: calc(100% - 32px);
+  max-width: 620px;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 14px 16px 14px 20px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.16);
+  animation: cookie-notice-in 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.cookie-notice.is-closing {
+  animation: cookie-notice-out 160ms ease both;
+}
+
+.cookie-notice-text {
+  flex: 1 1 auto;
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-weak);
+}
+
+.cookie-notice-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Declining is a plain control, not a styled button: the two answers carry the
+   same weight here, and dressing only one of them would be a thumb on the
+   scale of a question the reader is meant to answer freely. */
+.cookie-notice-skip {
+  padding: 8px 10px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text-weak);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 120ms ease;
+}
+
+.cookie-notice-skip:hover {
+  color: var(--text-strong);
+}
+
+.cookie-notice-accept {
+  padding: 8px 16px;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-inverted);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 120ms ease;
+}
+
+.cookie-notice-accept:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.cookie-notice-skip:focus-visible,
+.cookie-notice-accept:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@keyframes cookie-notice-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(12px);
+  }
+}
+
+@keyframes cookie-notice-out {
+  to {
+    opacity: 0;
+    transform: translateX(-50%) translateY(6px);
+  }
+}
+
+@media (max-width: 560px) {
+  .cookie-notice {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+    padding: 16px;
+  }
+
+  .cookie-notice-actions {
+    justify-content: flex-end;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cookie-notice,
+  .cookie-notice.is-closing {
+    animation: none;
+  }
+}
+
+/* Tailwind utility names for the shadcn tokens. Two remaps on purpose:
+   `--color-accent` reads the ui hover-surface token (the site's `--accent`
+   is the strong green and stays out of component hover backgrounds), and
+   `--color-border` reads `--border-weak` (the site's card-border weight). */
+@theme inline {
+  --font-heading: var(--font-plex-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-sans: var(--font-plex-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border-weak);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--ui-accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/* No `.dark` block: the shadcn tokens above derive from the site palette,
+   which already flips under prefers-color-scheme. */
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* ————————————————————————————————————————————————
+   Song ship — the music video, playing in the middle of the page while
+   the song does. The scene is two SVGs with the sail's slides, the video's
+   HTML styled as in the video, as a layer between them (SongShip.tsx says
+   why not a foreignObject).
+   ———————————————————————————————————————————————— */
+.song-ship {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  animation: song-ship-arrive 1.2s ease-out both;
+}
+
+/* The frame takes clicks so a click outside it can be told apart; the
+   rest of the overlay lets them through to the page. */
+.song-ship-frame {
+  position: relative;
+  pointer-events: auto;
+  width: min(80vw, 80vh);
+  aspect-ratio: 1;
+  filter: drop-shadow(0 24px 40px rgba(0, 0, 0, 0.35));
+}
+/* On a phone the scene takes the whole width; the night's pixel fade
+   reaches the screen edges. */
+@media (max-width: 768px) {
+  .song-ship-frame {
+    width: min(100vw, 80vh);
+  }
+}
+.song-ship-frame > svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.song-ship-lanterns rect:last-child {
+  filter: drop-shadow(0 0 18px rgba(242, 201, 76, 0.7));
+}
+
+/* mascots: the crew on deck and the small ones on the sail */
+.song-ship .mascot {
+  display: block;
+  overflow: visible;
+}
+.song-ship .mascot.cream .body { fill: #f2e5c9; }
+.song-ship .mascot.cream .dim { fill: #a89c88; }
+.song-ship .mascot.cream .eye { fill: #211f1c; }
+.song-ship .mascot.dark .body { fill: #211f1c; }
+.song-ship .mascot.dark .dim { fill: #8d8a86; }
+.song-ship .mascot.dark .eye { fill: #fdfcfa; }
+.song-ship .mascot .eyes rect {
+  transform-box: fill-box;
+  transform-origin: 50% 50%;
+}
+
+/* the sail is the screen: every lyric drawn as a small diagram */
+.song-sail {
+  --cream: #f2e5c9;
+  --s-ink: #211f1c;
+  --s-muted: #6a6255;
+  --s-line: #c9bc9f;
+  --s-green: #1f8a57;
+  --s-red: #c8372d;
+  --s-card: #fbf3df;
+  /* At the video's size; the per-frame transform puts it on the sail. */
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 0 0;
+  width: 660px;
+  height: 420px;
+  overflow: hidden;
+  background: var(--cream);
+  color: var(--s-ink);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: normal;
+  box-shadow: inset 0 -14px 0 rgba(33, 31, 28, 0.08), inset 14px 0 0 rgba(33, 31, 28, 0.04), inset -14px 0 0 rgba(33, 31, 28, 0.04);
+}
+.song-sail,
+.song-sail * {
+  box-sizing: content-box;
+}
+.song-sail .mono { font-family: var(--font-mono); }
+.song-sail .sl { position: absolute; inset: 0; display: none; }
+.song-sail .sl > *,
+.song-sail .abs { position: absolute; }
+.song-sail .sl svg.wire { left: 0; top: 0; width: 660px; height: 420px; overflow: visible; }
+.song-sail .wire line,
+.song-sail .wire path { stroke: var(--s-ink); stroke-width: 4; fill: none; stroke-dasharray: 1; }
+.song-sail .nd {
+  border: 3px solid var(--s-ink);
+  background: var(--s-card);
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  display: grid;
+  place-items: center;
+  text-align: center;
+  line-height: 1.05;
+}
+.song-sail .nd small {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--s-muted);
+  margin-top: 6px;
+}
+.song-sail .chip {
+  font-family: var(--font-mono);
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 8px 14px;
+  border: 3px solid var(--s-ink);
+  background: var(--s-card);
+  white-space: nowrap;
+  line-height: 1.2;
+}
+.song-sail .chip.r { color: #fff; background: var(--s-red); border-color: var(--s-red); }
+.song-sail .chip.g { color: #fff; background: var(--s-green); border-color: var(--s-green); }
+.song-sail .chip.k { color: var(--cream); background: var(--s-ink); }
+.song-sail .lab {
+  font-family: var(--font-mono);
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--s-muted);
+  white-space: nowrap;
+}
+.song-sail .big { font-weight: 700; letter-spacing: -0.03em; line-height: 1; white-space: nowrap; }
+.song-sail .q { font-size: 64px; font-weight: 700; color: var(--s-red); line-height: 1; }
+.song-sail .row4 {
+  left: 40px;
+  width: 420px;
+  height: 58px;
+  border: 3px solid var(--s-ink);
+  background: var(--s-card);
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 16px;
+  font-size: 25px;
+  font-weight: 600;
+}
+.song-sail .row4 b {
+  font-family: var(--font-mono);
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  background: var(--s-ink);
+  color: var(--cream);
+  font-size: 17px;
+}
+.song-sail .logl { left: 0; font-family: var(--font-mono); font-size: 19px; font-weight: 500; white-space: nowrap; }
+.song-sail .logl i { color: var(--s-muted); font-style: normal; }
+
+/* The scene itself fades in over the intro and out over the last bars
+   (the SVG's opacity, set per frame from the song). Stopping the song early
+   sinks the whole frame away instead. */
+.song-ship.is-leaving {
+  animation: song-ship-leave 0.9s ease-in both;
+}
+
+/* The ship rises from below the fold and settles into its swell. */
+@keyframes song-ship-arrive {
+  from {
+    opacity: 0;
+    transform: translateY(40vh);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes song-ship-leave {
+  from {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(40vh);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .song-ship,
+  .song-ship.is-leaving {
+    animation: none;
+  }
+}
+
+/* The mute button on the video, only for a start from the `/nfc` link
+   (SongShip). It sits on the sea in the scene's bottom-right corner and
+   fades in and out with the video. While the song is muted it pulses, a
+   mint ring growing out of it, so the way to the sound is found without a
+   label. */
+.song-mute {
+  position: absolute;
+  bottom: 8%;
+  right: 8%;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: 2px solid #f2e5c9;
+  background: #0d1a2b;
+  color: #f2e5c9;
+  cursor: pointer;
+  opacity: 0.75;
+  transition: opacity 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.song-mute:hover,
+.song-mute:focus-visible {
+  opacity: 1;
+  border-color: #7fd8a8;
+  color: #7fd8a8;
+}
+.song-mute:focus-visible {
+  outline: 2px solid #f2c94c;
+  outline-offset: 2px;
+}
+.song-mute[data-muted] {
+  opacity: 1;
+  border-color: #7fd8a8;
+  color: #7fd8a8;
+  animation: song-mute-pulse 1.4s ease-out infinite;
+}
+@keyframes song-mute-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgb(127 216 168 / 0.85);
+    transform: scale(1);
+  }
+  15% {
+    transform: scale(1.12);
+  }
+  30% {
+    transform: scale(1);
+  }
+  100% {
+    box-shadow: 0 0 0 16px rgb(127 216 168 / 0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .song-mute[data-muted] {
+    animation: none;
+  }
+}

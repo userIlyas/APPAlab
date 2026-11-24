@@ -1,0 +1,274 @@
+# The policy `appa plugin install claude-code` writes for a Claude Code session.
+#
+# It includes the Claude Code battery, which carries the rules for Claude
+# Code's built-in tools and their Annotators. A named tool without a `delta`
+# restricts nothing: the result's label is the combination of its sources,
+# unchanged.
+#
+# Two questions decide each tool's rule. As a source: can someone other than
+# this user write the text it returns? Then it carries
+# `delta = { trust = "suspicious" }`. As a sink: who can end up reading its
+# arguments? Its `requires` names that reader. A reader the session cannot see
+# is `public`.
+#
+# Who may see a value is the built-in audience chain `self` ⊆ `internal` ⊆
+# `public`: `self` is the person running this session, `internal` their
+# organization, `public` the unrestricted state every session starts in. The
+# chain works without a directory: `self` and `internal` are symbolic, and only
+# a rule naming an individual recipient needs a source to check them (see the
+# end of this file).
+#
+# Rules match in order and the first match wins, and the root's rules precede
+# an included battery's: a root rule for a tool the battery names overrides it.
+# A tool neither this policy nor a battery names gets a per-call contract from
+# the `*` Annotator at the end.
+#
+# `clappa` gives each Claude Code session a messaging address. A
+# `SendMessage` to another protected session's address carries this
+# session's label; a send by name leaves for whoever holds the name.
+
+[policy]
+version = 2
+
+# Subagents and peer messages rely on this runtime: the deployment controls a
+# subagent's context (`[policy.deployment]` below), and the runtime checks
+# each peer address. These rules precede the battery's.
+
+# Starting a subagent is this harness's spawn: the deployment controls the
+# child's context, so the subagent runs as a child trajectory. The spawn is
+# held until the session declares what the subagent's final message may
+# carry — as it is, floored at a label, or through a registered sanitizer such
+# as `attest-schema` below — and that message is checked when the subagent
+# stops: one that may not cross keeps the subagent running, with the reason or
+# the exact text to return, until it stops with one that may.
+[[policy.tool]]
+name = "host/claude-code/Agent"
+delta = {}
+
+# A workflow is a fan-out spawn: its script starts any number of subagents
+# under the one return declaration made at the `Workflow` call, which offers
+# every route above except `attest-schema`. Each subagent's return is checked
+# on its own, whether it arrives in its `StructuredOutput` call or at its stop.
+[[policy.tool]]
+name = "host/claude-code/Workflow"
+delta = {}
+
+# `Task` is the earlier name of `Agent`: the same spawn, the same contract.
+[[policy.tool]]
+name = "host/claude-code/Task"
+delta = {}
+
+# A socket address reaches only a live protected session under this policy:
+# the runtime refuses any other, and the message arrives carrying this
+# session's label. A send by name falls through to the battery's internal sink.
+[[policy.tool]]
+name = "host/claude-code/SendMessage(to:uds:*)"
+delta = {}
+
+[[policy.tool]]
+name = "host/claude-code/SendMessage(to:pipe:*)"
+delta = {}
+
+# A peer message the runtime held. Its content carries the label the runtime
+# holds it at, which this result takes on.
+[[policy.tool]]
+name = "mcp/appa/read_peer_message"
+delta = {}
+
+# Reporting to the OpenAPPA team that APPA is in the way. Served by the runtime
+# itself, and gated by the same algebra as any other sink that leaves this
+# machine: the report carries this session's APPA decisions, so a session
+# narrowed by a battery's reads reaches a human review instead of sending. The
+# report never carries a prompt, a tool argument or a tool output — what it may
+# carry is decided by the runtime, not by this rule. Turn the tool off entirely
+# with `[reporting] agent_yell = false` at the end of this file; a deployment
+# that leaves it on and wants a person in the loop can add
+# `requires = { attention = ["human-approval"] }` here instead.
+[[policy.tool]]
+name = "mcp/appa/yell"
+requires = { audience = { contains = ["public"] } }
+delta = {}
+
+# A compatibility net covers tools installed after this policy. Exact
+# declarations always win over the wildcard, including declarations supplied by
+# connector batteries. The mandate is deliberately closed to this deployment's
+# two trust ranks, the `human-approval` mark, and no effects. `audiences` is
+# left omitted, so an annotation may narrow a result to `self` or `internal`,
+# or require a reader this policy names, exactly as a static rule above would.
+[[policy.annotator]]
+name = "claude-code.undeclared-tool"
+builtin = "claude-code"
+ranks = ["suspicious", "trusted"]
+marks = ["human-approval"]
+effects = []
+
+[[policy.tool]]
+name = "*"
+annotator = "claude-code.undeclared-tool"
+
+# The reserved builtin sanitizer of a structured subagent return. The
+# session declares a JSON schema of bounded fields when it starts the
+# subagent; a final message that matches it crosses at the session's own
+# trust instead of the rank the subagent's reads left it at. It runs in
+# the runtime itself and needs no externals entry.
+[[policy.sanitizer]]
+name = "attest-schema"
+on = ["tool_output"]
+
+[policy.sanitizer.permits]
+trust = { from = "suspicious", to = "trusted" }
+
+# The deployment controls what a subagent starts from: the harness gives
+# every subagent exactly the prompt the parent's spawn call carried, and
+# nothing else of the parent's context. That is what lets the runtime
+# check the subagent's return as a branch of the parent.
+[policy.deployment]
+context_control = true
+# WebFetch's result is withheld until `coding.strip-instructions`, bound
+# below, has run on it, when the agent chooses that sanitizer.
+confined_results = ["host/claude-code/WebFetch"]
+
+# Batteries and Annotators can require fresh attention, trusted data, or a
+# wider audience before a tool runs. This authority shows the person running
+# the Claude Code session the exact call and can approve those gaps for that
+# call: any attention mark a battery declares (`*` — every mark but the
+# reserved `blocked`), data below `trusted`, and an audience up to `public`.
+# Approval does not change the trajectory's label or authorize later calls.
+[[policy.authority]]
+name = "hitl"
+hint = "Ask the person running this session to review the exact call, the data it carries, and any required audience expansion."
+
+[policy.authority.permits]
+trust_below = "trusted"
+audience_missing = ["public"]
+attention = ["*"]
+
+# A call bound for `public` readers after this session read `self` or
+# `internal` data can go out rewritten instead of approved: this sanitizer
+# asks a model to remove from the call's arguments everything the public may
+# not read. The rewritten call is checked again before it runs, and the
+# consult record keeps both the original and the rewrite. Registering it is a
+# trust decision: APPA does not verify what the model removed. Remove this
+# entry to leave such calls to `hitl`.
+[[policy.sanitizer]]
+name = "redact-for-public"
+on = ["tool_input"]
+hint = "These arguments leave for readers outside this organization. Remove every piece of information not intended for the public: credentials and secrets, personal data, and the organization's internal details such as private code, unreleased plans, customer records and internal discussions. Keep everything else, so the call still does its job."
+
+[policy.sanitizer.permits]
+audience = { from = ["self"], to = ["public"] }
+
+[externals]
+timeout_ms = 5000
+review_timeout_ms = 600000
+max_body_bytes = 65536
+
+[externals.authorities.hitl]
+builtin = "hitl"
+
+[externals.sanitizers.redact-for-public]
+builtin = "claude-code"
+
+# The file-tracker battery routes Read, Write, Edit, Bash and SafeBash through
+# the file-tracker, which the `appa` executable serves. While the deployment
+# includes it, `clappa` confines each Bash call in Claude Code's own sandbox,
+# or, where the preload's self-test fails, disables Bash and registers
+# SafeBash, which runs in Anthropic's sandbox runtime, `srt`. It disables
+# PowerShell, Monitor, Grep and NotebookEdit either way. To turn file tracking
+# off, run `appa battery remove file-tracker`: these bindings then stay idle,
+# and the `coding` battery's rules decide those tools.
+[externals.annotators.file-tracker]
+command = ["appa", "file-tracker", "annotate"]
+
+[externals.recorders.file-tracker]
+command = ["appa", "file-tracker", "record"]
+
+# The model for each battery sanitizer is configured here, not in the battery.
+# A Claude Code session has the `claude` CLI, so this policy binds every
+# battery sanitizer to it, and each one is offered by default. A binding for a
+# battery this deployment does not include stays idle, and it activates when
+# `appa battery install` adds that battery. To turn one sanitizer off, delete
+# its binding: the battery then decides as it would without it.
+[externals.sanitizers."coding.strip-instructions"]
+builtin = "claude-code"
+
+[externals.sanitizers."coding.strip-secrets"]
+builtin = "claude-code"
+
+[externals.sanitizers."cloudflare.strip-instructions"]
+builtin = "claude-code"
+
+[externals.sanitizers."cloudflare.redact-for-public"]
+builtin = "claude-code"
+
+[externals.sanitizers."databricks.strip-instructions"]
+builtin = "claude-code"
+
+[externals.sanitizers."github.strip-instructions"]
+builtin = "claude-code"
+
+[externals.sanitizers."google-workspace.strip-instructions"]
+builtin = "claude-code"
+
+[externals.sanitizers."grain.strip-instructions"]
+builtin = "claude-code"
+
+[externals.sanitizers."huggingface.strip-instructions"]
+builtin = "claude-code"
+
+[externals.sanitizers."launchdarkly.strip-instructions"]
+builtin = "claude-code"
+
+[externals.sanitizers."linear.strip-instructions"]
+builtin = "claude-code"
+
+[externals.sanitizers."linear.redact-for-public"]
+builtin = "claude-code"
+
+[externals.sanitizers."microsoft-learn.strip-instructions"]
+builtin = "claude-code"
+
+[externals.sanitizers."monday.strip-instructions"]
+builtin = "claude-code"
+
+[externals.sanitizers."monday.strip-secrets"]
+builtin = "claude-code"
+
+[externals.sanitizers."notion.strip-instructions"]
+builtin = "claude-code"
+
+[externals.sanitizers."pagerduty.strip-instructions"]
+builtin = "claude-code"
+
+[externals.sanitizers."pagerduty.redact-for-public"]
+builtin = "claude-code"
+
+[externals.sanitizers."posthog.strip-instructions"]
+builtin = "claude-code"
+
+[externals.sanitizers."sentry.strip-instructions"]
+builtin = "claude-code"
+
+[externals.sanitizers."sentry.redact-for-public"]
+builtin = "claude-code"
+
+[externals.sanitizers."slack.strip-instructions"]
+builtin = "claude-code"
+
+# Who `self` and `internal` are, read from a directory when a decision needs
+# actual membership: a rule naming an individual recipient
+# (`requires = { audience = { contains = ["$to"] } }`) checked against a
+# narrowed session. Without a source the chain still decides symbolically and
+# such a call is refused as unanswerable. To add one, install the GitHub
+# battery — it binds the `github` source and declares its selectors — and put
+# the mapping under `[policy]` here:
+#
+#   [policy.audience]
+#   self = ["github:viewer"]
+#   internal = ["github:org/<your-org>/members"]
+
+# Whether the agent may report on its own through the `yell` tool. Off leaves it
+# unadvertised and unroutable; a person can always report with `appa yell`.
+# A first `appa plugin install claude-code` asks, and writes the answer here.
+[reporting]
+agent_yell = false

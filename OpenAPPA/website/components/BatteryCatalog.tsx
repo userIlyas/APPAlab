@@ -1,0 +1,157 @@
+import Link from "next/link";
+
+const BATTERIES = [
+  {
+    name: "Slack",
+    description: "Rules for 19 Slack tools, with audiences from Slack channels, users, and groups; Slack Connect conversations are untrusted.",
+    href: "/battery-slack",
+    logo: "/images/batteries/slack.svg",
+  },
+  {
+    name: "Claude Code tools",
+    description: "Rules for Read, Grep, Write, Edit and Bash, with model annotators for Bash and a secret-masking sanitizer.",
+    href: "/battery-claude-code",
+    logo: "/images/batteries/claude.svg",
+  },
+  {
+    name: "GitHub",
+    description: "Rules for 44 repository, issue, pull request, and user tools; each repository's visibility decides its readers.",
+    href: "/battery-github",
+    logo: "/images/batteries/github.svg",
+  },
+  {
+    name: "Linear",
+    description: "Rules for 65 tools with per-issue, per-team, and per-project audiences, and reviewed writes.",
+    href: "/battery-linear",
+    logo: "/images/batteries/linear.svg",
+  },
+  {
+    name: "Grain",
+    description: "Rules for 49 meeting, transcript, deal, and admin tools.",
+    href: "/battery-grain",
+    logo: "/images/batteries/grain.svg",
+  },
+  {
+    name: "Google Workspace",
+    description: "Rules for 11 Google Drive tools and reviewed sharing, with audiences from your Workspace directory and groups.",
+    href: "/battery-google-workspace",
+    logo: "/images/batteries/google-workspace.svg",
+  },
+  {
+    name: "Archestra",
+    description: "Rules for every built-in tool: internal reads, trusted control-plane writes, and shares checked against their teams and members.",
+    href: "/battery-archestra",
+    logo: "/images/batteries/archestra.svg",
+  },
+  {
+    name: "Sentry",
+    description: "Rules for 9 listed and 55 catalog tools, internal reads, and reviewed writes.",
+    href: "/battery-sentry",
+    logo: "/images/batteries/sentry.svg",
+  },
+  {
+    name: "monday.com",
+    description: "Rules for 99 tools: internal reads, reviewed writes, and structural, workflow and agent changes.",
+    href: "/battery-monday",
+    logo: "/images/batteries/monday.svg",
+  },
+  {
+    name: "Notion",
+    description: "Rules for 36 tools; reads are internal because Notion exposes no page permissions.",
+    href: "/battery-notion",
+    logo: "/images/batteries/notion.svg",
+  },
+  {
+    name: "Microsoft Learn",
+    description: "Public documentation search and page fetches with untrusted result labeling.",
+    href: "/battery-microsoft-learn",
+    logo: "/images/batteries/microsoft-learn.svg",
+  },
+  {
+    name: "Cloudflare",
+    description: "Read-only rules for the documentation and Workers Observability servers: public docs, internal logs and Workers.",
+    href: "/battery-cloudflare",
+    logo: "/images/batteries/cloudflare.svg",
+  },
+  {
+    name: "LaunchDarkly",
+    description: "Rules for 20 flag, environment, AI Config, and audit tools; every write is reviewed.",
+    href: "/battery-launchdarkly",
+    logo: "/images/batteries/launchdarkly.svg",
+  },
+  {
+    name: "PostHog",
+    description: "Rules for 44 analytics, flag, experiment, and survey tools; internal reads and reviewed writes.",
+    href: "/battery-posthog",
+    logo: "/images/batteries/posthog.svg",
+  },
+  {
+    name: "PagerDuty",
+    description: "Rules for 18 incident, schedule, team, and status page tools; internal reads and every write reviewed.",
+    href: "/battery-pagerduty",
+    logo: "/images/batteries/pagerduty.svg",
+  },
+  {
+    name: "Hugging Face",
+    description: "Rules for 11 account, search, repository, Space, job, and sandbox tools; each repository's Hub visibility decides its readers.",
+    href: "/battery-huggingface",
+    logo: "/images/batteries/huggingface.svg",
+  },
+  {
+    name: "Databricks",
+    description: "Rules for the Genie One and Databricks SQL managed servers; internal reads, every SQL statement classified before it runs.",
+    href: "/battery-databricks",
+    logo: "/images/batteries/databricks.svg",
+  },
+  {
+    name: "xmemory",
+    description: "Rules for 32 instance and admin tools; internal reads, writes from trusted input only, reviewed schema migrations and deletions.",
+    href: "/battery-xmemory",
+    logo: "/images/batteries/xmemory.svg",
+  },
+  {
+    name: "Add your own",
+    href: "/write-a-battery",
+    add: true,
+  },
+] as const;
+
+export function BatteryCatalog() {
+  return (
+    <section className="battery-catalog" aria-label="Available OpenAPPA batteries">
+      <div className="battery-catalog-grid">
+        {BATTERIES.map((battery) => (
+          <Link
+            className={`battery-card${"add" in battery ? " battery-card-add" : ""}`}
+            href={battery.href}
+            key={battery.name}
+          >
+            {"add" in battery ? (
+              <>
+                <span className="battery-card-plus" aria-hidden="true">+</span>
+                <strong className="battery-card-name">{battery.name}</strong>
+              </>
+            ) : (
+              <>
+                <span className="battery-card-heading">
+                  <span className="battery-card-title">
+                    <img
+                      alt=""
+                      className={`battery-card-logo${battery.name === "GitHub" ? " battery-card-logo-github" : ""}`}
+                      height="22"
+                      src={battery.logo}
+                      width="22"
+                    />
+                    <strong className="battery-card-name">{battery.name}</strong>
+                  </span>
+                  <span className="battery-card-arrow" aria-hidden="true">→</span>
+                </span>
+                <span className="battery-card-description">{battery.description}</span>
+              </>
+            )}
+          </Link>
+        ))}
+      </div>
+    </section>
+  );
+}

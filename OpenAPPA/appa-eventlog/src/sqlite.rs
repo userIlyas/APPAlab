@@ -1,0 +1,2166 @@
+//! SQLite storage: the standalone daemon's database file, and the private `:memory:` database
+//! of [`Backend::Memory`](crate::Backend::Memory). This module owns the schema, its version
+//! stamp, and every statement either runs.
+
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use std::time::SystemTime;
+
+use appa_engine::profile::{PolicyFileKey, PolicyRevision};
+use appa_engine::value::TrajectoryId;
+use appa_runtime_api::PeerDigest;
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde_json::Value;
+
+#[cfg(feature = "fault-injection")]
+use crate::HostObservation;
+use crate::embedded::{
+    DirectTake, EmbeddedClaim, EmbeddedError, EmbeddedRow, EmbeddedStatus, NewEmbedded, ReadClaim, ReadTake,
+    StoredEmbedded, TICKET_BOUND, TICKET_OPENING, classify_read, next_read_ticket, read_ticket, same_payload,
+};
+#[cfg(feature = "fault-injection")]
+use crate::encoding::encode;
+use crate::encoding::{contiguous_from, decoded, extend, opening_key};
+use crate::held::{HeldError, HeldNotice, HeldPeerId, HeldPeerMessage, NewHeld, StoredNotice, millis, quota_limit};
+use crate::receipts::{
+    Completion, LeaseOwner, OperationClaim, OperationKey, OperationRequest, ProcessedResultClaim, ProcessedResultKey,
+    ProcessedResultRequest, ReceiptError, ReceiptLease, Renewal, SessionScope, StoredJson, StoredLease,
+    StoredOperation, StoredOperationInput, StoredResult, resolve_operation_claim, resolve_operation_completion,
+    resolve_result_claim, resolve_result_completion,
+};
+use crate::{
+    AppendError, Batch, CreateError, DeploymentName, Fence, Log, LogLineage, OpenError, PolicyHead, PublishError,
+    ReadError,
+};
+
+const SCHEMA_VERSION: i64 = 9;
+
+/// The oldest version a database upgrades from. A fresh database installs [`BASE_SCHEMA`] at
+/// this version and then runs every step of [`UPGRADES`], so the fresh and the upgraded paths
+/// are one path.
+pub(crate) const BASE_VERSION: i64 = 9;
+
+/// Step `n` moves a database from `BASE_VERSION + n` to the next version. A change that cannot
+/// carry the stored data forward raises `BASE_VERSION` instead of adding a step.
+const UPGRADES: [&str; (SCHEMA_VERSION - BASE_VERSION) as usize] = [];
+
+/// Lease expiries and completion times are unix milliseconds. The index on `policy_revisions`
+/// serves `published_as`: the first revision a deployment published a key as.
+const BASE_SCHEMA: &str = "CREATE TABLE logs (
+                         root  TEXT NOT NULL,
+                         seq   INTEGER NOT NULL,
+                         facts BLOB NOT NULL,
+                         PRIMARY KEY (root, seq)
+                     );
+                     CREATE TABLE policy_files (
+                         key   TEXT PRIMARY KEY,
+                         bytes BLOB NOT NULL
+                     );
+                     CREATE TABLE host_keys (
+                         key  TEXT NOT NULL,
+                         root TEXT NOT NULL,
+                         PRIMARY KEY (key, root)
+                     );
+                     CREATE TABLE operations (
+                         organization_id TEXT NOT NULL,
+                         caller_id TEXT,
+                         session_id TEXT NOT NULL,
+                         operation_id TEXT NOT NULL,
+                         root TEXT NOT NULL,
+                         input TEXT NOT NULL,
+                         status TEXT NOT NULL,
+                         decision TEXT,
+                         lease_owner TEXT,
+                         lease_expires_at INTEGER,
+                         PRIMARY KEY (organization_id, session_id, operation_id)
+                     );
+                     CREATE TABLE processed_results (
+                         organization_id TEXT NOT NULL,
+                         caller_id TEXT,
+                         session_id TEXT NOT NULL,
+                         tool_call_id TEXT NOT NULL,
+                         root TEXT NOT NULL,
+                         status TEXT NOT NULL,
+                         approved_output TEXT,
+                         decision TEXT,
+                         lease_owner TEXT,
+                         lease_expires_at INTEGER,
+                         completed_at INTEGER,
+                         PRIMARY KEY (organization_id, session_id, tool_call_id)
+                     );
+                     CREATE TABLE held_peer_messages (
+                         seq INTEGER PRIMARY KEY,
+                         id TEXT NOT NULL UNIQUE,
+                         receiver TEXT NOT NULL,
+                         digest TEXT NOT NULL,
+                         label TEXT NOT NULL,
+                         body TEXT NOT NULL,
+                         expires_at INTEGER NOT NULL,
+                         notified INTEGER NOT NULL
+                     );
+                     CREATE INDEX held_peer_messages_receiver ON held_peer_messages (receiver, seq);
+                     CREATE TABLE archived_roots (
+                         root TEXT PRIMARY KEY
+                     );
+                     CREATE TABLE deployments (
+                         name TEXT PRIMARY KEY,
+                         head INTEGER NOT NULL CHECK (head > 0)
+                     );
+                     CREATE TABLE policy_revisions (
+                         deployment TEXT NOT NULL,
+                         revision   INTEGER NOT NULL CHECK (revision > 0),
+                         key        TEXT NOT NULL,
+                         PRIMARY KEY (deployment, revision)
+                     );
+                     CREATE INDEX policy_revisions_key ON policy_revisions (deployment, key, revision);";
+
+const EMBEDDED_SCHEMA: &str = "CREATE TABLE embedded_peer_messages (
+         seq INTEGER PRIMARY KEY,
+         id TEXT NOT NULL UNIQUE,
+         root TEXT NOT NULL,
+         sender TEXT NOT NULL,
+         recipient TEXT NOT NULL,
+         pending_spawn TEXT,
+         dispatch TEXT NOT NULL,
+         digest TEXT NOT NULL,
+         label TEXT NOT NULL,
+         body TEXT,
+         status TEXT NOT NULL,
+         read_call_id TEXT,
+         read_arguments TEXT,
+         decision TEXT,
+         expires_at INTEGER NOT NULL,
+         created_at INTEGER NOT NULL,
+         UNIQUE (root, sender, dispatch)
+     );
+     CREATE INDEX embedded_peer_recipient ON embedded_peer_messages (root, recipient, status);
+     CREATE UNIQUE INDEX embedded_peer_read_call ON embedded_peer_messages (root, recipient, read_call_id)
+     WHERE read_call_id IS NOT NULL;";
+
+pub(crate) struct Sqlite {
+    connection: Mutex<Connection>,
+    logs: Mutex<LogCache>,
+}
+
+// Bound both the number of roots and their retained data. The weight includes encoded
+// bytes (for the decoded strings and containers) plus the inline decoded records.
+const CACHED_ROOTS: usize = 128;
+const CACHE_WEIGHT: usize = 32 * 1024 * 1024;
+
+#[derive(Default)]
+struct LogCache {
+    data_version: Option<i64>,
+    has_triggers: bool,
+    lineage: LogLineage,
+    entries: VecDeque<CachedLog>,
+    weight: usize,
+}
+
+struct CachedLog {
+    log: Log,
+    bytes: usize,
+    tail: Vec<u8>,
+}
+
+impl CachedLog {
+    fn weight(&self) -> usize {
+        self.bytes
+            + self.tail.len()
+            + self.log.policy_file().len()
+            + std::mem::size_of_val(self.log.facts())
+            + std::mem::size_of_val(self.log.host_records())
+            + self.log.basis() as usize * (size_of::<usize>() + size_of::<Option<PolicyRevision>>())
+    }
+}
+
+impl LogCache {
+    fn take(&mut self, root: &TrajectoryId) -> Option<CachedLog> {
+        let index = self.entries.iter().position(|entry| entry.log.root() == root)?;
+        let entry = self.entries.remove(index)?;
+        self.weight -= entry.weight();
+        Some(entry)
+    }
+
+    fn keep(&mut self, entry: CachedLog) {
+        let weight = entry.weight();
+        if weight > CACHE_WEIGHT {
+            return;
+        }
+        if self
+            .entries
+            .iter()
+            .any(|cached| cached.log.root() == entry.log.root() && cached.log.basis() >= entry.log.basis())
+        {
+            return;
+        }
+        self.take(entry.log.root());
+        while self.entries.len() >= CACHED_ROOTS || self.weight + weight > CACHE_WEIGHT {
+            let oldest = self.entries.pop_front().expect("a cache over its limit holds an entry");
+            self.weight -= oldest.weight();
+        }
+        self.weight += weight;
+        self.entries.push_back(entry);
+    }
+}
+
+impl Sqlite {
+    /// Open the file, refusing one that is damaged, then install or check the schema.
+    pub(crate) fn open(path: &Path) -> Result<Self, OpenError> {
+        let connection = Connection::open(path)?;
+        let path = path.display().to_string();
+        let probe = || -> Result<String, rusqlite::Error> {
+            connection.busy_timeout(std::time::Duration::from_secs(5))?;
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+            connection.pragma_update(None, "synchronous", "FULL")?;
+            connection.query_row("PRAGMA quick_check", [], |row| row.get(0))
+        };
+        let check = probe().map_err(|error| OpenError::Damaged {
+            path: path.clone(),
+            detail: error.to_string(),
+        })?;
+        if check != "ok" {
+            return Err(OpenError::Damaged { path, detail: check });
+        }
+        Self::install(connection, path)
+    }
+
+    pub(crate) fn memory() -> Result<Self, OpenError> {
+        Self::install(Connection::open_in_memory()?, ":memory:".to_string())
+    }
+
+    /// Open the file as [`Sqlite::open`] does, but replace a database too old to upgrade with a
+    /// fresh one. The old file stays beside it under an `.archived-<millis>` name, and every
+    /// root it held is recorded in the fresh one, so [`Sqlite::create`] refuses to reopen any of
+    /// them at the starting label.
+    pub(crate) fn open_archiving(path: &Path) -> Result<(Self, Option<PathBuf>), OpenError> {
+        match Self::open(path) {
+            Err(OpenError::Incompatible { .. }) => {}
+            opened => return opened.map(|store| (store, None)),
+        }
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        // Two processes archiving one file would each read roots from whatever sits at the
+        // path. The lock makes one finish first; the other then finds the replacement.
+        let lock_path = path.with_file_name(format!("{name}.upgrade-lock"));
+        let lock = std::fs::File::create(&lock_path).map_err(|error| moving(&lock_path, error))?;
+        lock.lock().map_err(|error| moving(&lock_path, error))?;
+        let refusal = match Self::open(path) {
+            Err(refusal @ OpenError::Incompatible { .. }) => refusal,
+            opened => return opened.map(|store| (store, None)),
+        };
+        // A file whose roots cannot be listed, or that another process still holds, is left
+        // for the operator rather than moved.
+        let Ok((held, roots)) = checkpointed_roots(path) else {
+            return Err(refusal);
+        };
+        let fresh = path.with_file_name(format!("{name}.upgrading"));
+        let archive = path.with_file_name(format!("{name}.archived-{}", millis(SystemTime::now())));
+        for stale in [fresh.clone()].iter().chain(&sidecars(&fresh)) {
+            remove_if_present(stale)?;
+        }
+        {
+            let store = Self::open(&fresh)?;
+            let mut connection = store.connection();
+            immediate(&mut connection, |transaction| {
+                let mut insert = transaction.prepare("INSERT INTO archived_roots (root) VALUES (?1)")?;
+                for root in &roots {
+                    insert.execute(params![root])?;
+                }
+                Ok::<_, rusqlite::Error>(())
+            })?;
+            // Leaving WAL mode folds the log into the main file, which the rename below moves
+            // alone.
+            connection.pragma_update(None, "journal_mode", "DELETE")?;
+        }
+        // The link keeps the old file whole under its archive name; the rename then replaces
+        // the configured path in one step. A crash between them leaves the old database in
+        // place, and the next open archives it again.
+        std::fs::hard_link(path, &archive).map_err(|error| moving(&archive, error))?;
+        for stale in &sidecars(path) {
+            remove_if_present(stale)?;
+        }
+        std::fs::rename(&fresh, path).map_err(|error| moving(path, error))?;
+        drop(held);
+        Ok((Self::open(path)?, Some(archive)))
+    }
+
+    /// Give a fresh database the schema and its version stamp, upgrade an older one, or check a
+    /// current one.
+    fn install(mut connection: Connection, path: String) -> Result<Self, OpenError> {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stamped: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        // Only an empty file is initialized. A database that holds tables
+        // but carries no stamp was written by something else — an earlier
+        // store, another tool — and creating this schema beside its data
+        // would leave its histories present and invisible.
+        let version = if stamped == 0 && is_empty(&transaction)? {
+            transaction.execute_batch(BASE_SCHEMA)?;
+            BASE_VERSION
+        } else {
+            stamped
+        };
+        if version > SCHEMA_VERSION {
+            return Err(OpenError::Newer {
+                path,
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        if version < BASE_VERSION {
+            return Err(OpenError::Incompatible {
+                path,
+                found: version,
+                oldest: BASE_VERSION,
+            });
+        }
+        for step in &UPGRADES[(version - BASE_VERSION) as usize..] {
+            transaction.execute_batch(step)?;
+        }
+        if stamped != SCHEMA_VERSION {
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
+        if !has_schema(&transaction)? {
+            return Err(OpenError::Damaged {
+                path,
+                detail: "stamped at this build's schema version, but its tables are missing".to_string(),
+            });
+        }
+        transaction.commit()?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+            logs: Mutex::default(),
+        })
+    }
+
+    pub(crate) fn connection(&self) -> MutexGuard<'_, Connection> {
+        self.connection
+            .lock()
+            .expect("the log store mutex is never poisoned: no panics under the lock")
+    }
+
+    fn logs(&self) -> MutexGuard<'_, LogCache> {
+        self.logs.lock().expect("the log cache mutex is never poisoned")
+    }
+
+    /// Tests using this connection may do in-place mutations just as a foreign writer can.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub(crate) fn testing_connection(&self) -> MutexGuard<'_, Connection> {
+        let connection = self.connection();
+        *self.logs() = LogCache::default();
+        connection
+    }
+
+    /// Store a root's opening batch and the policy file it opens under, in one transaction, fenced
+    /// at its deployment's head where it follows one. `before_commit` runs last inside it, and an
+    /// error from it rolls the opening back.
+    pub(crate) fn create(
+        &self,
+        root: &TrajectoryId,
+        key: &PolicyFileKey,
+        policy_file: &[u8],
+        batch: &Batch<'_>,
+        before_commit: impl FnOnce() -> Result<(), CreateError>,
+    ) -> Result<(), CreateError> {
+        immediate(&mut self.connection(), |transaction| {
+            let archived: Option<i64> = transaction
+                .query_row(
+                    "SELECT 1 FROM archived_roots WHERE root = ?1",
+                    params![root.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if archived.is_some() {
+                return Err(CreateError::Archived {
+                    root: root.as_str().to_string(),
+                });
+            }
+            if let Some(head) = moved(transaction, batch.fence.as_ref())? {
+                return Err(CreateError::PolicyMoved { head });
+            }
+            transaction.execute(
+                "INSERT INTO policy_files (key, bytes) VALUES (?1, ?2) ON CONFLICT (key) DO NOTHING",
+                params![key.as_str(), policy_file],
+            )?;
+            match insert_batch(transaction, root, 0, batch) {
+                Ok(()) => {}
+                Err(error) if is_taken(&error) => {
+                    return Err(CreateError::AlreadyExists {
+                        root: root.as_str().to_string(),
+                    });
+                }
+                Err(error) => return Err(CreateError::Storage(error)),
+            }
+            before_commit()
+        })
+    }
+
+    pub(crate) fn head(&self, deployment: &DeploymentName) -> Result<Option<PolicyHead>, ReadError> {
+        let connection = self.connection();
+        let Some(revision) = head_of(&connection, deployment)? else {
+            return Ok(None);
+        };
+        let key: String = connection.query_row(
+            "SELECT key FROM policy_revisions WHERE deployment = ?1 AND revision = ?2",
+            params![deployment.as_str(), revision.value() as i64],
+            |row| row.get(0),
+        )?;
+        Ok(Some(PolicyHead {
+            revision,
+            key: stored_key(key)?,
+        }))
+    }
+
+    /// Store `policy_file` and move `deployment`'s head from `expected` to `head`, in one
+    /// transaction that every append serializes against.
+    pub(crate) fn publish(
+        &self,
+        deployment: &DeploymentName,
+        expected: Option<PolicyRevision>,
+        head: &PolicyHead,
+        policy_file: &[u8],
+    ) -> Result<(), PublishError> {
+        immediate(&mut self.connection(), |transaction| {
+            publish_in(transaction, deployment, expected, head, policy_file)
+        })
+    }
+
+    /// The key `revision` of `deployment` names.
+    pub(crate) fn policy_key(
+        &self,
+        deployment: &DeploymentName,
+        revision: PolicyRevision,
+    ) -> Result<String, ReadError> {
+        revision_key(&self.connection(), deployment, revision)
+    }
+
+    pub(crate) fn published_as(
+        &self,
+        deployment: &DeploymentName,
+        key: &str,
+    ) -> Result<Option<PolicyRevision>, ReadError> {
+        let revision: Option<i64> = self.connection().query_row(
+            "SELECT MIN(revision) FROM policy_revisions WHERE deployment = ?1 AND key = ?2",
+            params![deployment.as_str(), key],
+            |row| row.get(0),
+        )?;
+        Ok(revision.map(stored_revision).transpose()?)
+    }
+
+    /// The key `revision` of `deployment` names, and the bytes stored under it.
+    pub(crate) fn policy_file(
+        &self,
+        deployment: &DeploymentName,
+        revision: PolicyRevision,
+    ) -> Result<(String, Vec<u8>), ReadError> {
+        let connection = self.connection();
+        let key = revision_key(&connection, deployment, revision)?;
+        let bytes = connection
+            .query_row("SELECT bytes FROM policy_files WHERE key = ?1", params![key], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        match bytes {
+            Some(bytes) => Ok((key, bytes)),
+            None => Err(ReadError::PolicyFileMissing { key }),
+        }
+    }
+
+    /// The connection an append runs on, held until the append is done.
+    pub(crate) fn appender(&self) -> Appender<'_> {
+        Appender(self.connection())
+    }
+
+    pub(crate) fn has_root(&self, root: &TrajectoryId) -> Result<bool, ReadError> {
+        let found: Option<i64> = self
+            .connection()
+            .query_row(
+                "SELECT 1 FROM logs WHERE root = ?1 LIMIT 1",
+                params![root.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    pub(crate) fn log(&self, root: &TrajectoryId) -> Result<Log, ReadError> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        // Read the version, tail and suffix in one SQLite snapshot. Our connection only
+        // appends to the log and inserts policy files. A commit by another connection
+        // could have rewritten any prefix or policy file, so discard all cached prefixes.
+        let version = transaction.pragma_query_value(None, "data_version", |row| row.get(0))?;
+        let mut cache = self.logs();
+        if cache.data_version != Some(version) {
+            // Triggers run on our own connection and can rewrite an accepted batch
+            // without changing data_version. Such databases always read and replay cold.
+            let has_triggers = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type = 'trigger')",
+                [],
+                |row| row.get(0),
+            )?;
+            *cache = LogCache {
+                data_version: Some(version),
+                has_triggers,
+                ..LogCache::default()
+            };
+        }
+
+        let mut prefix = cache.take(root);
+        let first = prefix.as_ref().map_or(0, |entry| entry.log.basis() - 1);
+        let mut batches = log_rows(&transaction, root, first)?;
+        if let Some(entry) = &prefix
+            && batches.first() != Some(&entry.tail)
+        {
+            prefix = None;
+            *cache = LogCache {
+                data_version: Some(version),
+                has_triggers: cache.has_triggers,
+                ..LogCache::default()
+            };
+            batches = log_rows(&transaction, root, 0)?;
+        }
+
+        if let Some(mut entry) = prefix {
+            transaction.commit()?;
+            let new = batches.split_off(1);
+            let decoded_batches = new.len();
+            if let Some(last) = new.last() {
+                entry.bytes += new.iter().map(Vec::len).sum::<usize>();
+                entry.tail.clone_from(last);
+                extend(&mut entry.log, new)?;
+            }
+            let log = entry.log.clone();
+            cache.keep(entry);
+            drop(cache);
+            drop(connection);
+            tracing::trace!(decoded_batches, cache_hit = true, "read SQLite log");
+            return Ok(log);
+        }
+
+        let key = opening_key(root, &batches)?;
+        let policy_file = transaction
+            .query_row(
+                "SELECT bytes FROM policy_files WHERE key = ?1",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| ReadError::PolicyFileMissing {
+                key: key.as_str().to_string(),
+            })?;
+        transaction.commit()?;
+        let lineage = (!cache.has_triggers).then(|| cache.lineage.clone());
+        drop(cache);
+        drop(connection);
+
+        // Cold reads can decode many megabytes. Other roots can use the database
+        // while this one decodes, and a racing reader may cache a newer snapshot.
+        let decoded_batches = batches.len();
+        let bytes = batches.iter().map(Vec::len).sum();
+        let tail = batches.last().expect("a log with an opening has a tail").clone();
+        let mut log = decoded(root, batches, policy_file)?;
+        log.lineage = Some(lineage.clone().unwrap_or_default());
+        if let Some(lineage) = lineage {
+            let mut cache = self.logs();
+            if cache.lineage == lineage {
+                cache.keep(CachedLog {
+                    log: log.clone(),
+                    bytes,
+                    tail,
+                });
+            }
+        }
+        tracing::trace!(decoded_batches, cache_hit = false, "read SQLite log");
+        Ok(log)
+    }
+
+    pub(crate) fn roots_mentioning(&self, key: &str) -> Result<Vec<TrajectoryId>, ReadError> {
+        let connection = self.connection();
+        let mut statement = connection.prepare("SELECT root FROM host_keys WHERE key = ?1 ORDER BY root ASC")?;
+        let roots = statement
+            .query_map(params![key], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(roots.into_iter().map(TrajectoryId::new).collect())
+    }
+
+    pub(crate) fn claim_operation(
+        &self,
+        request: &OperationRequest,
+        lease: &ReceiptLease,
+    ) -> Result<OperationClaim, ReceiptError> {
+        immediate(&mut self.connection(), |connection| {
+            let now = millis(SystemTime::now());
+            let expires_at = now.saturating_add(lease.ttl_millis());
+            let Some(stored) = read_operation(connection, &request.key, now)? else {
+                let input = serde_json::to_string(&StoredOperationInput::from_request(request))
+                    .map_err(|error| ReceiptError::storage(error.to_string()))?;
+                connection.execute(
+                    "INSERT INTO operations
+                         (organization_id, caller_id, session_id, operation_id, root, input, status, lease_owner, lease_expires_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,'pending',?7,?8)",
+                    params![
+                        request.key.session.organization_id,
+                        request.key.binding.caller_id(),
+                        request.key.session.session_id,
+                        request.key.operation_id,
+                        request.root.as_str(),
+                        input,
+                        lease.owner().as_str(),
+                        expires_at,
+                    ],
+                )?;
+                return Ok(OperationClaim::Claimed);
+            };
+            let claim = resolve_operation_claim(stored, request, lease.owner())?;
+            if claim.holds() {
+                connection.execute(
+                    "UPDATE operations SET lease_owner=?4, lease_expires_at=?5
+                     WHERE organization_id=?1 AND session_id=?2 AND operation_id=?3",
+                    params![
+                        request.key.session.organization_id,
+                        request.key.session.session_id,
+                        request.key.operation_id,
+                        lease.owner().as_str(),
+                        expires_at,
+                    ],
+                )?;
+            }
+            Ok(claim)
+        })
+    }
+
+    pub(crate) fn complete_operation(
+        &self,
+        key: &OperationKey,
+        decision: &Value,
+        owner: &LeaseOwner,
+    ) -> Result<(), ReceiptError> {
+        immediate(&mut self.connection(), |connection| {
+            let existing = read_operation(connection, key, millis(SystemTime::now()))?;
+            if let Completion::Write = resolve_operation_completion(existing, key, decision, owner)? {
+                let encoded =
+                    serde_json::to_string(decision).map_err(|error| ReceiptError::storage(error.to_string()))?;
+                connection.execute(
+                    "UPDATE operations SET status='complete', decision=?4
+                     WHERE organization_id=?1 AND session_id=?2 AND operation_id=?3",
+                    params![
+                        key.session.organization_id,
+                        key.session.session_id,
+                        key.operation_id,
+                        encoded
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn claim_processed_result(
+        &self,
+        request: &ProcessedResultRequest,
+        lease: &ReceiptLease,
+    ) -> Result<ProcessedResultClaim, ReceiptError> {
+        immediate(&mut self.connection(), |connection| {
+            let now = millis(SystemTime::now());
+            let expires_at = now.saturating_add(lease.ttl_millis());
+            let Some(stored) = read_result(connection, &request.key, now)? else {
+                connection.execute(
+                    "INSERT INTO processed_results
+                         (organization_id, caller_id, session_id, tool_call_id, root, status, lease_owner, lease_expires_at)
+                     VALUES (?1,?2,?3,?4,?5,'pending',?6,?7)",
+                    params![
+                        request.key.session.organization_id,
+                        request.key.caller_id,
+                        request.key.session.session_id,
+                        request.key.tool_call_id,
+                        request.root.as_str(),
+                        lease.owner().as_str(),
+                        expires_at,
+                    ],
+                )?;
+                return Ok(ProcessedResultClaim::Claimed);
+            };
+            let claim = resolve_result_claim(stored, request, lease.owner())?;
+            if claim.holds() {
+                connection.execute(
+                    "UPDATE processed_results SET lease_owner=?4, lease_expires_at=?5
+                     WHERE organization_id=?1 AND session_id=?2 AND tool_call_id=?3",
+                    params![
+                        request.key.session.organization_id,
+                        request.key.session.session_id,
+                        request.key.tool_call_id,
+                        lease.owner().as_str(),
+                        expires_at,
+                    ],
+                )?;
+            }
+            Ok(claim)
+        })
+    }
+
+    pub(crate) fn complete_processed_result(
+        &self,
+        key: &ProcessedResultKey,
+        approved_output: &str,
+        decision: &Value,
+        owner: &LeaseOwner,
+    ) -> Result<(), ReceiptError> {
+        immediate(&mut self.connection(), |connection| {
+            let now = millis(SystemTime::now());
+            let existing = read_result(connection, key, now)?;
+            if let Completion::Write = resolve_result_completion(existing, key, approved_output, decision, owner)? {
+                let encoded =
+                    serde_json::to_string(decision).map_err(|error| ReceiptError::storage(error.to_string()))?;
+                connection.execute(
+                    "UPDATE processed_results SET status='complete', approved_output=?4, decision=?5, completed_at=?6
+                     WHERE organization_id=?1 AND session_id=?2 AND tool_call_id=?3",
+                    params![
+                        key.session.organization_id,
+                        key.session.session_id,
+                        key.tool_call_id,
+                        approved_output,
+                        encoded,
+                        now,
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn renew_receipts(
+        &self,
+        lease: &ReceiptLease,
+        operations: &[OperationKey],
+        results: &[ProcessedResultKey],
+    ) -> Result<Renewal, ReceiptError> {
+        immediate(&mut self.connection(), |connection| {
+            let expires_at = millis(SystemTime::now()).saturating_add(lease.ttl_millis());
+            let mut renewal = Renewal::Kept;
+            for key in operations {
+                let (organization, session, id) =
+                    (&key.session.organization_id, &key.session.session_id, &key.operation_id);
+                let renewed = connection.execute(
+                    "UPDATE operations SET lease_expires_at=?5
+                     WHERE organization_id=?1 AND session_id=?2 AND operation_id=?3
+                       AND status='pending' AND lease_owner=?4",
+                    params![organization, session, id, lease.owner().as_str(), expires_at],
+                )?;
+                if renewed == 0 {
+                    let kept: Option<i64> = connection
+                        .query_row(
+                            "SELECT 1 FROM operations
+                             WHERE organization_id=?1 AND session_id=?2 AND operation_id=?3
+                               AND status='complete' AND lease_owner=?4",
+                            params![organization, session, id, lease.owner().as_str()],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if kept.is_none() {
+                        renewal = Renewal::Lost;
+                    }
+                }
+            }
+            for key in results {
+                let (organization, session, id) =
+                    (&key.session.organization_id, &key.session.session_id, &key.tool_call_id);
+                let renewed = connection.execute(
+                    "UPDATE processed_results SET lease_expires_at=?5
+                     WHERE organization_id=?1 AND session_id=?2 AND tool_call_id=?3
+                       AND status='pending' AND lease_owner=?4",
+                    params![organization, session, id, lease.owner().as_str(), expires_at],
+                )?;
+                if renewed == 0 {
+                    let kept: Option<i64> = connection
+                        .query_row(
+                            "SELECT 1 FROM processed_results
+                             WHERE organization_id=?1 AND session_id=?2 AND tool_call_id=?3
+                               AND status='complete' AND lease_owner=?4",
+                            params![organization, session, id, lease.owner().as_str()],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if kept.is_none() {
+                        renewal = Renewal::Lost;
+                    }
+                }
+            }
+            Ok(renewal)
+        })
+    }
+
+    pub(crate) fn release_receipts(
+        &self,
+        owner: &LeaseOwner,
+        operations: &[OperationKey],
+        results: &[ProcessedResultKey],
+    ) -> Result<(), ReceiptError> {
+        immediate(&mut self.connection(), |connection| {
+            let now = millis(SystemTime::now());
+            for key in operations {
+                connection.execute(
+                    "UPDATE operations SET lease_expires_at=?5
+                     WHERE organization_id=?1 AND session_id=?2 AND operation_id=?3
+                       AND status='pending' AND lease_owner=?4",
+                    params![
+                        key.session.organization_id,
+                        key.session.session_id,
+                        key.operation_id,
+                        owner.as_str(),
+                        now
+                    ],
+                )?;
+            }
+            for key in results {
+                connection.execute(
+                    "UPDATE processed_results SET lease_expires_at=?5
+                     WHERE organization_id=?1 AND session_id=?2 AND tool_call_id=?3
+                       AND status='pending' AND lease_owner=?4",
+                    params![
+                        key.session.organization_id,
+                        key.session.session_id,
+                        key.tool_call_id,
+                        owner.as_str(),
+                        now
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn has_pending_receipts(&self, root: &TrajectoryId) -> Result<bool, ReceiptError> {
+        let found: Option<i64> = self
+            .connection()
+            .query_row(
+                "SELECT 1 FROM operations WHERE root=?1 AND status='pending'
+                 UNION ALL
+                 SELECT 1 FROM processed_results WHERE root=?1 AND status='pending'
+                 LIMIT 1",
+                params![root.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    pub(crate) fn hold_peer_message(
+        &self,
+        receiver: &TrajectoryId,
+        digest: PeerDigest,
+        body: &str,
+        held: &NewHeld,
+        now: SystemTime,
+        quota: usize,
+    ) -> Result<(), HeldError> {
+        let label_json = held.label.to_string();
+        immediate(&mut self.connection(), |transaction| {
+            transaction.execute(
+                "INSERT INTO held_peer_messages (id, receiver, digest, label, body, expires_at, notified)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                params![
+                    held.id.as_str(),
+                    receiver.as_str(),
+                    digest.to_string(),
+                    label_json,
+                    body,
+                    held.expires_at
+                ],
+            )?;
+            // Every receiver's expired rows go, so a session that ended unread leaves none.
+            transaction.execute(
+                "DELETE FROM held_peer_messages WHERE expires_at <= ?1",
+                params![millis(now)],
+            )?;
+            transaction.execute(
+                "DELETE FROM held_peer_messages WHERE receiver = ?1 AND seq NOT IN (
+                     SELECT seq FROM held_peer_messages WHERE receiver = ?1 ORDER BY seq DESC LIMIT ?2
+                 )",
+                params![receiver.as_str(), quota_limit(quota)],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn peer_notices(&self, receiver: &TrajectoryId, now: SystemTime) -> Result<Vec<HeldNotice>, HeldError> {
+        // Asked on every acknowledged hook: a receiver with nothing new takes no write lock.
+        let pending: bool = self.connection().query_row(
+            "SELECT EXISTS (SELECT 1 FROM held_peer_messages
+             WHERE receiver = ?1 AND notified = 0 AND expires_at > ?2)",
+            params![receiver.as_str(), millis(now)],
+            |row| row.get(0),
+        )?;
+        if !pending {
+            return Ok(Vec::new());
+        }
+        immediate(&mut self.connection(), |transaction| {
+            let notices = {
+                let mut statement = transaction.prepare(
+                    "SELECT id, digest, label, expires_at FROM held_peer_messages
+                     WHERE receiver = ?1 AND notified = 0 AND expires_at > ?2 ORDER BY seq ASC",
+                )?;
+                statement
+                    .query_map(params![receiver.as_str(), millis(now)], held_row)?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            transaction.execute(
+                "UPDATE held_peer_messages SET notified = 1
+                 WHERE receiver = ?1 AND notified = 0 AND expires_at > ?2",
+                params![receiver.as_str(), millis(now)],
+            )?;
+            notices.into_iter().map(decode_held).collect()
+        })
+    }
+
+    pub(crate) fn peek_peer_message(
+        &self,
+        receiver: &TrajectoryId,
+        id: &HeldPeerId,
+        now: SystemTime,
+    ) -> Result<Option<HeldNotice>, HeldError> {
+        self.connection()
+            .query_row(
+                "SELECT id, digest, label, expires_at FROM held_peer_messages
+                 WHERE receiver = ?1 AND id = ?2 AND expires_at > ?3",
+                params![receiver.as_str(), id.as_str(), millis(now)],
+                held_row,
+            )
+            .optional()?
+            .map(decode_held)
+            .transpose()
+    }
+
+    pub(crate) fn take_peer_message(
+        &self,
+        receiver: &TrajectoryId,
+        id: &HeldPeerId,
+        now: SystemTime,
+    ) -> Result<Option<HeldPeerMessage>, HeldError> {
+        immediate(&mut self.connection(), |transaction| {
+            let found = transaction
+                .query_row(
+                    "SELECT id, digest, label, expires_at, body FROM held_peer_messages
+                     WHERE receiver = ?1 AND id = ?2",
+                    params![receiver.as_str(), id.as_str()],
+                    |row| Ok((held_row(row)?, row.get::<_, String>(4)?)),
+                )
+                .optional()?;
+            transaction.execute(
+                "DELETE FROM held_peer_messages WHERE receiver = ?1 AND id = ?2",
+                params![receiver.as_str(), id.as_str()],
+            )?;
+            match found {
+                Some((stored, body)) if stored.3 > millis(now) => Ok(Some(HeldPeerMessage {
+                    notice: decode_held(stored)?,
+                    body,
+                })),
+                Some(_) | None => Ok(None),
+            }
+        })
+    }
+
+    pub(crate) fn ensure_embedded_schema(&self) -> Result<(), EmbeddedError> {
+        install_embedded_schema(&self.connection())?;
+        Ok(())
+    }
+
+    pub(crate) fn claim_embedded_peer(&self, fresh: &NewEmbedded) -> Result<EmbeddedClaim, EmbeddedError> {
+        self.ensure_embedded_schema()?;
+        let label_json = fresh.label.to_string();
+        immediate(&mut self.connection(), |transaction| {
+            claim_embedded_sqlite(transaction, fresh, &label_json)
+        })
+    }
+
+    pub(crate) fn load_embedded_peer(&self, root: &str, id: &str) -> Result<Option<EmbeddedRow>, EmbeddedError> {
+        self.ensure_embedded_schema()?;
+        self.connection()
+            .query_row(
+                "SELECT id, sender, recipient, pending_spawn, dispatch, digest, label, body, status, read_call_id, decision, expires_at, read_arguments
+                 FROM embedded_peer_messages WHERE root = ?1 AND id = ?2",
+                params![root, id],
+                embedded_row,
+            )
+            .optional()?
+            .map(decode_embedded)
+            .transpose()
+    }
+
+    pub(crate) fn expire_embedded_inbox(&self, root: &str, now: i64) -> Result<(), EmbeddedError> {
+        self.ensure_embedded_schema()?;
+        self.connection().execute(
+            "UPDATE embedded_peer_messages SET body = NULL
+             WHERE root = ?1 AND status IN ('held', 'direct') AND expires_at <= ?2",
+            params![root, now],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn list_embedded_peer(
+        &self,
+        root: &str,
+        recipient: &str,
+        now: i64,
+    ) -> Result<Vec<EmbeddedRow>, EmbeddedError> {
+        self.ensure_embedded_schema()?;
+        let connection = self.connection();
+        connection.execute(
+            "UPDATE embedded_peer_messages SET body = NULL
+             WHERE root = ?1 AND recipient = ?2 AND status IN ('held', 'direct') AND expires_at <= ?3",
+            params![root, recipient, now],
+        )?;
+        let mut statement = connection.prepare(
+            "SELECT id, sender, recipient, pending_spawn, dispatch, digest, label, body, status, read_call_id, decision, expires_at, read_arguments
+             FROM embedded_peer_messages
+             WHERE root = ?1 AND recipient = ?2 AND status = 'held' AND body IS NOT NULL AND expires_at > ?3
+             ORDER BY seq ASC",
+        )?;
+        let rows = statement.query_map(params![root, recipient, now], embedded_row)?;
+        rows.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(decode_embedded)
+            .collect()
+    }
+
+    pub(crate) fn take_embedded_direct(
+        &self,
+        root: &str,
+        id: &str,
+        sender: &str,
+        recipient: &str,
+        digest: &str,
+    ) -> Result<DirectTake, EmbeddedError> {
+        self.ensure_embedded_schema()?;
+        immediate(&mut self.connection(), |transaction| {
+            let Some(row) = load_embedded_in(transaction, root, id)? else {
+                return Ok(DirectTake::Missing);
+            };
+            if row.sender != sender || row.recipient != recipient || row.digest != digest {
+                return Ok(DirectTake::Missing);
+            }
+            match row.status {
+                EmbeddedStatus::Direct => Ok(DirectTake::Already(row)),
+                EmbeddedStatus::Read => Ok(DirectTake::Busy),
+                EmbeddedStatus::Held => {
+                    transaction.execute(
+                        "UPDATE embedded_peer_messages SET status = 'direct'
+                         WHERE root = ?1 AND id = ?2 AND status = 'held'",
+                        params![root, id],
+                    )?;
+                    Ok(DirectTake::Taken(row))
+                }
+            }
+        })
+    }
+
+    pub(crate) fn claim_embedded_read(
+        &self,
+        root: &str,
+        id: &str,
+        recipient: &str,
+        call_id: &str,
+        arguments: &str,
+    ) -> Result<ReadTake, EmbeddedError> {
+        self.ensure_embedded_schema()?;
+        immediate(&mut self.connection(), |transaction| {
+            claim_read_sqlite(transaction, root, id, recipient, call_id, arguments)
+        })
+    }
+
+    pub(crate) fn finish_embedded_read(
+        &self,
+        root: &str,
+        id: &str,
+        call_id: &str,
+        generation: i64,
+        decision: &str,
+    ) -> Result<bool, EmbeddedError> {
+        self.ensure_embedded_schema()?;
+        let opening = read_ticket(TICKET_OPENING, generation);
+        let bound = read_ticket(TICKET_BOUND, generation);
+        let changed = immediate(&mut self.connection(), |transaction| {
+            transaction.execute(
+                "UPDATE embedded_peer_messages SET decision = ?4
+                 WHERE root = ?1 AND id = ?2 AND read_call_id = ?3 AND status = 'read'
+                   AND (decision = ?5 OR decision = ?6)",
+                params![root, id, call_id, decision, opening, bound],
+            )
+        })?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn release_embedded_read(
+        &self,
+        root: &str,
+        id: &str,
+        call_id: &str,
+        generation: i64,
+    ) -> Result<bool, EmbeddedError> {
+        self.ensure_embedded_schema()?;
+        let ticket = read_ticket(TICKET_OPENING, generation);
+        let changed = immediate(&mut self.connection(), |transaction| {
+            transaction.execute(
+                "UPDATE embedded_peer_messages
+                 SET status = 'held', read_call_id = NULL, read_arguments = NULL, decision = NULL
+                 WHERE root = ?1 AND id = ?2 AND read_call_id = ?3 AND status = 'read' AND decision = ?4",
+                params![root, id, call_id, ticket],
+            )
+        })?;
+        Ok(changed == 1)
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+impl Sqlite {
+    pub(crate) fn testing_clear_embedded_decision(&self, root: &str, id: &str) -> Result<(), EmbeddedError> {
+        self.ensure_embedded_schema()?;
+        self.connection().execute(
+            "UPDATE embedded_peer_messages SET decision = NULL WHERE root = ?1 AND id = ?2",
+            params![root, id],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn testing_expire_embedded(&self, root: &str, id: &str) -> Result<(), EmbeddedError> {
+        self.ensure_embedded_schema()?;
+        self.connection().execute(
+            "UPDATE embedded_peer_messages SET expires_at = 0 WHERE root = ?1 AND id = ?2",
+            params![root, id],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn testing_replace_embedded_body(&self, root: &str, id: &str, body: &str) -> Result<(), EmbeddedError> {
+        self.ensure_embedded_schema()?;
+        self.connection().execute(
+            "UPDATE embedded_peer_messages SET body = ?3 WHERE root = ?1 AND id = ?2",
+            params![root, id, body],
+        )?;
+        Ok(())
+    }
+}
+
+fn claim_read_sqlite(
+    transaction: &Transaction<'_>,
+    root: &str,
+    id: &str,
+    recipient: &str,
+    call_id: &str,
+    arguments: &str,
+) -> Result<ReadTake, EmbeddedError> {
+    let Some(row) = load_embedded_in(transaction, root, id)? else {
+        return Ok(ReadTake::Missing);
+    };
+    if row.recipient != recipient {
+        return Ok(ReadTake::Missing);
+    }
+    if let Some(taken) = classify_read(&row, call_id, arguments) {
+        return Ok(taken);
+    }
+    match row.status {
+        EmbeddedStatus::Held => claim_held_read(transaction, root, id, recipient, call_id, arguments),
+        EmbeddedStatus::Read => resume_embedded_read(transaction, root, id, &row),
+        EmbeddedStatus::Direct => Ok(ReadTake::Busy),
+    }
+}
+
+fn claim_held_read(
+    transaction: &Transaction<'_>,
+    root: &str,
+    id: &str,
+    recipient: &str,
+    call_id: &str,
+    arguments: &str,
+) -> Result<ReadTake, EmbeddedError> {
+    if call_id_taken(transaction, root, recipient, call_id, id)? {
+        return Ok(ReadTake::Busy);
+    }
+    let ticket = read_ticket(TICKET_OPENING, 1);
+    let changed = match transaction.execute(
+        "UPDATE embedded_peer_messages
+         SET status = 'read', read_call_id = ?3, read_arguments = ?4, decision = ?5
+         WHERE root = ?1 AND id = ?2 AND status = 'held'",
+        params![root, id, call_id, arguments, ticket],
+    ) {
+        Ok(changed) => changed,
+        Err(error) if is_unique(&error) => return Ok(ReadTake::Busy),
+        Err(error) => return Err(error.into()),
+    };
+    if changed == 0 {
+        return Ok(ReadTake::Busy);
+    }
+    owned_read(transaction, root, id, 1)
+}
+
+fn resume_embedded_read(
+    transaction: &Transaction<'_>,
+    root: &str,
+    id: &str,
+    row: &EmbeddedRow,
+) -> Result<ReadTake, EmbeddedError> {
+    let (kind, next) = next_read_ticket(row.decision.as_deref())?;
+    let ticket = read_ticket(&kind, next);
+    let changed = if row.decision.is_none() {
+        transaction.execute(
+            "UPDATE embedded_peer_messages SET decision = ?3
+             WHERE root = ?1 AND id = ?2 AND status = 'read' AND decision IS NULL",
+            params![root, id, ticket],
+        )?
+    } else {
+        transaction.execute(
+            "UPDATE embedded_peer_messages SET decision = ?4
+             WHERE root = ?1 AND id = ?2 AND status = 'read' AND decision = ?3",
+            params![root, id, row.decision, ticket],
+        )?
+    };
+    if changed == 0 {
+        return Ok(ReadTake::Busy);
+    }
+    owned_read(transaction, root, id, next)
+}
+
+fn owned_read(transaction: &Transaction<'_>, root: &str, id: &str, generation: i64) -> Result<ReadTake, EmbeddedError> {
+    Ok(ReadTake::Ready(ReadClaim {
+        row: load_embedded_in(transaction, root, id)?
+            .ok_or_else(|| EmbeddedError::Storage("the claimed embedded peer row is missing".to_string()))?,
+        generation,
+    }))
+}
+
+fn call_id_taken(
+    transaction: &Transaction<'_>,
+    root: &str,
+    recipient: &str,
+    call_id: &str,
+    id: &str,
+) -> Result<bool, EmbeddedError> {
+    let found: Option<String> = transaction
+        .query_row(
+            "SELECT id FROM embedded_peer_messages
+             WHERE root = ?1 AND recipient = ?2 AND read_call_id = ?3 AND id != ?4",
+            params![root, recipient, call_id, id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+fn is_unique(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _) if code.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
+
+fn claim_embedded_sqlite(
+    transaction: &Transaction<'_>,
+    fresh: &NewEmbedded,
+    label_json: &str,
+) -> Result<EmbeddedClaim, EmbeddedError> {
+    transaction.execute(
+        "UPDATE embedded_peer_messages SET body = NULL
+         WHERE root = ?1 AND status IN ('held', 'direct') AND expires_at <= ?2",
+        params![fresh.root, fresh.created_at],
+    )?;
+    if let Some(existing) = load_embedded_dispatch(transaction, &fresh.root, &fresh.sender, &fresh.dispatch)? {
+        return Ok(if same_payload(&existing, fresh) {
+            EmbeddedClaim::Stored(existing)
+        } else {
+            EmbeddedClaim::Conflict
+        });
+    }
+    let unread_count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM embedded_peer_messages
+         WHERE root = ?1 AND recipient = ?2 AND status = 'held' AND body IS NOT NULL AND expires_at > ?3",
+        params![fresh.root.as_str(), fresh.recipient.as_str(), fresh.created_at],
+        |row| row.get(0),
+    )?;
+    if unread_count >= crate::embedded::UNREAD_QUOTA as i64 {
+        return Ok(EmbeddedClaim::Quota);
+    }
+    transaction.execute(
+        "INSERT INTO embedded_peer_messages (
+            id, root, sender, recipient, pending_spawn, dispatch, digest, label, body, status, expires_at, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'held', ?10, ?11)",
+        params![
+            fresh.id.as_str(),
+            fresh.root.as_str(),
+            fresh.sender.as_str(),
+            fresh.recipient.as_str(),
+            fresh.pending_spawn.as_deref(),
+            fresh.dispatch.as_str(),
+            fresh.digest.as_str(),
+            label_json,
+            fresh.body.as_str(),
+            fresh.expires_at,
+            fresh.created_at
+        ],
+    )?;
+    Ok(EmbeddedClaim::Stored(
+        load_embedded_in(transaction, &fresh.root, &fresh.id)?
+            .ok_or_else(|| EmbeddedError::Storage("the inserted embedded peer row is missing".to_string()))?,
+    ))
+}
+
+fn load_embedded_dispatch(
+    transaction: &Transaction<'_>,
+    root: &str,
+    sender: &str,
+    dispatch: &str,
+) -> Result<Option<EmbeddedRow>, EmbeddedError> {
+    transaction
+        .query_row(
+            "SELECT id, sender, recipient, pending_spawn, dispatch, digest, label, body, status, read_call_id, decision, expires_at, read_arguments
+             FROM embedded_peer_messages WHERE root = ?1 AND sender = ?2 AND dispatch = ?3",
+            params![root, sender, dispatch],
+            embedded_row,
+        )
+        .optional()?
+        .map(decode_embedded)
+        .transpose()
+}
+
+fn load_embedded_in(transaction: &Transaction<'_>, root: &str, id: &str) -> Result<Option<EmbeddedRow>, EmbeddedError> {
+    transaction
+        .query_row(
+            "SELECT id, sender, recipient, pending_spawn, dispatch, digest, label, body, status, read_call_id, decision, expires_at, read_arguments
+             FROM embedded_peer_messages WHERE root = ?1 AND id = ?2",
+            params![root, id],
+            embedded_row,
+        )
+        .optional()?
+        .map(decode_embedded)
+        .transpose()
+}
+
+fn embedded_row(row: &rusqlite::Row<'_>) -> Result<StoredEmbedded, rusqlite::Error> {
+    let label: String = row.get(6)?;
+    Ok(StoredEmbedded {
+        id: row.get(0)?,
+        sender: row.get(1)?,
+        recipient: row.get(2)?,
+        pending_spawn: row.get(3)?,
+        dispatch: row.get(4)?,
+        digest: row.get(5)?,
+        label: serde_json::from_str(&label).map_err(|error| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error.to_string())))
+        })?,
+        body: row.get(7)?,
+        status: row.get(8)?,
+        read_call_id: row.get(9)?,
+        decision: row.get(10)?,
+        expires_at: row.get(11)?,
+        read_arguments: row.get(12)?,
+    })
+}
+
+fn decode_embedded(stored: StoredEmbedded) -> Result<EmbeddedRow, EmbeddedError> {
+    stored.decode()
+}
+
+impl From<rusqlite::Error> for EmbeddedError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+
+/// A held connection that one append runs on.
+pub(crate) struct Appender<'a>(MutexGuard<'a, Connection>);
+
+impl Appender<'_> {
+    /// Append one batch at `basis`, or refuse because the log has moved past it. `before_commit`
+    /// runs last inside the transaction, and an error from it writes nothing.
+    pub(crate) fn append(
+        mut self,
+        root: &TrajectoryId,
+        basis: u64,
+        batch: &Batch<'_>,
+        before_commit: impl FnOnce() -> Result<(), AppendError>,
+    ) -> Result<(), AppendError> {
+        immediate(&mut self.0, |transaction| {
+            admissible(transaction, root, basis, batch)?;
+            insert_batch(transaction, root, basis, batch)?;
+            before_commit()
+        })
+    }
+
+    /// Append the batch only while this read still owns its ticket. A batch that opens or admits
+    /// binds the ticket, so a later release cannot return the row to the inbox.
+    pub(crate) fn append_holding_read(
+        mut self,
+        root: &TrajectoryId,
+        basis: u64,
+        batch: &Batch<'_>,
+        hold: &crate::embedded::EmbeddedAppendHold<'_>,
+    ) -> Result<(), AppendError> {
+        immediate(&mut self.0, |transaction| {
+            admissible(transaction, root, basis, batch)?;
+            insert_batch(transaction, root, basis, batch)?;
+            let opening = read_ticket(TICKET_OPENING, hold.generation);
+            let bound = read_ticket(TICKET_BOUND, hold.generation);
+            let owned: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM embedded_peer_messages
+                 WHERE root = ?1 AND id = ?2 AND read_call_id = ?3 AND status = 'read'
+                   AND (decision = ?4 OR decision = ?5)",
+                params![root.as_str(), hold.id, hold.call_id, opening, bound],
+                |row| row.get(0),
+            )?;
+            if owned != 1 {
+                return Err(AppendError::ReadClaimLost);
+            }
+            if hold.bind {
+                let changed = transaction.execute(
+                    "UPDATE embedded_peer_messages SET decision = ?5
+                     WHERE root = ?1 AND id = ?2 AND read_call_id = ?3 AND status = 'read'
+                       AND (decision = ?4 OR decision = ?5)",
+                    params![root.as_str(), hold.id, hold.call_id, opening, bound],
+                )?;
+                if changed != 1 {
+                    return Err(AppendError::ReadClaimLost);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Commit `records` at the head of their logs in one transaction of their own, as another
+    /// writer racing this append would. `None` records nothing and only takes the position.
+    #[cfg(feature = "fault-injection")]
+    pub(crate) fn foreign(
+        &mut self,
+        records: &[(&TrajectoryId, Option<&HostObservation>)],
+    ) -> Result<(), rusqlite::Error> {
+        immediate(&mut self.0, |transaction| {
+            for (root, observation) in records {
+                let at = position(transaction, root)?;
+                let batch = Batch {
+                    bytes: encode(&[], *observation),
+                    key: observation.and_then(HostObservation::key),
+                    fence: None,
+                };
+                insert_batch(transaction, root, at, &batch)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl Appender<'_> {
+    /// Publish `policy_file` as the next revision of `deployment` in one transaction of its
+    /// own, as another process's publish racing this append would.
+    #[cfg(feature = "fault-injection")]
+    pub(crate) fn foreign_publish(
+        &mut self,
+        deployment: &DeploymentName,
+        policy_file: &[u8],
+    ) -> Result<(), AppendError> {
+        let published = immediate(&mut self.0, |transaction| {
+            let current = head_of(transaction, deployment)?;
+            let head = PolicyHead {
+                revision: current.map_or(PolicyRevision::FIRST, PolicyRevision::next),
+                key: PolicyFileKey::of(policy_file),
+            };
+            publish_in(transaction, deployment, current, &head, policy_file)
+        });
+        match published {
+            Ok(()) => Ok(()),
+            Err(PublishError::Storage(error)) => Err(AppendError::Storage(error)),
+            Err(error) => unreachable!("a foreign publish moves the head it read in its own transaction: {error}"),
+        }
+    }
+}
+
+/// Store `policy_file` and move `deployment`'s head from `expected` to `head` inside
+/// `transaction`.
+fn publish_in(
+    transaction: &Transaction<'_>,
+    deployment: &DeploymentName,
+    expected: Option<PolicyRevision>,
+    head: &PolicyHead,
+    policy_file: &[u8],
+) -> Result<(), PublishError> {
+    let current = head_of(transaction, deployment)?;
+    if current != expected {
+        return Err(PublishError::Moved { head: current });
+    }
+    transaction.execute(
+        "INSERT INTO policy_files (key, bytes) VALUES (?1, ?2) ON CONFLICT (key) DO NOTHING",
+        params![head.key.as_str(), policy_file],
+    )?;
+    transaction.execute(
+        "INSERT INTO policy_revisions (deployment, revision, key) VALUES (?1, ?2, ?3)",
+        params![deployment.as_str(), head.revision.value() as i64, head.key.as_str()],
+    )?;
+    transaction.execute(
+        "INSERT INTO deployments (name, head) VALUES (?1, ?2)
+         ON CONFLICT (name) DO UPDATE SET head = excluded.head",
+        params![deployment.as_str(), head.revision.value() as i64],
+    )?;
+    Ok(())
+}
+
+/// Damage stated in the log's own vocabulary, for callers that pin how a read refuses it.
+#[cfg(feature = "fault-injection")]
+impl Sqlite {
+    pub(crate) fn forget_policy_files(&self) {
+        self.testing_connection()
+            .execute("DELETE FROM policy_files", [])
+            .expect("the damage lands");
+    }
+
+    pub(crate) fn corrupt_policy_files(&self, bytes: &[u8]) {
+        self.testing_connection()
+            .execute("UPDATE policy_files SET bytes = ?1", params![bytes])
+            .expect("the damage lands");
+    }
+
+    /// How many batches now hold `bytes`: one where the batch exists.
+    pub(crate) fn corrupt_batch(&self, root: &TrajectoryId, seq: u64, bytes: &[u8]) -> usize {
+        self.testing_connection()
+            .execute(
+                "UPDATE logs SET facts = ?3 WHERE root = ?1 AND seq = ?2",
+                params![root.as_str(), seq as i64, bytes],
+            )
+            .expect("the damage lands")
+    }
+}
+
+impl From<rusqlite::Error> for ReceiptError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+
+/// Run `operation` in an immediate transaction, committed only when it succeeds.
+fn immediate<T, E: From<rusqlite::Error>>(
+    connection: &mut Connection,
+    operation: impl FnOnce(&Transaction<'_>) -> Result<T, E>,
+) -> Result<T, E> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let result = operation(&transaction)?;
+    transaction.commit()?;
+    Ok(result)
+}
+
+/// Whether `batch` may follow the log of `root` at `basis`: the log still stands there, and a
+/// decided batch's revision is still its deployment's head.
+fn admissible(connection: &Connection, root: &TrajectoryId, basis: u64, batch: &Batch<'_>) -> Result<(), AppendError> {
+    let current = position(connection, root)?;
+    if current != basis {
+        return Err(AppendError::Conflict { current });
+    }
+    match moved(connection, batch.fence.as_ref())? {
+        Some(head) => Err(AppendError::PolicyMoved { head }),
+        None => Ok(()),
+    }
+}
+
+/// Where the head stands when it is not the revision `fence` requires; `None` when the fence
+/// holds or there is none.
+fn moved(
+    connection: &Connection,
+    fence: Option<&Fence<'_>>,
+) -> Result<Option<Option<PolicyRevision>>, rusqlite::Error> {
+    let Some(fence) = fence else {
+        return Ok(None);
+    };
+    let head = head_of(connection, fence.deployment)?;
+    Ok((head != Some(fence.revision)).then_some(head))
+}
+
+fn revision_key(
+    connection: &Connection,
+    deployment: &DeploymentName,
+    revision: PolicyRevision,
+) -> Result<String, ReadError> {
+    connection
+        .query_row(
+            "SELECT key FROM policy_revisions WHERE deployment = ?1 AND revision = ?2",
+            params![deployment.as_str(), revision.value() as i64],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| ReadError::UnknownRevision {
+            deployment: deployment.as_str().to_string(),
+            revision,
+        })
+}
+
+fn head_of(connection: &Connection, deployment: &DeploymentName) -> Result<Option<PolicyRevision>, rusqlite::Error> {
+    let head: Option<i64> = connection
+        .query_row(
+            "SELECT head FROM deployments WHERE name = ?1",
+            params![deployment.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    head.map(stored_revision).transpose()
+}
+
+fn stored_revision(revision: i64) -> Result<PolicyRevision, rusqlite::Error> {
+    u64::try_from(revision)
+        .ok()
+        .filter(|revision| *revision > 0)
+        .map(PolicyRevision::new)
+        .ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Integer,
+                format!("a stored policy revision is not positive: {revision}").into(),
+            )
+        })
+}
+
+fn stored_key(key: String) -> Result<appa_engine::profile::PolicyFileKey, ReadError> {
+    serde_json::from_value(serde_json::Value::String(key.clone())).map_err(|error| ReadError::UndecodableKey {
+        key,
+        detail: error.to_string(),
+    })
+}
+
+/// Read only the tail of a held prefix and any batches that follow it.
+fn log_rows(connection: &Connection, root: &TrajectoryId, first: u64) -> Result<Vec<Vec<u8>>, ReadError> {
+    let (query, start) = if first == 0 {
+        // Check every position on a cold read, even values SQLite accepted with the wrong type.
+        ("SELECT seq, facts FROM logs WHERE root = ?1 ORDER BY seq ASC", None)
+    } else {
+        (
+            "SELECT seq, facts FROM logs WHERE root = ?1 AND seq >= ?2 ORDER BY seq ASC",
+            Some(first as i64),
+        )
+    };
+    let mut statement = connection.prepare(query)?;
+    let mut cursor = match start {
+        Some(start) => statement.query(params![root.as_str(), start])?,
+        None => statement.query([root.as_str()])?,
+    };
+    let mut rows = Vec::new();
+    while let Some(row) = cursor.next()? {
+        rows.push((row.get(0)?, row.get(1)?));
+    }
+    contiguous_from(first, rows).map_err(|gap| {
+        ReadError::Storage(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some(gap.to_string()),
+        ))
+    })
+}
+
+fn insert_batch(
+    connection: &Connection,
+    root: &TrajectoryId,
+    at: u64,
+    batch: &Batch<'_>,
+) -> Result<(), rusqlite::Error> {
+    connection.execute(
+        "INSERT INTO logs (root, seq, facts) VALUES (?1, ?2, ?3)",
+        params![root.as_str(), at as i64, batch.bytes],
+    )?;
+    if let Some(key) = &batch.key {
+        connection.execute(
+            "INSERT OR IGNORE INTO host_keys (key, root) VALUES (?1, ?2)",
+            params![key, root.as_str()],
+        )?;
+    }
+    Ok(())
+}
+
+fn position(connection: &Connection, root: &TrajectoryId) -> Result<u64, rusqlite::Error> {
+    let next: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(seq) + 1, 0) FROM logs WHERE root = ?1",
+        params![root.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(next as u64)
+}
+
+fn is_taken(error: &rusqlite::Error) -> bool {
+    const PRIMARY_KEY: i32 = 1555;
+    const UNIQUE: i32 = 2067;
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(e, _) if e.extended_code == PRIMARY_KEY || e.extended_code == UNIQUE
+    )
+}
+
+const TABLES: [&str; 9] = [
+    "logs",
+    "policy_files",
+    "deployments",
+    "policy_revisions",
+    "host_keys",
+    "operations",
+    "processed_results",
+    "held_peer_messages",
+    "archived_roots",
+];
+
+fn has_schema(connection: &Connection) -> Result<bool, rusqlite::Error> {
+    let names = TABLES.map(|table| format!("'{table}'")).join(", ");
+    let found: i64 = connection.query_row(
+        &format!("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ({names})"),
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(found == TABLES.len() as i64)
+}
+
+fn install_embedded_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    let mut statement = connection.prepare(
+        "SELECT name, sql FROM sqlite_master
+         WHERE name IN ('embedded_peer_messages', 'embedded_peer_recipient', 'embedded_peer_read_call')
+         ORDER BY name",
+    )?;
+    let found = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if found.is_empty() {
+        return connection.execute_batch(EMBEDDED_SCHEMA);
+    }
+    let normalize = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let expected = [
+        (
+            "embedded_peer_messages",
+            "CREATE TABLE embedded_peer_messages ( seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, root TEXT NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL, pending_spawn TEXT, dispatch TEXT NOT NULL, digest TEXT NOT NULL, label TEXT NOT NULL, body TEXT, status TEXT NOT NULL, read_call_id TEXT, read_arguments TEXT, decision TEXT, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL, UNIQUE (root, sender, dispatch) )",
+        ),
+        (
+            "embedded_peer_read_call",
+            "CREATE UNIQUE INDEX embedded_peer_read_call ON embedded_peer_messages (root, recipient, read_call_id) WHERE read_call_id IS NOT NULL",
+        ),
+        (
+            "embedded_peer_recipient",
+            "CREATE INDEX embedded_peer_recipient ON embedded_peer_messages (root, recipient, status)",
+        ),
+    ];
+    if found.len() == expected.len()
+        && found
+            .iter()
+            .zip(expected)
+            .all(|((name, sql), (expected_name, expected_sql))| name == expected_name && normalize(sql) == expected_sql)
+    {
+        return Ok(());
+    }
+    Err(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+        Some("the optional embedded peer schema is partial or incompatible".into()),
+    ))
+}
+
+/// Every root the database at `path` holds, read after folding its write-ahead log into the
+/// main file, so the file alone is the whole database. The returned connection holds the
+/// database exclusively, so no other process writes to it while it is moved; a database
+/// another process has open fails here instead.
+fn checkpointed_roots(path: &Path) -> Result<(Connection, Vec<String>), rusqlite::Error> {
+    let connection = Connection::open(path)?;
+    connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+    let blocked: i64 = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    if blocked != 0 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("another connection holds the write-ahead log".to_string()),
+        ));
+    }
+    let roots = connection
+        .prepare("SELECT DISTINCT root FROM logs")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok((connection, roots))
+}
+
+fn sidecars(path: &Path) -> [PathBuf; 2] {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    [
+        path.with_file_name(format!("{name}-wal")),
+        path.with_file_name(format!("{name}-shm")),
+    ]
+}
+
+fn remove_if_present(path: &Path) -> Result<(), OpenError> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(moving(path, error)),
+        _ => Ok(()),
+    }
+}
+
+fn moving(path: &Path, error: std::io::Error) -> OpenError {
+    OpenError::Archive {
+        path: path.display().to_string(),
+        detail: error.to_string(),
+    }
+}
+
+fn is_empty(connection: &Connection) -> Result<bool, rusqlite::Error> {
+    let tables: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(tables == 0)
+}
+
+/// One operation receipt row, its lease judged against `now` in unix milliseconds.
+fn read_operation(
+    connection: &Connection,
+    key: &OperationKey,
+    now: i64,
+) -> Result<Option<StoredOperation>, ReceiptError> {
+    connection
+        .query_row(
+            "SELECT organization_id, caller_id, session_id, root, input, status, decision, lease_owner, lease_expires_at
+             FROM operations WHERE organization_id=?1 AND session_id=?2 AND operation_id=?3",
+            params![key.session.organization_id, key.session.session_id, key.operation_id],
+            |row| {
+                Ok((
+                    (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?),
+                    (row.get::<_, String>(4)?, row.get(5)?, row.get::<_, Option<String>>(6)?),
+                    stored_lease(row, 7, now)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(
+            |((organization_id, caller_id, session_id, root), (input, status, decision), lease)| {
+                let input = StoredOperationInput::decode(json(&input)?)?;
+                Ok(StoredOperation {
+                    session: SessionScope {
+                        organization_id,
+                        session_id,
+                    },
+                    binding: input.binding(caller_id)?,
+                    root,
+                    semantic: input.semantic,
+                    status,
+                    decision: decision.as_deref().map(json),
+                    lease,
+                })
+            },
+        )
+        .transpose()
+}
+
+/// One processed-result receipt row, its lease judged against `now` in unix milliseconds.
+fn read_result(
+    connection: &Connection,
+    key: &ProcessedResultKey,
+    now: i64,
+) -> Result<Option<StoredResult>, ReceiptError> {
+    Ok(connection
+        .query_row(
+            "SELECT organization_id, session_id, root, status, approved_output, decision, lease_owner, lease_expires_at
+             FROM processed_results WHERE organization_id=?1 AND session_id=?2 AND tool_call_id=?3",
+            params![key.session.organization_id, key.session.session_id, key.tool_call_id],
+            |row| {
+                Ok(StoredResult {
+                    session: SessionScope {
+                        organization_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                    },
+                    root: row.get(2)?,
+                    status: row.get(3)?,
+                    approved_output: row.get(4)?,
+                    decision: row.get::<_, Option<String>>(5)?.as_deref().map(json),
+                    lease: stored_lease(row, 6, now)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// A receipt's lease columns, starting at column `from`: owner, then expiry.
+fn stored_lease(row: &rusqlite::Row<'_>, from: usize, now: i64) -> Result<StoredLease, rusqlite::Error> {
+    Ok(StoredLease {
+        owner: row.get(from)?,
+        live: row
+            .get::<_, Option<i64>>(from + 1)?
+            .is_some_and(|expires_at| expires_at > now),
+    })
+}
+
+/// A held row's notice columns: id, digest, label JSON, expiry.
+type HeldRow = (String, String, String, i64);
+
+fn held_row(row: &rusqlite::Row<'_>) -> Result<HeldRow, rusqlite::Error> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+}
+
+fn decode_held((id, digest, label, expires_at): HeldRow) -> Result<HeldNotice, HeldError> {
+    StoredNotice {
+        id,
+        digest,
+        label: serde_json::from_str(&label).map_err(|error| HeldError::Corrupt(error.to_string()))?,
+        expires_at,
+    }
+    .decode()
+}
+
+impl From<rusqlite::Error> for HeldError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+
+fn json(raw: &str) -> StoredJson {
+    serde_json::from_str(raw).map_err(|error| ReceiptError::storage(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Backend, LogStore, OpenError};
+
+    #[test]
+    fn sqlite_refuses_nonpositive_policy_revisions_on_write() {
+        for revision in [0_i64, -1, i64::MIN] {
+            let store = LogStore::open(Backend::Memory).expect("a fresh store opens");
+            let connection = store.lock();
+            assert!(
+                connection
+                    .execute("INSERT INTO deployments (name, head) VALUES ('test', ?1)", [revision])
+                    .is_err(),
+                "a deployment head must refuse {revision}"
+            );
+            assert!(
+                connection
+                    .execute(
+                        "INSERT INTO policy_revisions (deployment, revision, key) VALUES ('test', ?1, 'key')",
+                        [revision],
+                    )
+                    .is_err(),
+                "a published revision must refuse {revision}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_refuses_nonpositive_stored_heads_on_read() {
+        for revision in [0_i64, -1, i64::MIN] {
+            let store = LogStore::open(Backend::Memory).expect("a fresh store opens");
+            let deployment = DeploymentName::new("test");
+            {
+                let connection = store.lock();
+                connection
+                    .execute_batch("PRAGMA ignore_check_constraints = ON")
+                    .expect("legacy invalid rows can be simulated");
+                connection
+                    .execute("INSERT INTO deployments (name, head) VALUES ('test', ?1)", [revision])
+                    .expect("the invalid head is injected");
+            }
+            assert!(
+                matches!(
+                    store.head(&deployment),
+                    Err(ReadError::Storage(rusqlite::Error::FromSqlConversionFailure(..)))
+                ),
+                "head {revision} must be refused as an invalid stored integer"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_refuses_nonpositive_stored_published_revisions_on_read() {
+        for revision in [0_i64, -1, i64::MIN] {
+            let store = LogStore::open(Backend::Memory).expect("a fresh store opens");
+            let deployment = DeploymentName::new("test");
+            {
+                let connection = store.lock();
+                connection
+                    .execute_batch("PRAGMA ignore_check_constraints = ON")
+                    .expect("legacy invalid rows can be simulated");
+                connection
+                    .execute(
+                        "INSERT INTO policy_revisions (deployment, revision, key) VALUES ('test', ?1, 'key')",
+                        [revision],
+                    )
+                    .expect("the invalid revision is injected");
+            }
+            assert!(
+                matches!(
+                    store.published_as(&deployment, "key"),
+                    Err(ReadError::Storage(rusqlite::Error::FromSqlConversionFailure(..)))
+                ),
+                "published revision {revision} must be refused"
+            );
+        }
+    }
+
+    /// The SQLite schema is a persisted format: its version stamp and the DDL of each table,
+    /// compared token for token.
+    #[test]
+    fn a_fresh_sqlite_store_has_the_frozen_schema() {
+        let normalize = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected: Vec<(String, String, Option<String>)> = [
+            ("archived_roots", Some("CREATE TABLE archived_roots ( root TEXT PRIMARY KEY )")),
+            ("deployments", Some("CREATE TABLE deployments ( name TEXT PRIMARY KEY, head INTEGER NOT NULL CHECK (head > 0) )")),
+            ("held_peer_messages", Some("CREATE TABLE held_peer_messages ( seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, receiver TEXT NOT NULL, digest TEXT NOT NULL, label TEXT NOT NULL, body TEXT NOT NULL, expires_at INTEGER NOT NULL, notified INTEGER NOT NULL )")),
+            ("held_peer_messages_receiver", Some("CREATE INDEX held_peer_messages_receiver ON held_peer_messages (receiver, seq)")),
+            ("host_keys", Some("CREATE TABLE host_keys ( key TEXT NOT NULL, root TEXT NOT NULL, PRIMARY KEY (key, root) )")),
+            ("logs", Some("CREATE TABLE logs ( root TEXT NOT NULL, seq INTEGER NOT NULL, facts BLOB NOT NULL, PRIMARY KEY (root, seq) )")),
+            ("operations", Some("CREATE TABLE operations ( organization_id TEXT NOT NULL, caller_id TEXT, session_id TEXT NOT NULL, operation_id TEXT NOT NULL, root TEXT NOT NULL, input TEXT NOT NULL, status TEXT NOT NULL, decision TEXT, lease_owner TEXT, lease_expires_at INTEGER, PRIMARY KEY (organization_id, session_id, operation_id) )")),
+            ("policy_files", Some("CREATE TABLE policy_files ( key TEXT PRIMARY KEY, bytes BLOB NOT NULL )")),
+            ("policy_revisions", Some("CREATE TABLE policy_revisions ( deployment TEXT NOT NULL, revision INTEGER NOT NULL CHECK (revision > 0), key TEXT NOT NULL, PRIMARY KEY (deployment, revision) )")),
+            ("policy_revisions_key", Some("CREATE INDEX policy_revisions_key ON policy_revisions (deployment, key, revision)")),
+            ("processed_results", Some("CREATE TABLE processed_results ( organization_id TEXT NOT NULL, caller_id TEXT, session_id TEXT NOT NULL, tool_call_id TEXT NOT NULL, root TEXT NOT NULL, status TEXT NOT NULL, approved_output TEXT, decision TEXT, lease_owner TEXT, lease_expires_at INTEGER, completed_at INTEGER, PRIMARY KEY (organization_id, session_id, tool_call_id) )")),
+            ("sqlite_autoindex_archived_roots_1", None),
+            ("sqlite_autoindex_deployments_1", None),
+            ("sqlite_autoindex_held_peer_messages_1", None),
+            ("sqlite_autoindex_host_keys_1", None),
+            ("sqlite_autoindex_logs_1", None),
+            ("sqlite_autoindex_operations_1", None),
+            ("sqlite_autoindex_policy_files_1", None),
+            ("sqlite_autoindex_policy_revisions_1", None),
+            ("sqlite_autoindex_processed_results_1", None),
+        ]
+        .into_iter()
+        .map(|(name, sql)| {
+            let kind = match sql {
+                Some(sql) if sql.starts_with("CREATE TABLE") => "table",
+                Some(_) | None => "index",
+            };
+            (kind.to_owned(), name.to_owned(), sql.map(str::to_owned))
+        })
+        .collect();
+
+        let dir = tempfile::tempdir().expect("a temp dir is creatable");
+        let backends = [
+            Backend::Sqlite {
+                path: dir.path().join("appa.db"),
+            },
+            Backend::Memory,
+        ];
+        for backend in backends {
+            let store = LogStore::open(backend).expect("a fresh store opens");
+            let connection = store.lock();
+            let version: i64 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("the version reads");
+            assert_eq!(version, SCHEMA_VERSION);
+            let mut statement = connection
+                .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+                .expect("the schema query prepares");
+            let found = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?.map(|sql| normalize(&sql)),
+                    ))
+                })
+                .expect("the schema reads")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("every schema row reads");
+            assert_eq!(found, expected);
+        }
+    }
+
+    #[test]
+    fn embedded_peer_installs_beside_a_frozen_core_without_moving_its_version() {
+        let store = LogStore::open(Backend::Memory).expect("a fresh store opens");
+        let version_before: i64 = store
+            .lock()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("the core version reads");
+        assert_eq!(version_before, SCHEMA_VERSION);
+        {
+            let connection = store.lock();
+            install_embedded_schema(&connection).expect("the optional schema installs");
+            install_embedded_schema(&connection).expect("the exact optional schema is accepted again");
+        }
+        let connection = store.lock();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("the core version still reads");
+        assert_eq!(
+            version, SCHEMA_VERSION,
+            "the embedded side table does not move the frozen core version"
+        );
+    }
+
+    #[test]
+    fn a_database_from_a_newer_build_is_refused() {
+        let dir = tempfile::tempdir().expect("a temp dir is creatable");
+        let path = dir.path().join("appa.db");
+        drop(LogStore::open(Backend::Sqlite { path: path.clone() }).expect("a fresh store opens"));
+        Connection::open(&path)
+            .expect("the file reopens")
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .expect("the version moves");
+
+        for opened in [
+            LogStore::open(Backend::Sqlite { path: path.clone() }).err(),
+            LogStore::open_archiving(&path).err(),
+        ] {
+            match opened {
+                Some(OpenError::Newer { found, supported, .. }) => {
+                    assert_eq!((found, supported), (SCHEMA_VERSION + 1, SCHEMA_VERSION));
+                }
+                other => panic!("expected a newer-schema refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_stamped_database_without_its_tables_is_damaged() {
+        let dir = tempfile::tempdir().expect("a temp dir is creatable");
+        let path = dir.path().join("appa.db");
+        Connection::open(&path)
+            .expect("the file opens")
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .expect("the stamp lands");
+
+        match LogStore::open(Backend::Sqlite { path }).err() {
+            Some(OpenError::Damaged { .. }) => {}
+            other => panic!("expected a damage refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unstamped_database_that_already_holds_tables_is_refused() {
+        let dir = tempfile::tempdir().expect("a temp dir is creatable");
+        let path = dir.path().join("appa.db");
+        Connection::open(&path)
+            .expect("the file opens")
+            .execute_batch("CREATE TABLE batches (family TEXT, seq INTEGER, bytes BLOB);")
+            .expect("the older schema lands");
+
+        for opened in [
+            LogStore::open(Backend::Sqlite { path: path.clone() }).err(),
+            LogStore::open_archiving(&path).err(),
+        ] {
+            match opened {
+                Some(OpenError::Incompatible { found, oldest, .. }) => {
+                    assert_eq!((found, oldest), (0, BASE_VERSION));
+                }
+                other => panic!("expected a schema refusal, got {other:?}"),
+            }
+        }
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("the directory lists")
+                .all(|entry| !entry
+                    .expect("the entry reads")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".archived-")),
+            "a file this store did not write is not moved"
+        );
+        let tables: i64 = Connection::open(&path)
+            .expect("the file reopens")
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('logs', 'policy_files')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the count runs");
+        assert_eq!(tables, 0, "the refusal wrote nothing");
+    }
+
+    #[test]
+    fn a_damaged_file_is_refused() {
+        let dir = tempfile::tempdir().expect("a temp dir is creatable");
+        let path = dir.path().join("appa.db");
+        std::fs::write(&path, b"not a sqlite database at all").expect("the file writes");
+        match LogStore::open(Backend::Sqlite { path }).err() {
+            Some(OpenError::Damaged { .. }) => {}
+            other => panic!("expected a damage refusal, got {other:?}"),
+        }
+    }
+}

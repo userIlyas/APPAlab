@@ -1,0 +1,158 @@
+[package]
+name = "appa"
+version.workspace = true
+edition.workspace = true
+publish = false
+autobins = false
+autotests = false
+
+[lib]
+name = "appa_runtime"
+
+[[bin]]
+name = "appa"
+path = "src/bin/appa.rs"
+required-features = ["daemon"]
+
+[[example]]
+name = "installation_fixture"
+required-features = ["daemon"]
+
+[[example]]
+name = "kagent_installation_fixture"
+required-features = ["daemon"]
+
+[features]
+default = ["daemon"]
+# The server stack: the MCP endpoint, the HTTP surface, the CLI and its log
+# setup. An in-process host links the library without any of it.
+daemon = ["dep:rmcp", "dep:axum", "dep:tower", "dep:clap", "dep:tracing-subscriber", "dep:opentelemetry-appender-tracing", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry", "tokio/signal"]
+# PostgreSQL storage for an embedding host whose migrations install the schema.
+postgres = ["appa-eventlog/postgres"]
+# The `archestra` annotator builtin: the rendered model prompt sent to an endpoint the
+# embedding host supplies through `HostDefaults`. The daemon never offers it.
+archestra = ["appa-policy/archestra"]
+
+# Each test binary links the whole runtime, so the suites share one:
+# `tests/main.rs` declares every suite as a module. A suite that sets the
+# process environment, or counts what the process spawns, keeps a binary of
+# its own, because the suites running beside it in one process would reach
+# what it sets or add to what it counts.
+[[test]]
+name = "integration"
+path = "tests/main.rs"
+
+[[test]]
+name = "annotators"
+
+[[test]]
+name = "child_process"
+
+[[test]]
+name = "databricks_policy"
+
+[[test]]
+name = "github_policy"
+
+[[test]]
+name = "huggingface_targets"
+
+[[test]]
+name = "loopback_proxy"
+
+[dependencies]
+tower = { version = "0.5", features = ["util"], optional = true }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled"] }
+appa-adapter-amp = { path = "../appa-adapter-amp" }
+appa-adapter-opencode = { path = "../appa-adapter-opencode" }
+appa-adapter-claude-code = { path = "../appa-adapter-claude-code" }
+appa-adapter-kagent = { path = "../appa-adapter-kagent" }
+appa-file-tracker = { path = "../appa-file-tracker" }
+# The builtin-module ABI: one source of truth for the descriptor,
+# statuses, and version shared with deployer modules.
+appa-builtin = { path = "../appa-builtin" }
+appa-engine = { workspace = true }
+appa-eventlog = { workspace = true }
+appa-package = { workspace = true }
+appa-policy = { workspace = true }
+appa-runtime-api = { path = "../appa-runtime-api" }
+# `query` decodes the statusline's one GET parameter (`/status`).
+axum = { workspace = true, features = ["query"], optional = true }
+# Wall time as RFC 3339: a runtime event's in a diagnostic export, and a consult record's
+# start. Already in the tree through rmcp and schemars, so this adds nothing to the build.
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
+clap = { version = "4", features = ["derive", "env"], optional = true }
+base64 = "0.23"
+# `join_all` runs one evidence batch's independent consults concurrently.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+libloading = "0.9"
+libc = "0.2"
+hmac = "0.13"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+rand = "0.10"
+reqwest = { workspace = true }
+# `server` carries the tool macros' schema derive; `transport-streamable-http-server`
+# is the HTTP transport Claude Code's MCP client speaks.
+rmcp = { version = "3", features = ["server", "macros", "transport-streamable-http-server", "transport-io", "elicitation"], optional = true }
+# Must stay 1.x to match rmcp's `#[tool]` schema derive.
+schemars = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tar = "0.4"
+tempfile = "3"
+tokio = { workspace = true }
+toml = { workspace = true }
+toml_edit = "0.25"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics"] }
+opentelemetry-appender-tracing = { version = "0.33", optional = true }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "logs", "metrics", "reqwest-blocking-client", "trace"], optional = true }
+opentelemetry_sdk = { version = "0.33", features = ["logs", "metrics", "trace"], optional = true }
+tracing-opentelemetry = { version = "0.34", default-features = false, optional = true }
+url = "2"
+# The report id: a v4 UUID the receiver stores one object under. A consult record's id is
+# a v7, so a host's dataset sorts by time.
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+# Not rig-core's `rustls` feature: it pins reqwest to aws-lc-rs, which would put a
+# second crypto provider beside the workspace's ring. TLS still comes from reqwest.
+rig-core = { version = "0.42", default-features = false, features = ["reqwest"] }
+rig-agent = { version = "0.42", default-features = false }
+# Depended on only to name the crypto provider; see the workspace manifest.
+rustls = { workspace = true }
+regex = "1.13.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+# `build.rs` includes `src/plugin_layout.rs`, which re-exports the canonical
+# tree digest from the marketplace crate.
+[build-dependencies]
+appa-package = { workspace = true }
+sha2 = { workspace = true }
+tar = "0.4"
+# The release gate checks the compiled yell endpoint the way the client parses
+# it. A prefix test would pass URLs the client then refuses.
+url = "2"
+
+[dev-dependencies]
+# The fail points the orchestration tests drive. A dev-dependency, so they are
+# absent from the binary.
+appa-eventlog = { workspace = true, features = ["fault-injection"] }
+# `start_paused`: a test that must exhaust a retry table should not spend the
+# table's backoff in real seconds.
+tokio = { workspace = true, features = ["test-util"] }
+jsonschema = { version = "0.61.1", default-features = false }
+# The elicitation round trip is only real with a real client on the
+# other end: these features exist for `tests/hitl_elicitation.rs` and
+# never ship in the binary.
+rmcp = { version = "3", features = ["client", "transport-streamable-http-client-reqwest"] }
+# The stub servers the core unit tests run against: unconditional, so those
+# tests compile without the `daemon` feature.
+axum = { workspace = true, features = ["query"] }
+
+[lints]
+workspace = true

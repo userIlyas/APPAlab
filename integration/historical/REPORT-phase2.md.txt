@@ -1,0 +1,179 @@
+# Интеграция OpenAPPA в Agentic Banking Lab — этап 2: fail-closed, изолированное развёртывание, E2E, персистентность
+
+Продолжение `REPORT.md`. Цель этапа — перейти от прототипа к проверке в реально
+развёрнутом приложении. Состояние кода: OpenAPPA @ `ada9b33e`, Agentic Banking Lab
+@ `b9374e7` (+ рабочие изменения).
+
+---
+
+## 1. Устранение fail-open (приоритет 1) — выполнено
+
+**Проблема:** при `APPA_TAINT_MODE=enforce` и отсутствии колеса `appa_agent_python`
+(или ошибке загрузки) обёртка `TaintGate.active` возвращала `False`, и `run_tool`
+просто выполнял инструмент (passthrough) — enforcement деградировал в открытый режим.
+
+**Исправление** (`services/common/appa_taint.py`):
+- Введён инвариант: в режиме `enforce` **любая** неготовность движка/политики/сессии
+  либо ошибка движка → `TaintDenied` **до** выполнения инструмента (fail-closed).
+- Точки fail-closed в `run_tool`: отсутствие `conversation_id`, `_engine_ready() == False`
+  (движок не загружен ИЛИ политика не загружена), невозможность открыть сессию,
+  неожиданная ошибка `check`/`report` (трансляция в `TaintDenied`).
+- `_reload_policy` при ошибке парсинга/чтения политики оставляет `_policy_toml=None`
+  (не «мягкий» контур) и лог `CRITICAL`; `_load_native` в enforce логирует `CRITICAL`.
+- Режимы: `enforce` — fail-closed; `observe` — advisory passthrough (осознанно);
+  `off` — passthrough без загрузки движка.
+- Добавлен `TaintGate.status()` (mode, engine_available, engine_identity, policy_loaded,
+  policy_tools, declared_narrowers, allowed_narrow, fail_closed, sessions) и вывод в `/health`.
+
+**Проверка (14/14 тестов, `tests/test_appa_taint.py`):**
+`test_enforce_fails_closed_when_engine_unavailable`, `..._when_policy_missing`,
+`..._without_conversation_id` — sink не выполняется; `test_observe_passes_through_...`
+и `test_off_mode_passes_through` — ожидаемый passthrough.
+
+## 2. Изолированное развёртывание (приоритет 2) — выполнено
+
+- `Dockerfile`: добавлен build-ARG `APPA_TAINT_INSTALL` (default `0`), `COPY configs`,
+  `COPY vendor` и условный `pip install vendor/appa_agent_python-*.whl` при `=1`.
+  Для остальных сервисов стенда поведение не меняется.
+- Новый `docker-compose.appa.yml`: отдельный сервис `banking-agent-appa` —
+  **свой образ** `agentic-banking-banking-agent-appa`, **свой контейнер**
+  `agentic-banking-appa-1`, порт `127.0.0.1:8009`, `BANKING_AGENT_MODE=legacy`,
+  `APPA_TAINT_MODE=enforce`, `APPA_TAINT_E2E_HARNESS=1`. Сервис **только
+  присоединяется** к существующей сети `agentic-banking_banking` (external) и читает
+  те же секреты из `.env` (секреты не выводились и не перезаписывались).
+- Основной стенд не изменён: образы/контейнеры/данные/тома не трогались
+  (подтверждено `docker ps` — основной `banking-agent` на 8000 здоров, контейнеры
+  стенда работают без перезапуска).
+
+Сборка колеса воспроизводима: `scripts/build_appa_wheel.sh`
+(`rust:1.96-bookworm` + `maturin`), артефакт `vendor/appa_agent_python-0.46.1-...whl`.
+
+## 3–4. E2E через реальные интерфейсы + «метки → движок → блокировка до выполнения» (приоритеты 3–4)
+
+### Что проверено в развёрнутом контейнере (детерминированно, 8/8 PASS, `openappa-abl/e2e-gate.py`)
+
+| Проверка | Результат |
+|---|---|
+| `/health` развёрнутого образа: `mode=enforce`, `engine_available=true`, `engine_identity=appa-agent-python-v9`, `policy_loaded=true`, `policy_tools=14`, `fail_closed=true` | PASS |
+| Канapи пользователь `ivan.petrov` (customer-001) аутентифицирован (`azp=bank-ui`) | PASS |
+| **Чистый диалог**: `create_transfer` (self-transfer `account-001 → RU10000000000000000002`, 1.00 RUB) — **разрешён и реально выполнен** в АБС (operation_id возвращён; счёт операций 0→1) | PASS |
+| **Загрязнённый диалог**: синтетический недоверенный ingress допущен через реальный gate (`search.text` → narrowing) | PASS |
+| **Тот же `create_transfer` в загрязнённом диалоге**: HTTP **409 `code=policy_denied`**, причина — trust floor | PASS |
+| **Блокировка до выполнения**: после отказа счёт операций АБС не изменился (1→1) — side effect отсутствует | PASS |
+
+Дополнительное доказательство потока меток — лог контейнера `agentic-banking-appa-1`:
+
+```
+appa_taint deny tool=abs.create_transfer conv=e2e-taint-<…> reason=[appa] Blocked:
+abs.create_transfer cannot run. Why: - trust is suspicious, below the required floor trusted
+```
+
+Это подтверждает: метка поступает из точки ingress в policy engine (`search.text` →
+`suspicious`), и запрещённая финансовая операция блокируется **до** обращения к АБС.
+
+### Что НЕ подтверждено E2E (честно, разделяю статусы)
+
+Полный сценарий через `/v1/chat` (LLM-граф + поиск + память) в этом окружении
+не проходит по **несвязанной с OpenAPPA** причине: у сервиса памяти отсутствует
+`EMBEDDING_API_KEY` (в `.env` значение пустое), поэтому самый первый узел графа —
+`memory.recall` (`POST /api/v1/context`) — возвращает 503 «Embedding-модель недоступна»,
+и граф не доходит до вызова инструментов. Это ограничение стенда, а не интеграции:
+основной `banking-agent` страдает тем же (в логах `memory-service` видны 503 на
+`/api/v1/context`). Поэтому:
+- E2E «метка → блокировка» выполнен на **реальном gated `skills.mcp` + реальном движке
+  OpenAPPA + реальном АБС** через диагностический endpoint изолированного образа
+  (`POST /v1/appa/e2e/transfer`, монтируется только при `APPA_TAINT_E2E_HARNESS=1`,
+  иначе 404);
+- ingress в E2E — **синтетическое** допущение через реальный gate (поиск/память вне сети
+  недоступны); полноценный ingress `search.*`/`memory.untrusted`/`travel.plan` покрыт
+  юнит-тестами на реальном движке (см. `REPORT.md`, итого 14 тестов).
+
+## 5. Персистентность taint между перезапусками (приоритет 5) — исследование и предложение
+
+**Факты (подтверждено кодом OpenAPPA):**
+- `appa-agent-python/src/lib.rs:221,244,246` — хранилище `tempfile::tempdir()`,
+  `Runtime::open(config, store.path().join("appa.db"), None)`, `TrajectoryId("episode")`.
+  Итог: состояние живёт во временном SQLite и теряется при перезапуске; траектория
+  захардкожена (все диалоги) — нужна правка для многопользовательского режима.
+- `appa-runtime/src/api/mod.rs:2235` — `Runtime::open(config, db: PathBuf, modules)`:
+  `db` — это eventlog SQLite; передача постоянного пути даёт переживание рестарта
+  (детерминированный replay).
+- `appa-eventlog/src/sqlite.rs:52-54` — схема keyed per trajectory `PRIMARY KEY (root, seq)`,
+  где `root` = `TrajectoryId`; значит **один** SQLite-файл (или файл на диалог) штатно
+  хранит множество траекторий и переживает перезапуск через replay `log(root)`.
+
+**Рекомендуемый способ (минимальная правка OpenAPPA, вариант C):**
+1. Расширить `appa-agent-python`: конструктору `Session` добавить `store_path` (постоянный
+   каталог/файл) и `trajectory_id` (стабильный id = `conversation_id`, через валидацию
+   `TrajectoryId::new`) вместо `tempfile::tempdir()`/`"episode"`.
+2. В Python-обёртке `TaintGate`: хранилище на диске (volume контейнера, например
+   `appa-state:/var/lib/appa`), ключ диалога = `conversation_id`; при рестарте `Session`
+   открывает тот же SQLite → eventlog replay восстанавливает метку траектории.
+3. Многопользовательская изоляция: каждая траектория уже индексируется по `root`; при
+   общем SQLite — изоляция по `TrajectoryId`, при файле на диалог — изоляция средствами ФС.
+   Привязка «диалог → траектория» остаётся в памяти/БД банка (тот же `conversation_id`).
+
+**Альтернативы:**
+- Sidecar `appa serve` + `appa-eventlog` (SQLite/Postgres) + добавление wire-адаптера
+  `python`/`native` (больше Rust-работы, сетевой hop, но готовый daemon/config/replay CLI).
+- PostgreSQL-хранилище по образцу `summary.md` (Archestra `@archestra/openappa-rs` +
+  `openappa_events`/`openappa_policy_files` + advisory lock на «семью» траекторий) — для
+  multi-replica/транзакционной согласованности (P2).
+- **Консервативная миграция**: диалоги, открытые до включения персистентности (без записи
+  `TrajectoryOpened`), должны стартовать с консервативной меткой (OpenAPPA уже сжигает
+  approvals при смене ревизии политики), либо предлагать `/new`.
+
+**Статус:** предложение (реализация отдельным шагом, требуется правка OpenAPPA и пересборка
+колеса).
+
+## 6. Ограничения текущей реализации и следующие шаги
+
+Ограничения (не скрываю):
+1. **`/v1/chat` E2E не пройден** из-за пустого `EMBEDDING_API_KEY` в окружении (503 памяти) —
+   это дефект стенда, не интеграции; до прогона полного сценария требуется задать
+   embedding-провайдер (или локальный stub).
+2. **Ingress в E2E синтетический** (реальный движок/gate/АБС, но не реальный DDG/память);
+   search/memory/travel ingress покрыты юнит-тестами на реальном движке.
+3. **Состояние taint в памяти процесса** (сброс при рестарте) — см. §5, требуется правка
+   `appa-agent-python` (store_path + trajectory_id).
+4. **Audience-измерение не используется** (только Trust), привязка к `customer_id` — P2.
+5. `enforce` без колеса теперь fail-closed (исправлено), но это блокирует **все** gated
+   вызовы при деградации — для продуктового режима нужен метрический алерт «engine unavailable».
+6. Диагностический endpoint существуюет только в isolated-образе (`APPA_TAINT_E2E_HARNESS=1`),
+   в основном образе отвечает 404.
+
+Следующие шаги (по приоритету):
+- P1.1: правка `appa-agent-python` (persistent `store_path` + `trajectory_id`) + пересборка
+  колеса + volume `appa-state` в `docker-compose.appa.yml` + тест «рестарт контейнера →
+  taint сохранился».
+- P1.2: локальный embedding stub (или ключ) для прогона полного `/v1/chat` E2E
+  (реальный ingress search/memory → блокировка перевода).
+- P1.3: egress/metadata: gate на `travel.plan` уже есть; добавить контроль получателя
+  (`$recipient`) и DLP финального текста ответа.
+- P2: PostgreSQL-eventlog + метрики (`openappa_taint_decisions_total{decision,gap}`),
+  CI-прогон `tests/test_appa_taint.py` и `openappa-abl/e2e-gate.py` на каждом PR.
+
+## Побочные эффекты и чистота
+
+- Запущен **один** новый контейнер `agentic-banking-appa-1` (изолированный, `restart: no`);
+  основной стенд не пересобирался и не перезапускался.
+- В ходе E2E выполнена **одна синтетическая операция self-transfer** на канари-пользователе
+  `customer-001` (`account-001 → RU10000000000000000002`, 1.00 RUB) — это рабочие синтетические
+  данные стенда, не реальные средства; загрязнённый перевод **не** выполнен (подтверждено: счёт
+  операций не изменился).
+- Секреты `.env` не выводились (читались только имена ключей и длина значений); токены —
+  краткоживущие, для canary-пользователя.
+- Удаление изолированного стенда: `docker compose -f docker-compose.appa.yml down`
+  (удаляет только этот контейнер; основной стек не затрагивается).
+- Изменения не закоммичены.
+
+## Артефакты
+
+- `services/common/appa_taint.py` — gate с fail-closed + `status()` + `recall_memory` (content-aware).
+- `configs/appa.toml` — политика (14 инструментов).
+- `Dockerfile` (ARG `APPA_TAINT_INSTALL`), `docker-compose.appa.yml` — изолированное развёртывание.
+- `scripts/build_appa_wheel.sh`, `vendor/appa_agent_python-*.whl` — воспроизводимая сборка.
+- `tests/test_appa_taint.py` — 14 тестов (fail-closed/observe/off + реальный движок).
+- `openappa-abl/e2e-gate.py` + `e2e-gate-results.json` — 8/8 PASS в развёрнутом контейнере.
+- `openappa-abl/e2e.py` + `e2e-results.json` — попытка полного `/v1/chat` (заблокирована пустым
+  EMBEDDING_API_KEY, задокументировано).

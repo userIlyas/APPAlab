@@ -1,0 +1,516 @@
+//! Fixtures every integration test binary that declares `mod common;`
+//! compiles into itself. Only what several suites need verbatim lives
+//! here; a stub's own routes and state stay with the suite that reads
+//! them.
+#![allow(dead_code)]
+
+pub mod init_fixture;
+
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
+
+use appa_runtime::api::{OfferId, Runtime};
+use appa_runtime::config::Config;
+use appa_runtime::hooks;
+use appa_runtime_api::{
+    Actor, AdapterName, HookDecision, HookEvent, OutcomeBody, ParseRefusal, PrincipalSource, ProposedCall, ToolOutcome,
+    TrajectoryId, WireDecision, WireEvent,
+};
+
+/// The Claude Code hook JSON a suite is written in, as the served runtime
+/// reads it: translated onto the wire by the client-side codec (as `appa
+/// hook --adapter claude-code` does) and identified by the served
+/// adapter, so the event's tool is the canonical one. `None` for a hook the
+/// codec does not gate.
+pub fn claude_event(hook_json: &serde_json::Value) -> Option<HookEvent> {
+    let body = serde_json::to_vec(hook_json).expect("the event serializes");
+    let event = (appa_adapter_claude_code::codec().parse)(&body).expect("the Claude Code event parses")?;
+    let wire = WireEvent::from_event(AdapterName::ClaudeCode, &event).expect("the event translates");
+    let accepted = wire
+        .into_event(&appa_adapter_claude_code::adapter(), PrincipalSource::None)
+        .expect("the wire event maps")
+        .expect("a translated event is no ping");
+    Some(accepted.event)
+}
+
+/// One Claude Code hook through the served `/hook` dispatcher, wire to wire,
+/// with the wire decision rendered back into Claude Code's hook answer, as
+/// `appa hook` prints it. A refusal before any event
+/// exists comes back as the runtime's `{"error": …}` body.
+pub async fn claude_hook(runtime: &Runtime, hook_json: &serde_json::Value) -> (u16, serde_json::Value) {
+    let codec = appa_adapter_claude_code::codec();
+    let body = serde_json::to_vec(hook_json).expect("the event serializes");
+    let event = match (codec.parse)(&body) {
+        Ok(Some(event)) => event,
+        Ok(None) => return (200, serde_json::json!({})),
+        Err(ParseRefusal::Unreadable { detail }) => return (400, serde_json::json!({ "error": detail })),
+        Err(ParseRefusal::Malformed { detail }) => return (409, serde_json::json!({ "error": detail })),
+    };
+    let wire = WireEvent::from_event(AdapterName::ClaudeCode, &event).expect("the event translates");
+    let wire = serde_json::to_vec(&wire).expect("the wire event serializes");
+    let (status, answer) = hooks::answer(
+        runtime,
+        &appa_adapter_claude_code::adapter(),
+        PrincipalSource::None,
+        &wire,
+    )
+    .await;
+    match serde_json::from_value::<WireDecision>(answer.clone()).map(WireDecision::into_decision) {
+        Ok(Ok(decision)) => (status, (codec.render)(&body, &event, &decision)),
+        _ => (status, answer),
+    }
+}
+
+/// A served `appa runtime` process on a loopback port of its own choosing, killed on drop.
+pub struct ServedRuntime {
+    child: Child,
+    pub url: String,
+}
+
+impl ServedRuntime {
+    /// Whether the runtime process has exited, reaping it when it has.
+    pub fn has_exited(&mut self) -> bool {
+        self.child.try_wait().expect("the child polls").is_some()
+    }
+}
+
+impl Drop for ServedRuntime {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A port free a moment ago, for the one case that has no better: a product path that
+/// binds a URL fixed before it starts (`--ensure-runtime`). Anything else binds port 0
+/// and reads back what it got, or holds a [`RefusingPort`].
+pub fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("an ephemeral port binds");
+    listener.local_addr().expect("the bound address is readable").port()
+}
+
+/// A loopback port that refuses every connection for as long as this lives. It is the
+/// local end of a held connection: no socket listens there, so a connect is refused at
+/// once, and no bind to port 0 is handed it while the connection lasts. A socket bound
+/// without listening would not do: macOS drops the connect until it times out.
+pub struct RefusingPort {
+    local: std::net::TcpStream,
+    _remote: std::net::TcpStream,
+}
+
+impl RefusingPort {
+    pub fn new() -> RefusingPort {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("an ephemeral port binds");
+        let local = std::net::TcpStream::connect(listener.local_addr().expect("the listener has an address"))
+            .expect("the listener accepts");
+        let (remote, _) = listener.accept().expect("the connection is accepted");
+        RefusingPort { local, _remote: remote }
+    }
+
+    pub fn url(&self) -> String {
+        format!(
+            "http://{}",
+            self.local.local_addr().expect("the connection has an address")
+        )
+    }
+}
+
+/// The URL `appa runtime --listen 127.0.0.1:0` prints once it listens, read from the
+/// child's piped stdout. The rest of stdout is drained so the runtime never blocks on it.
+pub fn served_url(child: &mut Child) -> String {
+    use std::io::BufRead;
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("the runtime's stdout is piped"));
+    let (sent, printed) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = stdout.read_line(&mut line);
+        let _ = sent.send(line);
+        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+    });
+    let line = printed
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the runtime printed its URL within the deadline");
+    assert!(!line.is_empty(), "the runtime exited before it listened");
+    line.trim_end().to_string()
+}
+
+/// Start the built binary as `appa runtime` over `config` and `db`, and wait until
+/// `/health` answers.
+pub fn serve_runtime(config: &Path, db: &Path) -> ServedRuntime {
+    let child = appa_runtime::child_process::spawn(
+        Command::new(env!("CARGO_BIN_EXE_appa"))
+            .arg("runtime")
+            .arg("--config")
+            .arg(config)
+            .arg("--db")
+            .arg(db)
+            .arg("--listen")
+            .arg("127.0.0.1:0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .expect("the binary spawns");
+    let mut served = ServedRuntime {
+        child,
+        url: String::new(),
+    };
+    served.url = served_url(&mut served.child);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = served.child.try_wait().expect("the child polls") {
+            panic!("the runtime exited before becoming healthy: {status}");
+        }
+        if http(&format!("{}/health", served.url), "GET", None).is_some() {
+            return served;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("the runtime never became healthy within the deadline");
+}
+
+/// One plain HTTP request; the body on a 2xx answer, `None` otherwise.
+pub fn http(url: &str, method: &str, body: Option<&str>) -> Option<String> {
+    use std::io::{Read, Write};
+    let rest = url.strip_prefix("http://")?;
+    let (host, path) = rest.split_once('/').map(|(h, p)| (h, format!("/{p}")))?;
+    let mut stream = std::net::TcpStream::connect(host).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("the read timeout sets");
+    let body = body.unwrap_or("");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    let (head, payload) = response.split_once("\r\n\r\n")?;
+    head.starts_with("HTTP/1.1 2").then(|| payload.to_string())
+}
+
+/// Fixture arguments, from a `json!` value to the bytes a harness would
+/// have sent. The adapter holds the harness's bytes already, so
+/// production never takes this direction.
+pub fn raw(value: serde_json::Value) -> Box<serde_json::value::RawValue> {
+    serde_json::value::to_raw_value(&value).expect("the fixture serializes")
+}
+
+/// The repository root, for the suites that read the shipped
+/// integration files rather than a fixture of their own.
+pub fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the runtime crate sits one level below the repo root")
+        .to_path_buf()
+}
+
+/// `root` including the shipped battery's rules for the harness's session tools
+/// only: these suites replace the battery's shell and file rules with
+/// deterministic ones of their own. The battery's Annotator declarations stay, so
+/// the root's bindings of them still load.
+pub fn including_session_tool_rules(dir: &Path, root: &str) -> String {
+    let shipped = std::fs::read_to_string(repo_root().join("marketplace/batteries/claude-code/appa.toml"))
+        .expect("the shipped battery is readable");
+    let shipped: toml::Value = toml::from_str(&shipped).expect("the shipped battery parses");
+    let selected = ["Bash", "Monitor", "PowerShell", "Read", "Grep", "Write", "Edit"];
+    let tools: Vec<toml::Value> = shipped["policy"]["tool"]
+        .as_array()
+        .expect("the battery declares tools")
+        .iter()
+        .filter(|rule| {
+            let name = rule["name"].as_str().expect("every rule is named");
+            let tool = name.split('(').next().expect("split yields a first part");
+            !selected.iter().any(|seven| tool == format!("host/claude-code/{seven}"))
+        })
+        .cloned()
+        .collect();
+    let mut policy = toml::Table::new();
+    policy.insert("version".into(), shipped["policy"]["version"].clone());
+    policy.insert("annotator".into(), shipped["policy"]["annotator"].clone());
+    policy.insert("tool".into(), toml::Value::Array(tools));
+    let battery = dir.join("batteries/claude-code");
+    std::fs::create_dir_all(&battery).expect("the battery directory is created");
+    std::fs::write(
+        battery.join("appa.toml"),
+        toml::to_string(&toml::Table::from_iter([(
+            "policy".to_string(),
+            toml::Value::Table(policy),
+        )]))
+        .unwrap(),
+    )
+    .expect("the battery writes");
+    format!("include = [\"batteries/claude-code/appa.toml\"]\n\n{root}")
+}
+
+/// `policy` with its `appa file-tracker` bindings pointed at the built `appa` and at a
+/// tracker configuration under `dir`, whose store is `dir/file-tracker.json`. The runtime
+/// runs `appa` as its own executable, and a suite's runtime runs inside the test binary.
+pub fn with_a_local_file_tracker(dir: &Path, policy: &str) -> String {
+    let config = dir.join("file-tracker.toml");
+    let store = dir.join("file-tracker.json");
+    std::fs::write(&config, format!("store = {:?}\n", store.display().to_string()))
+        .expect("the tracker configuration writes");
+    let shipped = |verb: &str| format!("[\"appa\", \"file-tracker\", {verb:?}]");
+    let local = |verb: &str| {
+        format!(
+            "[{:?}, \"file-tracker\", {verb:?}, \"--config\", {:?}]",
+            env!("CARGO_BIN_EXE_appa"),
+            config.display().to_string()
+        )
+    };
+    assert!(
+        policy.contains(&shipped("annotate")) && policy.contains(&shipped("record")),
+        "the policy binds the file-tracker"
+    );
+    policy
+        .replace(&shipped("annotate"), &local("annotate"))
+        .replace(&shipped("record"), &local("record"))
+}
+
+/// Every offer a feedback body names, in the order the feedback lists
+/// them. Which end a suite takes is its own assertion: a remedy plan
+/// that stages several offers surfaces one line each.
+pub fn offers(feedback: &str) -> Vec<OfferId> {
+    feedback
+        .lines()
+        .filter_map(|line| {
+            let after = line.split("offer_id:").nth(1)?;
+            let rest = after.trim_start().strip_prefix('"')?;
+            Some(OfferId(rest[..rest.find('"')?].to_string()))
+        })
+        .collect()
+}
+
+/// The last offer a feedback body names.
+pub fn last_offer(feedback: &str) -> OfferId {
+    offers(feedback)
+        .last()
+        .cloned()
+        .unwrap_or_else(|| panic!("no offer id in feedback: {feedback}"))
+}
+
+/// The last offer a denial's feedback names that delivers the raw result: the
+/// plain acceptance of a narrowing, or an authority's ruling beside it. A
+/// battery that confines a result also lists its output sanitizers and, for a
+/// tool with effects, withholding after these; a suite with no model to answer
+/// a sanitizer takes the route that needs none.
+pub fn unsanitized_offer_of(decision: &HookDecision) -> OfferId {
+    let HookDecision::DenyCall { feedback, .. } = decision else {
+        panic!("expected a deny carrying feedback, got {decision:?}")
+    };
+    let mut route = "";
+    let mut found = None;
+    for line in feedback.lines() {
+        if line.trim_start().starts_with("- ") {
+            route = line;
+        } else if line.contains("offer_id:") && !route.contains("sanitizer") && !route.contains("withhold") {
+            found = offers(line).pop();
+        }
+    }
+    found.unwrap_or_else(|| panic!("no offer without a sanitizer in feedback: {feedback}"))
+}
+
+/// The last offer a denial's feedback names.
+pub fn offer_of(decision: &HookDecision) -> OfferId {
+    let HookDecision::DenyCall { feedback, .. } = decision else {
+        panic!("expected a deny carrying feedback, got {decision:?}")
+    };
+    last_offer(feedback)
+}
+
+/// The one root trajectory a suite's session runs as. Every suite opens
+/// its own database, so the id needs no suite-specific spelling.
+pub fn root() -> TrajectoryId {
+    TrajectoryId("test-root".to_string())
+}
+
+pub fn actor() -> Actor {
+    Actor {
+        root: root(),
+        child: None,
+    }
+}
+
+/// The root actor proposes one call.
+pub async fn propose(runtime: &Arc<Runtime>, call: ProposedCall) -> HookDecision {
+    hooks::handle(
+        runtime,
+        HookEvent::ToolCall {
+            actor: actor(),
+            call,
+            call_id: None,
+            spawn: None,
+            prompt: None,
+            ruling: None,
+            declares: None,
+        },
+    )
+    .await
+}
+
+/// The root actor reports one call as run with a plain body, and the
+/// runtime acknowledges it.
+pub async fn ran(runtime: &Arc<Runtime>, call: ProposedCall) {
+    assert_eq!(
+        hooks::handle(
+            runtime,
+            HookEvent::ToolResult {
+                actor: actor(),
+                call,
+                call_id: None,
+                outcome: ToolOutcome::Success {
+                    body: OutcomeBody::Available("done".to_string()),
+                },
+            },
+        )
+        .await,
+        HookDecision::Ack
+    );
+}
+
+/// The runtime over the root config at `config`, its store in `dir`, with the suite's
+/// root session started.
+pub async fn session_runtime(dir: &Path, config: &Path) -> Arc<Runtime> {
+    loaded_session_runtime(dir, Config::load(config).unwrap()).await
+}
+
+/// [`session_runtime`] over an already loaded `config`.
+pub async fn loaded_session_runtime(dir: &Path, config: Config) -> Arc<Runtime> {
+    let runtime = Arc::new(Runtime::open(config, dir.join("runtime.db"), None).unwrap());
+    assert_eq!(
+        hooks::handle(
+            &runtime,
+            HookEvent::SessionStart {
+                root: root(),
+                principal: None,
+                address: None,
+                title: None,
+                launch: None,
+                start: None,
+            }
+        )
+        .await,
+        HookDecision::Ack
+    );
+    runtime
+}
+
+/// The shipped `battery` copied verbatim into `dir`, under a root config that includes it
+/// and then declares `root_policy`.
+pub async fn battery_runtime(dir: &Path, battery: &str, root_policy: &str) -> Arc<Runtime> {
+    let include = format!("marketplace/batteries/{battery}/appa.toml");
+    let target = dir.join(&include);
+    std::fs::create_dir_all(target.parent().expect("the battery file sits in a directory")).unwrap();
+    std::fs::copy(repo_root().join(&include), target).unwrap();
+    let path = dir.join("appa.toml");
+    std::fs::write(&path, format!("include = [\"{include}\"]\n\n{root_policy}")).unwrap();
+    session_runtime(dir, &path).await
+}
+
+/// A loopback audience source answering every collection with one fixed roster, for a
+/// battery whose `internal` reads need a source to narrow onto.
+pub async fn members_source() -> String {
+    let router = axum::Router::new().route(
+        "/audience",
+        axum::routing::post(|_body: String| async move {
+            serde_json::json!({ "version": 1, "answer": { "members": ["alice@corp.example"] } }).to_string()
+        }),
+    );
+    format!("{}/audience", serve(router).await)
+}
+
+pub fn audit_len(runtime: &Runtime) -> usize {
+    runtime.audit(&root()).expect("the audit reads").len()
+}
+
+/// Serve one router on an ephemeral loopback port for the rest of the
+/// test, and answer with its base URL.
+pub async fn serve(router: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("an ephemeral loopback port binds");
+    let addr = listener.local_addr().expect("the bound address is readable");
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("the stub serves");
+    });
+    format!("http://{addr}")
+}
+
+/// A fake `claude` executable running `script` in place of the model, for the built-in
+/// Claude Code annotator's `[externals.claude_code] command`.
+#[cfg(unix)]
+pub fn fake_claude(dir: &Path, script: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-claude");
+    std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("the fake claude writes");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("the fake claude is executable");
+    path
+}
+
+/// A fake `claude` that answers from a file: it reads its next structured answer from
+/// `answer.json` and keeps the prompt it was asked in `prompt.txt`, so a suite sets the
+/// answer before a call and reads what the annotator was asked after it.
+#[cfg(unix)]
+pub struct Classifier {
+    answer: PathBuf,
+    prompt: PathBuf,
+}
+
+#[cfg(unix)]
+impl Classifier {
+    /// Write the fake `claude` into `dir` and answer its path beside the classifier.
+    pub fn install(dir: &Path) -> (PathBuf, Classifier) {
+        let classifier = Classifier {
+            answer: dir.join("answer.json"),
+            prompt: dir.join("prompt.txt"),
+        };
+        let command = fake_claude(
+            dir,
+            &format!(
+                "cat > {prompt}\ncat {answer}",
+                prompt = classifier.prompt.display(),
+                answer = classifier.answer.display(),
+            ),
+        );
+        (command, classifier)
+    }
+
+    /// The next structured answer: its delta, its requirements, and the effects it emits.
+    pub fn answers(&self, delta: serde_json::Value, requires: serde_json::Value, emits: &[&str]) {
+        let structured = serde_json::json!({ "delta": delta, "requires": requires, "emits": emits });
+        std::fs::write(
+            &self.answer,
+            serde_json::json!({ "structured_output": structured }).to_string(),
+        )
+        .expect("the answer is written");
+    }
+
+    /// What the classifier was last asked, empty when it never ran.
+    pub fn prompt(&self) -> String {
+        std::fs::read_to_string(&self.prompt).unwrap_or_default()
+    }
+}
+
+/// The include line of a deployment without file tracking: the `coding` battery and the
+/// shipped Claude Code battery, whose map binds the `coding` rules to Claude Code's native
+/// shell and file tools, written into `dir`. With the `file-tracker` battery left out, its map
+/// onto those tools binds nothing, so a call to one matches a coding rule first.
+pub fn including_coding_on_native_claude_code_tools(dir: &Path) -> &'static str {
+    for battery in ["coding", "claude-code"] {
+        let target = dir.join("batteries").join(battery);
+        std::fs::create_dir_all(&target).expect("the battery directory is created");
+        std::fs::copy(
+            repo_root()
+                .join("marketplace/batteries")
+                .join(battery)
+                .join("appa.toml"),
+            target.join("appa.toml"),
+        )
+        .expect("the battery file is copied");
+    }
+    "include = [\"batteries/coding/appa.toml\", \"batteries/claude-code/appa.toml\"]\n"
+}

@@ -1,0 +1,53 @@
+name: Deploy to Vercel
+
+# Deploys production via the Vercel CLI on pushes to main, instead of the
+# Vercel Git integration, so commit authors do not need to be members of the
+# Vercel team (which is billed per-seat). Git-triggered deployments are
+# disabled in website/vercel.json.
+#
+# We intentionally use plain `vercel deploy` (source upload + remote build)
+# rather than `vercel pull`/`vercel build`/`deploy --prebuilt`: the token is
+# scoped to the team for least privilege, and team-scoped tokens cannot call
+# the team-metadata endpoint that `pull`/`build` require (403
+# team_unauthorized). `deploy` is the only CLI command with an owner-lookup
+# fallback for this. Builds therefore run on Vercel's infra, same as the Git
+# integration did. The CLI runs from the repository root; the project's Root
+# Directory setting (website) is applied server-side.
+#
+# Required configuration:
+#   VERCEL_TOKEN      - secret in the `production` environment (main only):
+#                       Vercel API token scoped to the team
+#   VERCEL_ORG_ID     - repository variable: "orgId" from `vercel link`
+#                       (.vercel/project.json)
+#   VERCEL_PROJECT_ID - repository variable: "projectId" from `vercel link`
+#                       (.vercel/project.json)
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-production:
+    name: Deploy Production
+    runs-on: ubuntu-latest
+    environment: production # Holds the Vercel token; deploys from main only.
+    timeout-minutes: 20
+    concurrency:
+      group: "vercel-production"
+      cancel-in-progress: false
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Deploy production
+        uses: archestra-ai/.github/actions/vercel-deploy@v1.13.6
+        with:
+          token: ${{ secrets.VERCEL_TOKEN }}
+          org-id: ${{ vars.VERCEL_ORG_ID }}
+          project-id: ${{ vars.VERCEL_PROJECT_ID }}

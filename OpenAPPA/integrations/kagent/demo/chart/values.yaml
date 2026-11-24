@@ -1,0 +1,76 @@
+# The kagent ModelConfig already used by appa-guide. The kagent release owns
+# its provider credentials; this chart never creates or copies them.
+modelConfig:
+  name: default-model-config
+
+# The appa-runtime release owns the runtime, policy, persistence, and
+# appa-guide. This chart only points its demo Agents at that existing Service.
+runtime:
+  url: http://appa-runtime.appa.svc.cluster.local:18787
+  # Fills the OpenAI model's reasoning_effort when the ModelConfig leaves
+  # it unset (APPA_KAGENT_OPENAI_REASONING_EFFORT on every agent).
+  reasoningEffort: ""
+
+# Deterministic demo-only implementations of the policy's Annotator,
+# sanitizers, and non-HITL Authorities. The shared runtime invokes these
+# through local command adapters; the service never owns runtime resources.
+mocks:
+  image:
+    repository: ghcr.io/archestra-ai/appa-demo-mocks
+    tag: ""
+    pullPolicy: IfNotPresent
+    # Release charts pin the released digest; empty uses the tag.
+    digest: ""
+  # Seconds a change-board consult waits for a member's ruling before it
+  # answers nothing. The chart adds five seconds for the HTTP client and
+  # five more for the runtime consult, with a 30-second runtime minimum.
+  # At most 280 seconds, below the plugins' 300-second remedy-call limit.
+  approvalWindowSeconds: 120
+
+tools:
+  image:
+    repository: ghcr.io/archestra-ai/appa-demo-tools
+    tag: ""
+    pullPolicy: IfNotPresent
+    # Release charts pin the released digest; empty uses the tag.
+    digest: ""
+
+# The delegated children. The policy names each child by its canonical
+# id, `agent/<namespace>/<childName>`. The chart renders those ids from
+# the release namespace and these values (templates/_helpers.tpl). Every
+# agent name here must
+# be a DNS-1123 label (values.schema.json). The chart fails to render
+# when two of these names coincide: cluster-ops, release-manager,
+# childName, go.childName, and, with go.enabled, go.name and
+# go.undeclaredName. The policy declares both children even without
+# the go cell, so go.childName stays in the set.
+
+agents:
+  # The python child cluster-ops delegates to.
+  childName: log-analyst
+  # The go cell: a twin of cluster-ops on kagent's go runtime, gated by
+  # the go plugin. On kagent 0.9.12, the controller derives its image
+  # from controller.agentImage by replacing the last path segment with
+  # `golang-adk`, so the alias must be published beside appa-kagent-adk.
+  go:
+    enabled: false
+    name: cluster-ops-go
+    # Its delegated child on the go runtime too, so the fork's child side
+    # is exercised on the go plugin as well.
+    childName: log-analyst-go
+    # An agent the policy never names, listed by the go parent: the
+    # blocked-delegation case on the go cell.
+    undeclaredName: release-manager-go
+
+# The showcase chats: real transcripts of every demo case, replayed into
+# kagent's session store after install so the dashboard opens with the
+# cases already on screen. Idempotent across upgrades.
+seed:
+  enabled: true
+  # The dashboard's user; kagent's unsecure auth mode names it so.
+  user: admin@kagent.dev
+  controllerUrl: ""    # defaults to kagent-controller in the release namespace
+  image:
+    repository: python
+    tag: 3.13-slim
+    pullPolicy: IfNotPresent

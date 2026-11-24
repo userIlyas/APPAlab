@@ -1,0 +1,38 @@
+[package]
+name = "website-chat-playground"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The chat-playground service: multi-turn sessions over the appa-example-agent loop, corp tools in-process, one SSE stream per turn"
+
+[dependencies]
+appa-runtime = { package = "appa", path = "../appa-runtime", default-features = false }
+appa-policy = { path = "../appa-policy" }
+appa-engine = { path = "../appa-engine" }
+appa-example-agent = { path = "../appa-example-agent" }
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio-util = "0.7"
+tokio-stream = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = { workspace = true }
+anyhow = "1"
+thiserror = "2"
+# Unguessable session ids.
+getrandom = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+# Drive the router as the tower service it is, and read one turn's SSE body
+# frame by frame. Both already ride in under axum.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# The schema of `WireEvent`, rendered into the website's copy of it. Already
+# in the tree through appa-runtime.
+schemars = "1"
+
+[[bin]]
+name = "appa-demo"
+path = "src/main.rs"

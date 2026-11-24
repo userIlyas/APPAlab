@@ -1,0 +1,370 @@
+# Claude Code
+
+You run in a Claude Code session protected by APPA: the installed `appa`
+binary is registered in the user's Claude Code settings as the session's
+hooks, and its runtime serves the `appa` MCP server. This reference
+carries the Claude Code mechanics; the router skill you came from carries
+the mode, and the core rules above carry the shared policy-writing rules.
+
+The session started with advice not to read or change the policy outside
+this skill. This skill is where that work happens: follow this reference
+while it runs.
+
+## Operations
+
+The core rules name operations. On Claude Code they are:
+
+| Operation | On Claude Code |
+|---|---|
+| Read the policy | `appa describe --config <live-path>`, with `--session-tools` for the tools in question, then the root config and the relevant included files. |
+| Publish a change | Edit the root config, or run `appa battery install` or `appa battery remove`, then reload as **Reload and finish** shows. |
+| Run the runtime's remedy tool | Call `execute_remedy_plan` on the `appa` MCP server. |
+
+## Read sources
+
+For OpenAPPA configuration, read only:
+
+- the output of `appa describe --config <live-path>`;
+- the live root config and included files relevant to the request;
+- a matched battery's `appa.toml`, `appa-package.toml`, and README;
+- `appa battery status --config <live-path> --json` for credential and dependency status;
+- the relevant section of the policy-review guide the install wrote beside
+  this skill, at `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/appa-guide/references/contracts.md`.
+
+If the installed guide or battery files are missing or these sources do
+not establish the syntax or behavior, stop and report an incomplete
+installation. Do not fetch a different OpenAPPA version or search the
+repository for an answer. Never search a checkout, inspect source code,
+tests, Git history, or implementation details.
+
+## Find the live config
+
+Run `appa describe` first. Use the complete path on its `Config:` line, including
+spaces. This is the installed deployment path and follows `APPA_CONFIG` and
+`APPA_CONFIG_DIR` when either is set.
+
+Then run:
+
+```sh
+ps ax -o command | grep '[a]ppa runtime'
+```
+
+If a running process visibly names a different `--config` path, stop and ask
+the user which deployment to configure. Do not split an unquoted path on
+spaces. If no runtime is running, continue with the path reported by `appa
+describe`; initialization has already established it.
+
+The runtime address is
+`${APPA_RUNTIME_URL:-http://127.0.0.1:8787}`.
+
+## Checkup (`init`)
+
+### Inspect
+
+1. List every tool this session can call: Claude Code's built-ins (`Glob`,
+   `Read`, `Edit`, ...) and every MCP tool, spelled `mcp__<server>__<tool>`.
+   A deferred tool counts: its name is enough.
+2. Run:
+
+   ```sh
+   appa describe --config <live-path> --session-tools <name>,<name>,...
+   ```
+
+   with every name from step 1, comma-separated. Record:
+   - the config state, included batteries, Authorities, audience sources,
+     and named audiences;
+   - `MCP servers`: every server configured on this machine or seen in this
+     session;
+   - the batteries that cover them, with the exact command that includes
+     them and the credential each one reads;
+   - `MCP servers without a battery`;
+   - `Session tools`: how many tools a rule covers, which ones the Annotator
+     judges call by call (each such call may ask the user), and which ones
+     are refused because no rule covers them.
+3. Read the root config. Record its tool rules and included batteries, and
+   preserve its comments. If `appa describe` and the file disagree, stop and
+   report the mismatch instead of guessing.
+4. A server `appa describe` lists but whose tools this session does not see
+   is configured but not inspectable here. Do not invent its tool list.
+
+The policy names an MCP tool by its canonical id `mcp/<server>/<tool>`, split
+at the first `__` after `mcp__`; a plugin-provided server is
+`mcp/plugin_<plugin>_<server>/<tool>`. A Claude Code built-in is
+`host/claude-code/<name>`. `appa describe` prints canonical ids. Keep each
+exact tool description from the session.
+
+### Batteries
+
+For each battery `appa describe` suggests, read only its `appa.toml`, `appa-package.toml`, and
+README in the deployment's store, `<config-dir>/batteries/<name>/`, where
+`<config-dir>` holds the live config. Do not run its scripts directly; use the bounded `appa battery status --check` readiness checks. If that
+directory is missing, stop and report an incomplete installation. Never
+configure one APPA build with batteries fetched from another version.
+
+Name each credential variable `appa describe` reports. Before the proposal,
+run `appa battery status --config <live-path> --battery <name>,<name> --json --check`
+for every suggested and every included battery. An environment value takes
+precedence over a saved database value. A missing variable can still work
+through a battery's declared CLI authentication fallback; only `--check`
+verifies that fallback, because executable presence alone is not login.
+Check what each battery's README expects the root config to provide, and record
+anything missing. Only name a group if `appa describe` lists it as a named
+audience or the proposal configures an audience source for it.
+
+### Shell commands and files
+
+The Claude Code battery confines every shell command, `Bash` or SafeBash, to
+the files and hosts it declares, and blocks `PowerShell`, `Monitor`, `Grep`
+and `NotebookEdit`. Propose no rule and no Annotator hint for those tools. A command that declares `network_hosts` requires
+public data, and its result is `suspicious`. When the user's work needs a
+known host for `self` or `internal` data, propose a root rule such as
+`host/claude-code/Bash(network_hosts:*.corp.example)` with `annotator` and
+`recorder` set to `file-tracker` and the readers that host may receive.
+Recommend a service's MCP battery when the user needs rules for the service
+itself. `Read`, `Write` and `Edit` go through the file-tracker. Label
+paths in `~/.config/appa/file-tracker.toml`, never with root `Read`, `Write`
+or `Edit` rules: a root rule for those tools precedes the battery's and
+stops the file-tracker from recording the label. These rules come from the
+`file-tracker` battery. When the user wants file tracking off, for example
+because confined shell commands block their work, propose
+`appa battery remove file-tracker`; `appa battery install file-tracker`
+turns it on again.
+
+### Remaining tools
+
+Draft rules for the remaining tools as **Cover the remaining tools** in the
+core rules describes. On this host, they are the tools `appa describe` reports
+as annotated call by call or refused, and that no suggested battery covers.
+Ask about unclear servers as **Ask about ambiguity** describes.
+
+For Gmail, match only exact tools visible in this session whose canonical ids
+start with `mcp/claude_ai_Gmail/`; do not assume a fixed connector tool list. Mail
+the requester reads is `self` data. Checking a named recipient against `self`
+or `internal` requires an audience source, and an email domain is not one.
+This boundary answer is separate from approval to write or install anything.
+
+### Propose, then apply
+
+For an operator new to APPA, open with **How APPA works here**: ideas 1 to 4
+of **Talk to the operator**, one short bullet each with an example from this
+session's tools, and that the status line shows the session's trust and
+audience.
+
+Then give one line on the current state: protected or not, and which
+batteries are included. Then group the proposal by server. Show:
+
+- batteries to include, each with its explanation;
+- rules for the remaining tools, and how those tools will behave;
+- existing behavior that stays unchanged, but only when it affects the result;
+- tools the proposal leaves to the Annotator (judged call by call, which may
+  ask the user) or refused, only when there are any;
+- every configured MCP server whose tools could not be inspected: "<server>
+  is configured, but I could not inspect its tools in this session."
+
+At the end of the proposal, add **Needed setup** when any required support is
+missing. Show a table with the columns Battery and Setup, one row per battery
+that `--check` does not report `ready`. Setup is the sign-in command, or "a
+token on a local page". Never list a battery that is ready or needs no setup,
+such as one ready through a CLI sign-in. Under the table, say that setup runs
+after approval and that the user can skip any one step. Also list there every
+other missing requirement with its concrete fix. For example: "Slack needs your
+approval before publishing, but approval is not set up yet. I'll add it." Do
+not merely report "no HITL authority," and do not mix missing requirements
+with unchanged rules.
+
+Close with one plain sentence: "You can ask later to change what requires
+approval or what gets blocked." Keep specific tuning options for when the
+user asks for a change.
+
+End with: **Approve, or tell me what to change.** Wait for the reply.
+
+When nothing is missing and every session tool has a rule, say so in one or
+two sentences and mention tuning in one line, without approval language.
+
+After approval:
+
+1. Run `appa describe --config <live-path> --session-tools ...` again. If the
+   config, batteries, Authorities, audience sources, or named audiences
+   changed since the proposal, revise the proposal and ask for approval again.
+2. Resolve the missing prerequisites of every approved battery before including
+   it, and of every already-included battery that is not `ready`. Run
+   `appa battery status --config <live-path> --battery <name>,<name> --json --check`.
+   First, in one short message, list the setup steps ahead as a numbered
+   list, one line each (for example "1. GitHub sign-in 2. Slack token"), and
+   say that the batteries are included after them. For an operator new to
+   APPA, add that APPA asks each provider itself rather than through Claude's
+   connection, and that the token page keeps tokens in OpenAPPA's local
+   credential store, not the config. Then work through each
+   battery that is not `ready` in chat, one prerequisite per message. Start
+   the next only after the current one is ready or skipped. Open every step
+   message with its name and number, then one or two short sentences on why,
+   written from the battery's `benefit` in the status JSON: what APPA asks
+   the provider, what that does for the user's data, and what stops working
+   if the user skips it. For example:
+
+   > **Slack token (2 of 2).** With this token, APPA asks Slack who can read
+   > each channel. Channel text then goes only to people who can already
+   > read it.
+
+   Then give the step:
+   - A missing program (a `dependencies` entry with `installed: false`): tell
+     the user what to install. Check again after they reply.
+   - A CLI sign-in (an installed `alternatives` entry): offer only the
+     sign-in first. Ask the user to run its `login_hint` with the `!` prefix,
+     for example `! gh auth login -s user:email`, and to say "done". Do not
+     show token steps or start a token page in that message. Never run the
+     sign-in yourself. Also add "or say **skip** to set up <Battery>
+     later". Then check that battery again. Only when it is still
+     not ready, or the user says the sign-in does not work, continue with the
+     token below. A battery whose CLI is not installed goes to the token
+     directly.
+   - A token: give the battery's `setup` steps as a short numbered list, and
+     run this in the background:
+
+     ```sh
+     appa ui --config <live-path> --battery <name> --no-open
+     ```
+
+     Give the URL it prints as a link, and add "or say **skip** to set up
+     <Battery> later". The page shows only the token field. When the battery
+     is ready, the command prints the
+     battery's sanitized status as JSON and exits, and its exit brings you
+     back. Continue from that JSON; do not ask the user if they are done. If a
+     check fails, the page stays open and shows why. If the user says skip,
+     stop the command. A skip applies only to this battery; continue with
+     the next step. After 15 minutes the command exits with an error;
+     treat that as a skip. A skipped battery is still included, because its
+     rules need no token. Leave out only the parts that need the token: the
+     audience mapping in step 5, and any other part a reload refuses without
+     the token.
+
+   Never ask for tokens in chat, read the credential database, or put token values
+   in shell commands or configuration files. Saving reloads a running runtime; if
+   none is running, the next session starts it with the saved credentials.
+   A `ready` result with reason `configured` means the battery's executables
+   exist and its tokens are set, but no provider check ran; do not claim its
+   provider access was tested.
+3. Include each approved battery with the command `appa describe` printed:
+   `appa battery install <name> --config <live-path>`, with
+   `--server <connection-id>` when it names one. The command adds the
+   battery's `appa.toml` to the root `include` list, validates the result, and
+   reloads the runtime. Never copy a
+   battery directory: the store beside the config already holds every battery
+   of the installed version.
+4. Add the root support each battery requires, as **Battery support** in
+   the core rules describes.
+5. Name each battery's credential variable and add its audience mapping, as
+   **Battery support** describes. On this host the runtime supplies the
+   variable from its environment or the local credential database. Skip the
+   mapping for a battery whose token was skipped.
+6. Add the approved rules for the remaining tools to the root config.
+7. Reload and report the result as described below. When the battery's
+   README names a replay trace, offer
+   `appa replay --config <live-path> <trace>` as the check that the
+   composed config decides as the README states.
+
+## Adjust the current config
+
+Start from the user's requested outcome, not from a full tool rescan.
+
+If the requested outcome is ambiguous, ask one focused question and wait. Do
+not guess.
+
+1. Run `appa describe --config <live-path>`, adding `--session-tools` with the
+   tools the request is about. Record the config state, batteries, policy
+   tools, Authorities, audience sources, and named audiences.
+2. Read the root config and only the included files relevant to the requested
+   changes.
+3. For policy syntax or behavior that the current config does not demonstrate,
+   first consult the relevant section of the policy-review guide at
+   `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/appa-guide/references/contracts.md`.
+   If it is unavailable or does not answer the question, stop and report an
+   incomplete installation. Do not guess syntax, fetch another version, search
+   for an OpenAPPA checkout, or inspect source code.
+4. Explain what happens now, what you propose, and the practical effect.
+   Ask only for a decision that changes the result.
+5. If a battery would help, propose it as **Propose a battery** in the core
+   rules describes. Existing root rules still take priority.
+6. End with: **Approve, or tell me what to change.** Wait for the reply.
+7. Run `appa describe --config <live-path>` again. If the config, batteries,
+   Authorities, audience sources, or named audiences changed since the
+   proposal, revise the proposal and ask for approval again.
+8. Resolve the prerequisites with the chat setup flow above, for each newly
+   approved battery and for each included battery the request names that is
+   not ready. When an included battery becomes ready, add what was left out
+   without its token, such as its audience mapping. Include each newly
+   approved battery with
+   `appa battery install <name> --config <live-path>`, as in the checkup, and
+   add the root support, credential variable, and audience mapping it
+   requires. To take one out, use
+   `appa battery remove <name> --config <live-path>`.
+9. Apply only the approved root-rule changes.
+10. Reload and report the result as described below.
+
+## Tuning options
+
+The defaults are a middle ground: a normal coding session keeps running, and
+the common ways private data leaks or outside text steers the agent are
+caught. Offer these options when the user asks for a change they fit, as
+**Tune the defaults** in the core rules describes.
+
+Looser:
+
+| Option | Change | Cost |
+|---|---|---|
+| `trust-server <server>` | Static rules with `delta = {}` for the server's tools, in place of the Annotator's call-by-call judgment or a battery's `suspicious`. | Text other people write there reaches the session at full trust. |
+| `trusted-sites <domains>` | `host/claude-code/WebFetch(url:https://<domain>/*)` with the root WebFetch rule's `requires` and `delta = {}`, placed before the root WebFetch rule. | Anyone who can edit those pages can steer the agent. |
+
+Stricter:
+
+| Option | Change | Cost |
+|---|---|---|
+| `no-fallback` | Remove the root's `name = "*"` rule and its `claude-code.undeclared-tool` Annotator. Tools no rule covers are refused. | A newly added MCP server does nothing until `/appa-guide` writes rules for it. |
+| `no-leak-approvals` | Remove `audience_missing` from the `hitl` Authority's permits. A call that would send private data where a wider audience can read it is refused instead of asking. | Deliberately sharing private data needs a policy change first. |
+| `private-folders <paths>` | A `[[path]]` rule per path in `~/.config/appa/file-tracker.toml` with the absolute `pattern = "<path>/*"` and `audience = ["self"]`. | After reading those folders, public sends need approval or are refused. |
+| `suspicious-server <server>` | Static rules with `delta = { trust = "suspicious" }` for the server's tools. | Once the agent reads that server, writes to its own instructions and other trusted-only actions ask the user. |
+
+## Explain a block
+
+1. Find the blocked call: the `[appa] Blocked` text in this conversation, or
+   what the user pastes. Take the tool name, its arguments, and the `Why`
+   lines. If neither is available, ask the user to paste the block.
+2. Run `appa describe --config <live-path> --session-tools <tool>` to see
+   whether a rule covers the tool, the Annotator judges it, or nothing covers it.
+3. Continue with **Explain a block** in the core rules.
+
+## Reload and finish
+
+Reload only after an approved write:
+
+```sh
+curl --fail-with-body -sS -X POST \
+  "${APPA_RUNTIME_URL:-http://127.0.0.1:8787}/reload"
+```
+
+Briefly say what succeeded. If something failed, say what, and whether the
+file was restored.
+If the fix changes who may receive information, say how before asking for
+approval. Describe only behavior supported by the README or observed results.
+
+Do not repeat what each battery does.
+
+For each battery whose setup was skipped, add one short group:
+"**<Battery> <token or sign-in> not set.** The <Battery> battery is
+included. Until you set it:" then one or two bullets from the battery's
+README on what does not work, then "To set it later:
+`/appa-guide set up the <Battery> <token or sign-in>`." The skip was the
+user's choice: do not call the setup unfinished.
+
+After a successful reload, add:
+
+> The updated policy is in effect: this session and every other protected
+> session decide their next tool call under it.
+
+For an operator new to APPA, end with **When something is blocked**:
+Claude shows `[appa] Blocked` with the reason and the ways forward before the
+call runs; `/appa-guide why was this blocked` explains it, `/appa-guide
+adjust` changes the rule, and `/clear` starts a clean label. With
+`file-tracker` included, add that files keep the label of the session that
+wrote them. Add that after adding an MCP server, the user runs `/appa-guide`
+again; until then a model judges each of its calls and may ask them.

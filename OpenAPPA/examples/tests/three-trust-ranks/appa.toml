@@ -1,0 +1,28 @@
+# A trust chain with three ranks. Content lowers the trajectory to the rank of
+# its source; a sink needs at least its declared rank.
+
+[policy]
+version = 2
+trust_chain = ["untrusted", "vendor", "internal"]
+
+[[policy.tool]]
+name = "mcp/docs/read_vendor_doc"
+delta = { trust = "vendor" }
+
+[[policy.tool]]
+name = "mcp/mail/read_inbound"
+delta = { trust = "untrusted" }
+
+[[policy.tool]]
+name = "mcp/shell/run_command"
+requires = { trust = "internal" }
+delta = {}
+
+[[policy.tool]]
+name = "mcp/slack/post_message"
+requires = { trust = "vendor" }
+delta = {}
+
+[externals]
+timeout_ms = 2000
+max_body_bytes = 65536

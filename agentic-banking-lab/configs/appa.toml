@@ -1,0 +1,90 @@
+# OpenAPPA policy for the Agentic Banking Lab (trust dimension).
+#
+# Recoverable Information-Flow Control: a tool result with a non-empty `delta`
+# *narrows* the conversation's label, so the engine first refuses the call and
+# surfaces a remedy ("accept the narrowing").  A tool with `requires` states a
+# floor the conversation's label must still satisfy for the call to run.
+#
+# Tool names here are canonical (<namespace>.<tool>) as produced by
+# services/common/appa_taint.py:
+#   abs.*    -> shared ABS MCP (get_customer_info, ..., create_transfer, ...)
+#   search.* -> DuckDuckGo MCP (news_search, text_search)
+#   memory.recall / memory.untrusted -> long-term memory recall; the recall
+#            itself is a trusted read, while `memory.untrusted` is a synthetic
+#            narrowing emitted only when the recalled records are marked untrusted
+#   travel.plan   -> external travel partner A2A (its answers are untrusted)
+
+version = 2
+trust_chain = ["suspicious", "trusted"]
+
+# ---------------------------------------------------------------------------
+# Untrusted ingress: the bytes can carry injected instructions, so admitting
+# them lowers the conversation trust trusted -> suspicious.
+# ---------------------------------------------------------------------------
+[[tool]]
+name = "search.text"
+delta = { trust = "suspicious" }
+
+[[tool]]
+name = "search.news"
+delta = { trust = "suspicious" }
+
+[[tool]]
+name = "memory.recall"
+delta = {}
+
+[[tool]]
+name = "memory.untrusted"
+delta = { trust = "suspicious" }
+
+[[tool]]
+name = "travel.plan"
+delta = { trust = "suspicious" }
+
+# ---------------------------------------------------------------------------
+# Trusted ABS reads. They expose sensitive bank data but do not import untrusted
+# bytes, so `delta = {}` leaves the conversation label unchanged.
+# ---------------------------------------------------------------------------
+[[tool]]
+name = "abs.get_customer_info"
+delta = {}
+
+[[tool]]
+name = "abs.get_customer_accounts"
+delta = {}
+
+[[tool]]
+name = "abs.get_operations_history"
+delta = {}
+
+[[tool]]
+name = "abs.get_account_statement"
+delta = {}
+
+[[tool]]
+name = "abs.get_portfolio"
+delta = {}
+
+[[tool]]
+name = "abs.list_investment_products"
+delta = {}
+
+# ---------------------------------------------------------------------------
+# Irreversible money movement: hard trust floor.  Once the conversation has
+# admitted untrusted data (search/memory/travel), these are refused even if the
+# surrounding flows or a spoofed confirmation would otherwise let them through.
+# ---------------------------------------------------------------------------
+[[tool]]
+name = "abs.create_transfer"
+requires = { trust = "trusted" }
+delta = {}
+
+[[tool]]
+name = "abs.pay_service"
+requires = { trust = "trusted" }
+delta = {}
+
+[[tool]]
+name = "abs.buy_investment_product"
+requires = { trust = "trusted" }
+delta = {}

@@ -1,0 +1,16 @@
+# Replay the Hugging Face battery against real repositories. The battery's
+# two annotators ask the Hub for each named repository's visibility; the
+# trace checks the resulting trust and audience with `appa/do_something`.
+include = ["../../../marketplace/batteries/huggingface/appa.toml"]
+
+[policy]
+version = 2
+trust_chain = ["suspicious", "trusted"]
+
+# Searches and private repositories stay with the viewer: the token's own reader.
+[policy.audience]
+self = ["huggingface:viewer"]
+
+[externals]
+timeout_ms = 30000
+max_body_bytes = 1048576

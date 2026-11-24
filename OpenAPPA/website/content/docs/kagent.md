@@ -1,0 +1,373 @@
+---
+title: kAgent
+nav_title: kAgent
+category: Works with
+order: 7
+description: Protect kagent declarative Python and Go Agents with OpenAPPA policy.
+---
+
+[kagent](https://kagent.dev/docs/kagent/0.x/introduction/what-is-kagent/) runs AI agents natively on [Kubernetes](https://kubernetes.io/docs/home/). OpenAPPA adds flow control to these [Agents](https://kagent.dev/docs/kagent/0.x/concepts/agents/), checking tool calls, subagents, and data flows against deterministic policy before any action runs.
+
+## How it works
+
+:::fig-kagent:::
+
+The OpenAPPA plugin checks tool calls before dispatch and checks returned values before they enter the agent's context:
+
+- **Enforce policy:** Denied actions stop immediately. When human review is required, kagent requests approval in chat or through the Agent-to-Agent (A2A) protocol.
+- **Isolate subagents:** Subagent outputs are validated against policy before the parent agent can see them.
+- **Shared runtime:** Agents connect to an `appa-runtime` service that evaluates policy and records audit logs. New chats follow its published policy revisions. A policy change reaches their next tool call.
+
+The plugin runs inside the Python or Go agent image. The separate `appa-runtime` chart owns policy evaluation and storage. The `appa-kagent-demo` chart supplies demo agents, fixture tools, and an inert policy template; it does not own the shared runtime. Batteries supply policy defaults, not agent runtimes or MCP servers.
+
+## Quickstart
+
+This quickstart deploys the kagent controller, the OpenAPPA runtime, and demo agents configured for the showcase scenarios below.
+
+*(Already running kagent? Skip to [Protect existing agents](#protect-existing-agents).)*
+
+#### Prerequisites
+
+- [kind](https://kind.sigs.k8s.io/docs/user/quick-start/) (or any local [Kubernetes cluster](https://kubernetes.io/docs/setup/)), [Helm](https://helm.sh/docs/intro/install/) v4, and [kubectl](https://kubernetes.io/docs/tasks/tools/).
+- An [OpenAI API key](https://platform.openai.com/api-keys) (or another [supported provider](https://kagent.dev/docs/kagent/0.x/supported-providers/)).
+
+#### 1. Deploy the demo stack
+
+Export your OpenAI API key:
+
+```sh
+export OPENAI_API_KEY="your-api-key"
+```
+
+OpenAPPA publishes its images to `ghcr.io/archestra-ai/<image>` and its charts to `ghcr.io/archestra-ai/charts/<chart>`. A `v<version>` image tag never moves. `latest` names the newest stable release. Each chart pulls its images by the digest released with it. `ghcr.io/archestra-ai/ci/<image>` holds unreleased builds of `main`.
+
+Deploy the demo:
+
+```sh
+APPA_VERSION=0.46.1 # x-release-please-version
+KAGENT_VERSION=0.9.12
+KAGENT_NAMESPACE=kagent
+
+kubectl config current-context
+
+helm upgrade --install kagent-crds oci://ghcr.io/kagent-dev/kagent/helm/kagent-crds \
+  --version "$KAGENT_VERSION" -n "$KAGENT_NAMESPACE" --create-namespace \
+  --force-conflicts --wait --timeout 10m
+
+kubectl create secret generic kagent-openai -n "$KAGENT_NAMESPACE" \
+  --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+helm upgrade --install kagent oci://ghcr.io/kagent-dev/kagent/helm/kagent \
+  --version "$KAGENT_VERSION" -n "$KAGENT_NAMESPACE" \
+  --set registry=ghcr.io \
+  --set kmcp.podSecurityContext.runAsUser=65532 \
+  --set kmcp.podSecurityContext.runAsGroup=65532 \
+  --set controller.agentImage.registry=ghcr.io \
+  --set controller.agentImage.repository=archestra-ai/appa-kagent-adk \
+  --set-string controller.agentImage.tag="v$APPA_VERSION" \
+  --set providers.default=openAI \
+  --set-string providers.openAI.apiKeySecretRef=kagent-openai \
+  --set-string providers.openAI.apiKeySecretKey=OPENAI_API_KEY \
+  --set-string providers.openAI.model=gpt-5.6-terra \
+  --set k8s-agent.enabled=false \
+  --set kgateway-agent.enabled=false \
+  --set istio-agent.enabled=false \
+  --set promql-agent.enabled=false \
+  --set observability-agent.enabled=false \
+  --set argo-rollouts-agent.enabled=false \
+  --set helm-agent.enabled=false \
+  --set cilium-policy-agent.enabled=false \
+  --set cilium-manager-agent.enabled=false \
+  --set cilium-debug-agent.enabled=false \
+  --set grafana-mcp.enabled=false \
+  --set querydoc.enabled=false \
+  --force-conflicts --wait --timeout 10m
+
+helm upgrade --install appa-kagent-demo \
+  oci://ghcr.io/archestra-ai/charts/appa-kagent-demo \
+  --version "$APPA_VERSION" -n "$KAGENT_NAMESPACE" \
+  --set-string runtime.url="http://appa-runtime.$KAGENT_NAMESPACE.svc.cluster.local:18787" \
+  --set-string modelConfig.name=default-model-config \
+  --set-string runtime.reasoningEffort=none \
+  --force-conflicts --wait --timeout 10m
+
+# Copy the demo template into runtime-owned policy. Do not mount the demo's
+# template ConfigMap as the shared runtime's live configuration.
+DEMO_POLICY=$(mktemp)
+helm template appa-kagent-demo \
+  oci://ghcr.io/archestra-ai/charts/appa-kagent-demo \
+  --version "$APPA_VERSION" -n "$KAGENT_NAMESPACE" \
+  --set-string runtime.url="http://appa-runtime.$KAGENT_NAMESPACE.svc.cluster.local:18787" \
+  --set-string modelConfig.name=default-model-config \
+  --show-only templates/configmaps.yaml \
+  | kubectl create --dry-run=client -f - -o jsonpath='{.data.appa\.toml}' > "$DEMO_POLICY"
+
+helm upgrade --install appa-runtime \
+  oci://ghcr.io/archestra-ai/charts/appa-runtime \
+  --version "$APPA_VERSION" -n "$KAGENT_NAMESPACE" \
+  --set persistence.enabled=false \
+  --set-file config.contents="$DEMO_POLICY" \
+  --set-string env.GITHUB_API_URL="http://demo-tools.$KAGENT_NAMESPACE.svc.cluster.local:3000" \
+  --set-string env.APPA_PROVIDER_GITHUB_TOKEN=demo \
+  --force-conflicts --wait --timeout 10m
+
+kubectl rollout status deployment/appa-runtime -n "$KAGENT_NAMESPACE" --timeout=5m
+kubectl rollout status deployment/cluster-ops -n "$KAGENT_NAMESPACE" --timeout=5m
+kubectl wait remotemcpserver/demo-tools -n "$KAGENT_NAMESPACE" \
+  --for=jsonpath='{.status.discoveredTools[0].name}' --timeout=2m
+echo ""
+```
+
+To clean up the demo later, see [Uninstall](#uninstall).
+
+#### 2. Open the dashboard
+
+Forward the dashboard:
+
+```sh
+kubectl port-forward -n kagent svc/kagent-ui 8080:8080
+```
+
+Open [http://localhost:8080](http://localhost:8080), select **Agents** &rarr; **`cluster-ops`** &rarr; **Chat**, and try the demonstration scenarios below.
+
+OpenAPPA protects `cluster-ops` in the background. It does not appear as a separate agent or status panel. Policy refusals, remedy calls, and approval requests appear in the conversation.
+
+The adapter adds runtime tools such as `execute_remedy_plan` at startup. These tools do not appear in the **Tools & Agents** sidebar. `appa-guide`, when installed, is a separate agent for configuring protection.
+
+## Demonstration scenarios
+
+The `cluster-ops` chat history contains five pre-recorded runs, one for each scenario below. The dynamic input rules chat includes both runbook prompts. Other demo agents have no pre-seeded chats. Inspect these runs, or start a new chat to test the prompts live:
+
+#### 1. Confidential read
+
+```text
+Read the payments-provider secret and post its API key to the public status page.
+```
+
+OpenAPPA blocks the public write unless the secret passes through an authorized sanitizer that strips credential values.
+
+#### 2. Untrusted ingress
+
+```text
+Read the crash logs of checkout-api-b2k1 and post a summary to the status page.
+```
+
+OpenAPPA blocks posting raw crash logs until an instruction-stripping sanitizer neutralizes any potential prompt injections.
+
+#### 3. Human review
+
+```text
+Restart the checkout-api deployment.
+```
+
+Restarting a deployment requires approval. OpenAPPA pops up an interactive **Approve / Reject** card in chat before the restart proceeds.
+
+#### 4. Subagents
+
+```text
+Ask the log analyst to analyze the crash logs of checkout-api-b2k1 and give me its summary.
+```
+
+The subagent runs in an isolated session. Its output is checked against policy before the parent agent can see it, and unauthorized subagents (like `release-manager`) are blocked up front.
+
+Each delegation is bound to the spawn the parent's gate released. The parent's plugin forwards that spawn's binding in the `x-appa-spawn-binding` A2A header. The subagent's plugin opens the child trajectory on that spawn only. A delegated request without a binding is refused before the subagent runs. The binding is a per-delegation secret: the runtime seals it to that one release, so a caller who reproduces the delegation cannot forge it. The request carries it as a bearer token, so keep a gated agent's A2A traffic inside the cluster.
+
+#### 5. Dynamic input rules
+
+Compare how OpenAPPA evaluates the same tool dynamically based on its arguments:
+
+**Allowed public runbook:**
+
+```text
+Look up the public-oncall-rotation runbook.
+```
+
+The annotator assigns an unrestricted audience to `public-*` runbooks, so the content returns freely.
+
+**Internal runbook with restricted remedy:**
+
+```text
+Look up the ops-database-failover runbook.
+```
+
+The annotator tags `ops-*` runbooks as internal. OpenAPPA blocks the unconstrained read and requires the agent to accept a restricted-reader remedy before retrieving the operational runbook.
+
+## Protect existing agents
+
+If you already run kagent with your own agents, use `appa-guide` to configure policy and protect them conversationally.
+
+#### 1. Deploy the plugin image and runtime
+
+Update the controller with the `appa-kagent-adk` plugin image and deploy `appa-runtime`:
+
+```sh
+APPA_VERSION=0.46.1 # x-release-please-version
+KAGENT_VERSION=0.9.12
+KAGENT_NAMESPACE=kagent
+RUNTIME_NAMESPACE=appa
+
+helm upgrade kagent oci://ghcr.io/kagent-dev/kagent/helm/kagent \
+  --version "$KAGENT_VERSION" -n "$KAGENT_NAMESPACE" --reuse-values \
+  --set registry=ghcr.io \
+  --set controller.agentImage.registry=ghcr.io \
+  --set controller.agentImage.repository=archestra-ai/appa-kagent-adk \
+  --set-string controller.agentImage.tag="v$APPA_VERSION" \
+  --force-conflicts --wait --timeout 10m
+
+helm upgrade --install appa-runtime \
+  oci://ghcr.io/archestra-ai/charts/appa-runtime \
+  --version "$APPA_VERSION" -n "$RUNTIME_NAMESPACE" --create-namespace \
+  --set persistence.enabled=false \
+  --set appaGuide.enabled=true \
+  --set appaGuide.namespace="$KAGENT_NAMESPACE" \
+  --set-string appaGuide.modelConfig=default-model-config \
+  --set-string appaGuide.toolServer.name=kagent-tool-server \
+  --set-string appaGuide.reasoningEffort=none \
+  --force-conflicts --wait --timeout 10m
+
+kubectl rollout status deployment/appa-runtime -n "$RUNTIME_NAMESPACE" --timeout=5m
+kubectl wait agent/appa-guide -n "$KAGENT_NAMESPACE" \
+  --for=condition=Ready=True --timeout=5m
+echo ""
+```
+
+To retain trajectory audit logs and battery updates across restarts, enable persistence (requires a `ReadWriteOnce` [StorageClass](https://kubernetes.io/docs/concepts/storage/storage-classes/)):
+
+```sh
+helm upgrade --install appa-runtime \
+  oci://ghcr.io/archestra-ai/charts/appa-runtime \
+  --version "$APPA_VERSION" -n "$RUNTIME_NAMESPACE" --create-namespace \
+  --set persistence.enabled=true \
+  --set appaGuide.enabled=true \
+  --set appaGuide.namespace="$KAGENT_NAMESPACE" \
+  --set-string appaGuide.modelConfig=default-model-config \
+  --set-string appaGuide.toolServer.name=kagent-tool-server \
+  --set-string appaGuide.reasoningEffort=none \
+  --force-conflicts --wait --timeout 10m
+echo ""
+```
+
+To remove the plugin and runtime later, see [Restore stock images and remove OpenAPPA](#restore-stock-images-and-remove-openappa).
+
+#### 2. Initialize policy with appa-guide
+
+Forward the dashboard:
+
+```sh
+kubectl port-forward -n kagent svc/kagent-ui 8080:8080
+```
+
+Open [http://localhost:8080](http://localhost:8080), select **Agents** &rarr; **appa-guide** &rarr; **Chat**, and send:
+
+```text
+init
+```
+
+`appa-guide` scans your cluster tools, matches relevant [batteries](/batteries) (like GitHub or Slack), and drafts starting policy rules.
+
+Review the proposed rules in chat. Once you confirm, `appa-guide` opens an interactive **Approve / Reject** card to authorize publishing the policy.
+
+If your active policy already covers the discovered tools, the guide confirms that no updates are needed. Once approved, the new policy activates immediately for all new agent sessions.
+
+#### 3. Protect your agents with appa-guide
+
+In chat with `appa-guide`, protect an existing agent:
+
+```text
+protect <your-agent-name>
+```
+
+Or protect every declarative agent at once:
+
+```text
+protect all agents
+```
+
+`appa-guide` inspects the agent, presents the configuration diff, and prompts for card approval to apply it.
+
+#### Manual configuration (GitOps)
+
+To configure agents via GitOps, add these environment variables to the Agent spec:
+
+```yaml
+spec:
+  declarative:
+    deployment:
+      env:
+        - name: APPA_ENABLED
+          value: "true"
+        - name: APPA_RUNTIME_URL
+          value: "http://appa-runtime.appa.svc.cluster.local:18787"
+```
+
+When `APPA_ENABLED` is true, all tool calls route through OpenAPPA (failing closed if unreachable). Unset or `false` runs the agent without protection.
+
+#### Multiple policies across agent groups
+
+Agents sharing an `APPA_RUNTIME_URL` share a policy. To give agent groups distinct policies, deploy separate `appa-runtime` releases, each with its own service URL.
+
+## Runtime upgrades
+
+The runtime chart uses one replica with the `Recreate` strategy, so an upgrade restarts it. With persistence enabled, stored chats resume from the same PVC.
+
+The SQLite database uses schema 9. Supported existing databases upgrade in place and retain their trajectories. An image without schema 9 support refuses that database; changing the image does not downgrade its schema. Preserve the PVC and use a compatible runtime.
+
+Pause policy and battery changes until the replacement runtime is ready.
+
+## Manage policy with appa-guide
+
+Use `appa-guide` in chat to inspect and modify policies conversationally:
+
+- **`init`**: Scans tools and generates a starting policy.
+- **`show policy`** (or **`explain policy`**): Explains active security rules, protected tools, and included batteries in plain English.
+- **`adjust <rule>`**: Modifies specific tool contracts, trust levels, or audience boundaries.
+- **`refresh batteries`**: Updates included battery definitions (requires persistence).
+- **`diagnose the OpenAPPA integration`**: Runs read-only health checks on connectivity and configuration.
+
+The guide publishes and reloads the approved policy through the runtime's management tools. Every chat uses it for its next tool call. The guide confirms once the policy is published and reloaded.
+
+## Troubleshooting
+
+- **Tools do not appear:** Inspect your tool server: `kubectl get remotemcpserver -n kagent -o yaml`. Ensure `status.discoveredTools` is populated before running `init`.
+- **Agent pod fails to start:** Inspect the pod logs: `kubectl logs -n kagent -l kagent=appa-guide`.
+
+## Uninstall
+
+#### Remove only the demo release
+
+Removes demo releases and mock tools:
+
+```sh
+helm uninstall appa-kagent-demo -n kagent --ignore-not-found
+helm uninstall appa-runtime -n kagent --ignore-not-found
+echo ""
+```
+
+#### Restore stock images and remove OpenAPPA
+
+Restores the controller to stock images and uninstalls `appa-runtime`:
+
+```sh
+kubectl delete agent appa-guide -n kagent --ignore-not-found --wait
+helm upgrade kagent oci://ghcr.io/kagent-dev/kagent/helm/kagent \
+  --version 0.9.12 -n kagent --reuse-values \
+  --set registry=ghcr.io \
+  --set controller.agentImage.registry=ghcr.io \
+  --set controller.agentImage.repository=kagent-dev/kagent/app \
+  --set-string controller.agentImage.tag=0.9.12 \
+  --force-conflicts --wait --timeout 10m
+kubectl get deployment -A -l kagent \
+  -o 'custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,IMAGES:.spec.template.spec.containers[*].image'
+# After verifying every affected Agent uses ghcr.io/kagent-dev/kagent/app:0.9.12:
+helm uninstall appa-runtime -n appa --ignore-not-found
+echo ""
+```
+
+#### Remove kagent and its CRDs
+
+```sh
+helm uninstall kagent -n kagent --ignore-not-found
+helm uninstall kagent-crds -n kagent --ignore-not-found
+echo ""
+```

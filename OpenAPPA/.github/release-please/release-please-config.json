@@ -1,0 +1,118 @@
+{
+  "bootstrap-sha": "389b9e75f6abc86b9527807a2c0d14762c5a2afc",
+  "changelog-path": "CHANGELOG.md",
+  "changelog-type": "default",
+  "pull-request-footer": "",
+  "include-v-in-tag": true,
+  "separate-pull-requests": true,
+  "changelog-sections": [
+    {
+      "section": "Features",
+      "type": "feat",
+      "hidden": false
+    },
+    {
+      "section": "Bug Fixes",
+      "type": "fix",
+      "hidden": false
+    },
+    {
+      "section": "Performance Improvements",
+      "type": "perf",
+      "hidden": false
+    },
+    {
+      "section": "Documentation",
+      "type": "docs",
+      "hidden": false
+    },
+    {
+      "section": "Dependencies",
+      "type": "deps",
+      "hidden": false
+    },
+    {
+      "section": "CI/CD",
+      "type": "ci",
+      "hidden": true
+    },
+    {
+      "section": "Code Refactoring",
+      "type": "refactor",
+      "hidden": false
+    },
+    {
+      "section": "Reverts",
+      "type": "revert",
+      "hidden": false
+    },
+    {
+      "section": "Tests",
+      "type": "test",
+      "hidden": true
+    },
+    {
+      "section": "Miscellaneous Chores",
+      "type": "chore",
+      "hidden": false
+    },
+    {
+      "section": "Other",
+      "type": "*",
+      "hidden": false
+    }
+  ],
+  "packages": {
+    ".": {
+      "component": "OpenAPPA",
+      "release-type": "simple",
+      "version-file": ".github/release-please/version.txt",
+      "initial-version": "0.1.0",
+      "bump-minor-pre-major": true,
+      "include-component-in-tag": false,
+      "draft": true,
+      "force-tag-creation": true,
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "marketplace/plugins/kagent/appa-package.toml"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.toml",
+          "jsonpath": "$.workspace.package.version"
+        },
+        {
+          "type": "generic",
+          "path": "charts/appa-runtime/Chart.yaml"
+        },
+        {
+          "type": "generic",
+          "path": "charts/appa-runtime/README.md"
+        },
+        {
+          "type": "generic",
+          "path": "integrations/kagent/demo/chart/Chart.yaml"
+        },
+        {
+          "type": "generic",
+          "path": "integrations/kagent/demo/chart/README.md"
+        },
+        {
+          "type": "generic",
+          "path": "integrations/kagent/demo/README.md"
+        },
+        {
+          "type": "generic",
+          "path": "website/content/docs/kagent.md"
+        },
+        {
+          "type": "generic",
+          "path": "integrations/kagent/README.md"
+        }
+      ]
+    }
+  },
+  "plugins": [],
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json"
+}

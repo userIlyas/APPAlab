@@ -1,0 +1,592 @@
+# Руководство по самостоятельному тестированию OpenAPPA в Agentic Banking Lab
+
+Это практическая инструкция: открываете WSL Ubuntu, копируете команды по порядку и
+собственными глазами видите, что OpenAPPA **разрешает** операцию в чистом диалоге и
+**блокирует** ту же операцию после поступления недоверенных данных.
+
+Всё здесь проверено по реально существующим файлам и работающей инфраструктуре.
+Ничего устанавливать или донастраивать не нужно — всё уже собрано.
+
+---
+
+## Легенда типов команд
+
+- 🔍 — команда **только проверяет** состояние, ничего не меняет.
+- ⚙️ — команда **запускает / пересоздаёт** контейнер(ы).
+- 💰 — команда **создаёт тестовую операцию в АБС** (синтетический перевод).
+
+Основной стенд контейнера **не останавливаем** и **не пересоздаём**. Удаляем только
+изолированный контейнер `agentic-banking-appa-1` (без `-v`).
+
+## Важная информация заранее
+
+- **OpenAPPA встроен в banking-agent** через Python-адаптер (`appa_agent_python`,
+  PyO3-колесо из каталога `vendor/`). Отдельно запускать OpenAPPA **не нужно** —
+  отдельного контейнера/сервиса OpenAPPA нет.
+- Есть **два** banking-agent:
+  - `agentic-banking-banking-agent-1` → порт **8000**, основной стенд, **БЕЗ** OpenAPPA;
+  - `agentic-banking-appa-1` → порт **8009**, тестовый, **С** OpenAPPA
+    (`APPA_TAINT_MODE=enforce`, `BANKING_AGENT_MODE=legacy`).
+- Полный сценарий через `/v1/chat` в этом окружении **не работает по внешней причине**:
+  у сервиса памяти не задан `EMBEDDING_API_KEY`, поэтому первый узел графа
+  `memory.recall` возвращает 503. Это ограничение стенда, а не интеграции. Рабочий
+  маршрут тестирования — диагностический endpoint `/v1/appa/e2e/transfer` тестового
+  образа (см. ниже). Ключи вводить не нужно и не предлагается.
+- **Taint-состояние живёт в памяти процесса**: при перезапуске тестового контейнера
+  накопленные метки сбрасываются (persistent taint пока не реализован — см.
+  `REPORT-phase2.md`, §5).
+
+---
+
+# Часть 1. Проверка текущего состояния
+
+## Шаг 1. Перейти в каталог проекта
+
+**Зачем:** все команды `docker compose` для тестового стенда должны выполняться из
+каталога репозитория.
+
+**Команда:**
+```bash
+cd /home/leany/memory-tracing/agentic-banking-lab
+pwd
+```
+
+**Ожидаемый результат:** `pwd` печатает `/home/leany/memory-tracing/agentic-banking-lab`.
+
+**Если ошибка:** «No such file or directory» — проверьте, что каталог существует:
+`ls /home/leany/memory-tracing`.
+
+## Шаг 2. Проверить, что Docker работает 🔍
+
+**Зачем:** без работающего Docker-демона ничего не заработает.
+
+**Команда:**
+```bash
+docker version --format '{{.Server.Version}}'
+```
+
+**Ожидаемый результат:** версия сервера, например `29.9.2`.
+
+**Если ошибка:** «Cannot connect to the Docker daemon» — запустите Docker
+Desktop / `sudo service docker start` и повторите. Дальше не продолжать, пока демон
+не отвечает.
+
+## Шаг 3. Проверить, что основной стенд работает 🔍
+
+**Зачем:** тестовый banking-agent использует те же вспомогательные сервисы
+(Keycloak, АБС, память, MCP), что и основной. Они должны быть запущены.
+
+**Команда:**
+```bash
+docker ps --format '{{.Names}}\t{{.Status}}' | sort
+```
+
+**Ожидаемый результат:** длинный список из ~24 контейнеров `agentic-banking-*-1`,
+почти все со статусом `Up` (часть — `(healthy)`). Ключевые: `keycloak-1`,
+`abs-api-1`, `abs-mcp-1`, `memory-service-1`, `travel-agent-1`, `banking-agent-1`,
+`ui-1`.
+
+**Если ошибка:** если большинства контейнеров нет — основной стенд не запущен.
+Запустите его отдельно: `docker compose -f docker-compose.yml up -d` (это основной
+стенд; данное руководство его не останавливает и не пересоздаёт).
+
+## Шаг 4. Проверить, запущен ли тестовый banking-agent с OpenAPPA 🔍
+
+**Зачем:** определить, нужно ли его запускать (часть 2) или он уже работает.
+
+**Команда:**
+```bash
+docker ps --filter name=agentic-banking-appa-1 --format '{{.Names}}\t{{.Status}}\t{{.Ports}}'
+```
+
+**Ожидаемый результат (если уже запущен):**
+```
+agentic-banking-appa-1    Up …    127.0.0.1:8009->8009/tcp
+```
+
+**Ожидаемый результат (если не запущен):** пустая строка → переходите к **Шагу 7**.
+
+**Если ошибка:** если контейнер есть, но статус `Exited`/`Restarting` — см. логи:
+`docker logs agentic-banking-appa-1 2>&1 | tail -40`, затем **Шаг 8**.
+
+## Шаг 5. Сводка портов (для ориентира) 🔍
+
+| Порт | Сервис | Назначение в тестировании |
+|---|---|---|
+| 8000 | `banking-agent` (основной) | банк-агент **без** OpenAPPA |
+| **8009** | `banking-agent-appa` | банк-агент **с** OpenAPPA — цель теста |
+| 8080 | Keycloak | выдача тестовых токенов |
+| 8101 | `abs-mcp` (secure) | защищённый MCP АБС |
+| 8001 | `abs-api` | ядро АБС, реальная бухгалтерия |
+| 3000 | UI | веб-интерфейс банка (не обязателен) |
+
+## Шаг 6. Проверить режим `APPA_TAINT_MODE=enforce` 🔍
+
+**Зачем:** убедиться, что именно **тестовый** агент работает в режиме принуждения, а не
+основной.
+
+**Команда:**
+```bash
+docker inspect agentic-banking-appa-1 --format '{{ join .Config.Env "\n" }}' | grep -E 'APPA_TAINT|BANKING_AGENT_MODE|PORT='
+```
+
+**Ожидаемый результат:**
+```
+PORT=8009
+BANKING_AGENT_MODE=legacy
+APPA_TAINT_MODE=enforce
+APPA_TAINT_E2E_HARNESS=1
+```
+Если в выводе нет `APPA_TAINT_MODE=enforce` — это не тот контейнер/не тот образ.
+
+**Если ошибка:** «No such object» — тестовый контейнер не запущен, см. **Часть 2**.
+
+---
+
+# Часть 2. Запуск OpenAPPA (фактически — запуск тестового banking-agent)
+
+## Шаг 7. Понять, что отдельно ничего запускать не нужно
+
+**Зачем:** OpenAPPA — это не отдельный сервис, а Python-модуль внутри
+`banking-agent-appa`. «Запуск OpenAPPA» = запуск тестового контейнера с установленным
+колесом `appa_agent_python`.
+
+Колесо уже собрано и лежит здесь:
+```bash
+ls -1 /home/leany/memory-tracing/agentic-banking-lab/vendor/*.whl
+```
+🔍 Ожидаемый результат: `appa_agent_python-0.46.1-cp311-abi3-manylinux_2_34_x86_64.whl`.
+
+## Шаг 8. Собрать образ (только если он отсутствует) ⚙️
+
+**Зачем:** тестовый образ `agentic-banking-banking-agent-appa` должен содержать колесо
+OpenAPPA. Сборка устанавливает `requirements.txt`, копирует исходники и
+`pip install vendor/*.whl` (build-аргумент `APPA_TAINT_INSTALL=1`).
+
+**Команда (из каталога репозитория):**
+```bash
+docker images --format '{{.Repository}}:{{.Tag}}' | grep agentic-banking-banking-agent-appa
+```
+🔍 Если образ уже в списке — сборку можно пропустить.
+
+Сборка, если образ отсутствует:
+```bash
+cd /home/leany/memory-tracing/agentic-banking-lab
+docker compose -f docker-compose.appa.yml build
+```
+
+**Ожидаемый результат:** финальная строка
+`Image agentic-banking-banking-agent-appa Built`, в логе сборки видно
+`Successfully installed appa-agent-python-0.46.1`.
+
+**Если ошибка:** «no source files were specified» по `vendor` — колесо отсутствует,
+соберите его: `scripts/build_appa_wheel.sh` (нужен Docker и интернет; собирает из
+соседнего `/home/leany/memory-tracing/OpenAPPA`). Это не трогает основной стенд.
+
+## Шаг 9. Запустить тестовый контейнер ⚙️
+
+**Команда (из каталога репозитория):**
+```bash
+cd /home/leany/memory-tracing/agentic-banking-lab
+docker compose -f docker-compose.appa.yml up -d
+```
+
+**Ожидаемый результат:** `Container agentic-banking-appa-1 Started`. Через ~5 секунд
+контейнер в `Up`.
+
+**Если ошибка:** `network agentic-banking_banking not found` — не запущен основной
+стенд (его сеть не существует), см. **Шаг 3**.
+
+Проверка после запуска:
+```bash
+sleep 6
+docker ps --filter name=agentic-banking-appa-1 --format '{{.Names}}\t{{.Status}}'
+curl -s -o /dev/null -w "8009 -> HTTP %{http_code}\n" http://127.0.0.1:8009/health
+```
+🔍 Ожидаемый результат: статус `Up`, и `8009 -> HTTP 200`.
+
+> Основной стенд (`banking-agent` на 8000) при этом **не трогается** — тестовый
+> контейнер лишь присоединяется к общей сети `agentic-banking_banking`.
+
+---
+
+# Часть 3. Проверка работоспособности
+
+## Шаг 10. `/health` и загрузка OpenAPPA 🔍
+
+**Команда:**
+```bash
+curl -s http://127.0.0.1:8009/health | python3 -m json.tool
+```
+
+**Ожидаемый результат:** JSON, в котором есть блок `appa_taint`:
+```json
+"appa_taint": {
+    "mode": "enforce",
+    "engine_available": true,
+    "engine_identity": "appa-agent-python-v9",
+    "policy_loaded": true,
+    "policy_tools": 14,
+    "declared_narrowers": ["memory.untrusted", "search.news", "search.text", "travel.plan"],
+    "allowed_narrow": ["memory.untrusted", "search.news", "search.text", "travel.plan"],
+    "fail_closed": true,
+    "sessions": 0
+}
+```
+
+Что важно увидеть:
+- `mode: "enforce"` — активен режим принуждения;
+- `engine_available: true`, `engine_identity: "appa-agent-python-v9"` — движок OpenAPPA загружен;
+- `policy_loaded: true`, `policy_tools: 14` — IFC-политика (`configs/appa.toml`) загружена;
+- `fail_closed: true` — при отказе движка операции блокируются, а не пропускаются.
+
+Для сравнения — основной агент **не** содержит этого блока:
+```bash
+curl -s http://127.0.0.1:8000/health | python3 -c "import sys,json; print('appa_taint' in json.load(sys.stdin))"
+```
+🔍 Ожидаемый результат: `False` (на 8000 OpenAPPA нет).
+
+**Если ошибка:**
+- соединение отклонено (connection refused) на 8009 → контейнер не запущен (**Шаг 9**);
+- `mode: "off"` → некорректный `.env`/переопределение `APPA_TAINT_MODE`;
+- `engine_available: false` → колесо не установлено в образе → пересоберите (**Шаг 8**);
+- `policy_loaded: false` → отсутствует `configs/appa.toml` → пересоберите.
+
+## Шаг 11. Связь с вспомогательными сервисами 🔍
+
+**Зачем:** тестовый агент должен достучаться до Keycloak/АБС/MCP. Проще всего —
+попытаться получить тестовый токен.
+
+**Команда:**
+```bash
+TOKEN=$(curl -s -X POST "http://127.0.0.1:8080/realms/agentic-banking/protocol/openid-connect/token" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=password&client_id=bank-ui&username=ivan.petrov&password=banking-demo" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+echo "${#TOKEN}"   # печатаем только длину токена, не сам токен
+```
+
+**Ожидаемый результат:** положительное число (длина JWT, сотни символов).
+
+**Если ошибка:** пустая строка/ошибка JSON — Keycloak не отвечает на 8080 (см. **Шаг 3**).
+Сообщение Keycloak об ошибке можно посмотреть, убрав фильтр:
+`curl -s -X POST … ·/token -d "…"` (выведет полный JSON с `error`/`error_description`).
+
+> Дальнейшие команды используют переменную `$TOKEN` из этого шага. Она живёт только
+> в текущем терминале. Если открыли новый терминал — повторите **Шаг 11**.
+
+---
+
+# Часть 4. Практическая демонстрация Taint Tracking
+
+Используем диагностический endpoint тестового образа:
+
+`POST /v1/appa/e2e/transfer` (доступен только на тестовом образе, где
+`APPA_TAINT_E2E_HARNESS=1`).
+
+Поля запроса:
+- `conversation_id` — произвольная строка (id диалога → он же «траектория» для OpenAPPA);
+- `ingest` — `true` (загрязнить диалог синтетическим недоверенным текстом) или
+  отсутствует (выполнить операцию);
+- `from_account`, `to_account`, `amount`, `idempotency_key` — параметры перевода.
+
+Что происходит внутри:
+- при `ingest=true` через **реальный** шлюз OpenAPPA допускается синтетический
+  недоверенный контент (`search.text`), метка диалога `trusted → suspicious`;
+  внешние сервисы при этом **не вызываются** — это детерминированный mock-ingress;
+- при вызове без `ingest` выполняется **реальный** `create_transfer` через
+  защищённый `abs-mcp`. Решение «можно/нельзя» принимает движок OpenAPPA **до**
+  обращения к АБС.
+
+## Шаг 12. Тест A — чистый диалог (операция разрешена) 💰
+
+**Зачем:** показать, что при достаточном Trust гейт **разрешает** операцию (это не
+сплошная блокировка).
+
+> ⚠️ Эта команда **реально выполнит синтетический перевод 1.00 RUB** между счетами
+> демо-пользователя (`account-001 → RU10000000000000000002`). Это не реальные деньги,
+> но это **запись операции в АБС**. Если не хотите создавать никаких записей —
+> пропустите **Шаг 12**, а «разрешённый» путь посмотрите в юнит-тесте
+> `test_clean_conversation_allows_reads_and_money` (Часть 6) и в автоматическом
+> скрипте `e2e-gate.py`.
+
+**Команда:**
+```bash
+CONV_CLEAN="clean-$(date +%s)"
+curl -s -X POST http://127.0.0.1:8009/v1/appa/e2e/transfer \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"conversation_id\":\"$CONV_CLEAN\",\"from_account\":\"account-001\",\"to_account\":\"RU10000000000000000002\",\"amount\":\"1.00\",\"idempotency_key\":\"manual-clean-$(date +%s)\"}" \
+  | python3 -m json.tool
+```
+
+**Ожидаемый результат:** HTTP 200 и JSON:
+```json
+{
+  "status": "allowed",
+  "result": {
+    "status": "completed",
+    "operation_id": "…",
+    "from_account": "…",
+    "to_account": "RU10000000000000000002",
+    "amount": "1.00",
+    "balance_after": "…"
+  }
+}
+```
+`status: "allowed"` + `result.status: "completed"` → OpenAPPA пропустил операцию,
+АБС её выполнила.
+
+**Если ошибка:** см. `curl -v`; `401` — протух токен (повторите **Шаг 11**);
+`404 "not found"` — вы стучитесь в основной агент (порт 8000) или флаг
+`APPA_TAINT_E2E_HARNESS` не `1`.
+
+## Шаг 13. Тест B — загрязнённый диалог (операция блокируется) 🔍
+
+**Зачем:** показать, что после недоверенных данных гейт **блокирует** ту же операцию
+**до** выполнения. Этот шаг **не выполняет перевод** (никаких записей в АБС).
+
+**Команда 1 — загрязнить диалог (mock-ingress, внешние сервисы не вызываются):**
+```bash
+CONV_TAINT="taint-$(date +%s)"
+curl -s -X POST http://127.0.0.1:8009/v1/appa/e2e/transfer \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"conversation_id\":\"$CONV_TAINT\",\"ingest\":true}" \
+  | python3 -m json.tool
+```
+
+**Ожидаемый результат:** HTTP 200 и JSON:
+```json
+{
+  "status": "ingested",
+  "appa": { "mode": "enforce", "engine_available": true, "policy_loaded": true, "fail_closed": true, "sessions": 1 }
+}
+```
+`status: "ingested"` → метка диалога `$CONV_TAINT` понижена до `suspicious`.
+
+**Команда 2 — попытаться перевести деньги в том же диалоге:**
+```bash
+curl -s -o /tmp/appa-blocked.json -w "HTTP %{http_code}\n" -X POST http://127.0.0.1:8009/v1/appa/e2e/transfer \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"conversation_id\":\"$CONV_TAINT\",\"from_account\":\"account-001\",\"to_account\":\"RU10000000000000000002\",\"amount\":\"1.00\",\"idempotency_key\":\"manual-taint-$(date +%s)\"}"
+python3 -m json.tool /tmp/appa-blocked.json
+```
+
+**Ожидаемый результат:** `HTTP 409` и JSON:
+```json
+{
+  "detail": "Операция отклонена политикой контроля информации (OpenAPPA).",
+  "code": "policy_denied",
+  "summary": "[appa] Blocked: abs.create_transfer cannot run.",
+  "reason": "[appa] Blocked: abs.create_transfer cannot run.\n\nWhy:\n  - trust is suspicious, below the required floor trusted\n…"
+}
+```
+Ключевые признаки: `code == "policy_denied"`, в `reason` есть строка
+`trust is suspicious, below the required floor trusted`.
+
+**Если ошибка:** если вместо 409 пришёл 200 `allowed` — ingress не сработал
+(например, `ingest` не был выполнен в том же `conversation_id`). Повторите
+**Шаг 13** с одним и тем же `$CONV_TAINT`, сначала `ingest`, потом перевод.
+
+---
+
+# Часть 5. Просмотр результатов
+
+## Шаг 14. Сообщения OpenAPPA в Docker-логах 🔍
+
+**Команда:**
+```bash
+docker logs agentic-banking-appa-1 2>&1 | grep -iE "deny tool|appa_taint" | tail -20
+```
+
+**Ожидаемый результат:** строка вида
+```
+appa_taint deny tool=abs.create_transfer conv=taint-… reason=[appa] Blocked:
+abs.create_transfer cannot run.  Why:   - trust is suspicious, below the required floor trusted  …
+```
+
+`deny tool=abs.create_transfer` + `trust is suspicious` — это прямое доказательство,
+что решение принял движок OpenAPPA.
+
+> Строки уровня INFO (`OpenAPPA engine loaded`, `narrow accepted`) по умолчанию
+> подавлены (логгер `appa_taint` работает с уровнем WARNING). Ключевая строка
+> блокировки пишется на уровне WARNING и видна.
+
+## Шаг 15. Отсутствие побочного эффекта после блокировки 🔍
+
+**Зачем:** доказать, что заблокированная операция **не дошла** до АБС.
+
+**Команда (считаем переводы в выписке демо-пользователя):**
+```bash
+curl -s http://127.0.0.1:8009/v1/dashboard -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "import sys,json; ops=json.load(sys.stdin)['operations']; print('transfers:', sum(1 for o in ops if o.get('category')=='transfer'))"
+```
+
+**Ожидаемый результат:** число переводов **не изменилось** после заблокированной
+попытки (если вы делали Шаг 12 — оно равно числу чистых переводов; заблокированный
+перевод счёт **не** увеличивает).
+
+**Если ошибка:** если число выросло после заблокированной попытки — это аварийный
+признак (гейт не сработал); остановитесь и проверьте логи.
+
+## Шаг 16. Taint сохраняется внутри диалога 🔍
+
+**Зачем:** показать, что понижение Trust «прилипает» к `conversation_id`, а не
+сбрасывается после первого отказа.
+
+**Команда (повторный перевод в том же загрязнённом диалоге, новый idempotency_key):**
+```bash
+curl -s -o /dev/null -w "repeat -> HTTP %{http_code}\n" -X POST http://127.0.0.1:8009/v1/appa/e2e/transfer \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"conversation_id\":\"$CONV_TAINT\",\"from_account\":\"account-001\",\"to_account\":\"RU10000000000000000002\",\"amount\":\"1.00\",\"idempotency_key\":\"manual-taint-again-$(date +%s)\"}"
+```
+
+**Ожидаемый результат:** снова `HTTP 409` (тот же диалог — та же метка `suspicious`).
+
+## Шаг 17. Независимость taint между диалогами 🔍
+
+**Зачем:** показать, что метка одного диалога не «протекает» в другой.
+
+**Команда (новый диалог, без ingest):**
+```bash
+curl -s -o /dev/null -w "fresh -> HTTP %{http_code}\n" -X POST http://127.0.0.1:8009/v1/appa/e2e/transfer \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"conversation_id\":\"fresh-$(date +%s)\",\"from_account\":\"account-001\",\"to_account\":\"RU10000000000000000002\",\"amount\":\"1.00\",\"idempotency_key\":\"manual-fresh-$(date +%s)\"}"
+```
+
+**Ожидаемый результат:** `HTTP 200` (новый чистый диалог разрешён). ⚠️ Это снова
+выполнит синтетический перевод — если не хотите записей в АБС, пропустите этот
+шаг; изоляцию можно увидеть и в скрипте `e2e-gate.py` (там «чистый» и «загрязнённый»
+диалоги проверяются в одном прогоне).
+
+---
+
+# Часть 6. Автоматические тесты
+
+Все три команды запускаются из каталога репозитория. Используется готовое
+виртуальное окружение хоста `/home/leany/memory-tracing/openappa-abl/.venv`,
+в котором уже установлены `appa_agent_python`, `pytest`, `httpx`.
+
+## Шаг 18. Юнит/интеграционные тесты гейта (реальный движок) 🔍
+
+**Файл:** `tests/test_appa_taint.py` (14 тестов). Движок-зависимые тесты помечены
+`@needs_engine` и **пропускаются**, если колесо не установлено.
+
+**Команда:**
+```bash
+cd /home/leany/memory-tracing/agentic-banking-lab
+APPA_TAINT_MODE=enforce /home/leany/memory-tracing/openappa-abl/.venv/bin/python -m pytest tests/test_appa_taint.py -v
+```
+
+**Ожидаемый результат:** `14 passed`. Ключевые тесты:
+- `test_clean_conversation_allows_reads_and_money` — чистый диалог разрешает деньки;
+- `test_untrusted_search_blocks_money_in_the_same_conversation` — загрязнённый диалог блокирует;
+- `test_untrusted_memory_recall_narrows_and_blocks_money` — отравленная память сужает Trust;
+- `test_enforce_fails_closed_when_*` — fail-closed при отсутствии движка/политики/диалога.
+
+Если колесо отсутствует → часть `7 passed, 7 skipped` (это нормально, движковые
+тесты просто не выполняются; блокировка в этом случае не доказывается).
+
+**Если ошибка:** `ModuleNotFoundError: services` — вы не в каталоге репозитория.
+
+## Шаг 19. `openappa-abl/validation.py` — контракт glue + движок (без Docker) 🔍
+
+**Что делает:** прогоняет обёртку `TaintGate` с реальным движком, воспроизводя точные
+вызовы точек интеграции (`mcp.py`, `travel.py`, `clients.py`) через contextvar.
+Никаких внешних сервисов и записей в АБС (используются fake-исполнители).
+
+**Предусловие:** колесо в venv (есть), `PYTHONPATH` указывает на корень репозитория.
+
+**Команда:**
+```bash
+cd /home/leany/memory-tracing/agentic-banking-lab
+PYTHONPATH=/home/leany/memory-tracing/agentic-banking-lab \
+  /home/leany/memory-tracing/openappa-abl/.venv/bin/python /home/leany/memory-tracing/openappa-abl/validation.py
+```
+
+**Ожидаемый результат:** `4/4 checks passed` (contextvar, блокировка после поиска,
+чистый диалог разрешён, блокировка после результата партнёра).
+
+## Шаг 20. `openappa-abl/e2e-gate.py` — E2E в развёрнутом контейнере 💰
+
+**Что делает:** 8 проверок через реальный HTTP: `/health` (движок+enforce+политика),
+**чистый диалог → перевод разрешён и реально выполнен**, загрязнённый диалог →
+перевод заблокирован 409 `policy_denied`, отсутствие побочного эффекта в АБС.
+
+**Предусловия:** тестовый контейнер запущен (8009), Keycloak (8080), АБС.
+
+**Команда:**
+```bash
+cd /home/leany/memory-tracing/agentic-banking-lab
+/home/leany/memory-tracing/openappa-abl/.venv/bin/python /home/leany/memory-tracing/openappa-abl/e2e-gate.py
+```
+
+**Ожидаемый результат:** `ALL CHECKS PASSED: 8/8`, в конце создаётся
+`/home/leany/memory-tracing/openappa-abl/e2e-gate-results.json`.
+⚠️ Скрипт выполняет **один синтетический перевод 1.00 RUB** (это и доказывает
+«разрешённый» путь).
+
+**Если ошибка:** скрипт вернёт `SOME CHECKS FAILED` и exit code 1; детали — в выводе
+и в `e2e-gate-results.json`.
+
+---
+
+# Часть 7. Завершение работы
+
+## Шаг 21. Остановить только тестовое окружение ⚙️
+
+**Команда (из каталога репозитория):**
+```bash
+cd /home/leany/memory-tracing/agentic-banking-lab
+docker compose -f docker-compose.appa.yml down
+```
+
+**Ожидаемый результат:** остановлен и удалён контейнер `agentic-banking-appa-1`.
+**Основной стенд при этом не затрагивается** (в этом compose-файле только один
+сервис `banking-agent-appa`; внешняя сеть `agentic-banking_banking` не удаляется).
+
+> **Категорически не используйте** `docker compose down -v` — это удалит named
+> volumes и данные. Здесь и без `-v` volumes не затрагиваются.
+
+**Если ошибка:** «… the network is in use» при попытке удалить сеть — это внешняя
+сеть, `down` её не удаляет; сообщение можно игнорировать, контейнер удалится.
+
+## Шаг 22. Повторный запуск тестового контейнера ⚙️
+
+```bash
+cd /home/leany/memory-tracing/agentic-banking-lab
+docker compose -f docker-compose.appa.yml up -d
+ss -ltnp 2>/dev/null | grep 8009 || docker ps --filter name=agentic-banking-appa-1
+```
+
+**Ожидаемый результат:** контейнер снова `Up`, порт 8009 отвечает.
+
+**Важное ограничение:** после `down`/повторного `up` **метки taint сбрасываются**
+(состояние OpenAPPA живёт в памяти процесса — persistent taint пока не реализован).
+Для нового цикла просто повторите **Шаг 11 → Шаг 13**.
+
+---
+
+# Приложение A. Контролируемые (canary) данные для тестов
+
+| Параметр | Значение |
+|---|---|
+| Keycloak realm | `http://127.0.0.1:8080/realms/agentic-banking` |
+| Клиент | `bank-ui` (public) |
+| Пользователь / пароль | `ivan.petrov` / `banking-demo` (демо-пароль из репозитория) |
+| `customer_id` | `customer-001` |
+| Счёт-источник | `account-001` (checking, RUB) |
+| Счёт-назначение | `RU10000000000000000002` (savings, RUB) |
+| Сумма теста | `1.00` |
+
+# Приложение B. Ограничения текущей реализации (не скрываем)
+
+1. `/v1/chat` (полный агентный граф) **не проходит тестирование** в этом окружении:
+   `EMBEDDING_API_KEY` пуст → `memory.recall` в первом узле отдаёт 503. Рабочий
+   маршрут — `/v1/appa/e2e/transfer`. Это дефект стенда, не интеграции.
+2. **Persistent taint не реализован** — метки переживают «ходы» внутри процесса, но
+   сбрасываются при перезапуске контейнера.
+3. Используется только измерение **Trust**; audience/привязка к `customer_id` — нет.
+4. Ingress в E2E — **синтетический** (mock через реальный гейт); реальные
+   `search.*`/`memory.untrusted`/`travel.plan` покрыты юнит-тестами.
+5. Диагностический endpoint `/v1/appa/e2e/transfer` есть **только** в тестовом образе
+   (`APPA_TAINT_E2E_HARNESS=1`); на основном образе отвечает 404.

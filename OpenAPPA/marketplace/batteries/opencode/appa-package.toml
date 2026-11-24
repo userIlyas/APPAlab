@@ -1,0 +1,16 @@
+schema = 1
+name = "opencode"
+description = "OpenCode tool rules: the map that binds the file-tracker battery's canonical tools to OpenCode's read, write, edit and appa_safebash, and contracts for the other built-in tools: web results lower trust."
+
+[battery]
+policy = "appa.toml"
+hosts = ["opencode"]
+namespaces = ["opencode"]
+helpers = []
+benefit = "With the file-tracker battery, files written from private data stay private and sandboxed commands cannot read undeclared files or reach undeclared hosts. Private data cannot reach public tools, and web results cannot drive trusted-only work."
+
+[battery.targets.single-user]
+policy = "appa.toml"
+
+[battery.targets.multi-user]
+policy = "appa.toml"

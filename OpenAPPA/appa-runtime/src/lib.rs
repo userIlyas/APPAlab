@@ -1,0 +1,74 @@
+//! appa-runtime — the process that gates a harness's flows.
+
+#[cfg(feature = "daemon")]
+mod agent_scan;
+#[cfg(feature = "daemon")]
+mod annotate;
+pub mod api;
+pub mod batteries;
+pub mod config;
+mod credentials;
+pub mod describe;
+pub mod guide;
+#[cfg(feature = "daemon")]
+pub mod hook_client;
+pub mod hooks;
+#[cfg(feature = "daemon")]
+pub mod init;
+#[cfg(feature = "daemon")]
+pub mod installation;
+#[cfg(feature = "daemon")]
+mod loopback_http;
+#[cfg(feature = "daemon")]
+mod management;
+#[cfg(feature = "daemon")]
+mod mascot;
+#[cfg(feature = "daemon")]
+pub mod mcp;
+#[cfg(feature = "daemon")]
+pub mod protected_launch;
+#[cfg(feature = "daemon")]
+pub mod replay;
+#[cfg(feature = "daemon")]
+#[path = "main.rs"]
+pub mod runtime_cli;
+#[cfg(feature = "daemon")]
+pub mod runtime_start;
+#[cfg(feature = "daemon")]
+pub mod runtime_url;
+#[cfg(feature = "daemon")]
+mod sanitize;
+#[cfg(feature = "daemon")]
+pub mod session_context;
+#[cfg(feature = "daemon")]
+pub mod statusline;
+#[cfg(feature = "daemon")]
+mod style;
+pub mod tls;
+pub mod tool_validation;
+#[cfg(feature = "daemon")]
+pub mod ui;
+
+mod batteries_layout;
+#[cfg(feature = "daemon")]
+mod batteries_staging;
+mod builtins;
+pub mod child_process;
+mod consult;
+mod consult_process;
+mod do_something;
+mod elicit;
+mod engine;
+mod events;
+mod external;
+#[cfg(feature = "daemon")]
+mod git_checkout;
+mod label_guide;
+mod model;
+mod process_tree;
+mod secrets;
+mod telemetry;
+#[cfg(test)]
+mod test_support;
+mod transcriber;
+pub mod yell;
